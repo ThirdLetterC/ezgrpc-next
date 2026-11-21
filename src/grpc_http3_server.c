@@ -1209,6 +1209,13 @@ static int open_udp(grpc_h3_server *h3s, uv_udp_t *udp, struct sockaddr_storage 
   if ((rv = uv_udp_init_ex(&server->loop, udp, (unsigned)family)) != 0)
     return rv;
   udp->data = h3s;
+#if defined(SO_REUSEPORT) && !defined(_WIN32)
+  /* like the TCP listeners: one server per thread can share the port. The kernel spreads datagrams
+   * by address 4-tuple, so a connection stays on one loop (migration is disabled) */
+  uv_os_fd_t fd;
+  if (uv_fileno((uv_handle_t *)udp, &fd) == 0)
+    (void)setsockopt((int)fd, SOL_SOCKET, SO_REUSEPORT, &(int){1}, sizeof(int));
+#endif
   unsigned flags = UV_UDP_REUSEADDR | (family == AF_INET6 ? UV_UDP_IPV6ONLY : 0);
   if ((rv = uv_udp_bind(udp, (const struct sockaddr *)&ss, flags)) != 0)
     return rv;

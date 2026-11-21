@@ -531,11 +531,33 @@ void test_hostile_protobuf_lengths(void) {
   grpc_server_free(server);
 }
 
+/* Without HTTP/3 support built in, asking for it fails cleanly with GRPC_ERR_UNSUPPORTED. */
+void test_http3_unsupported_without_build(void) {
+  if (grpc_http3_available()) {
+    TEST_IGNORE_MESSAGE("built with HTTP/3; covered by the http3 test");
+  }
+  TEST_ASSERT_EQUAL_STRING("none", grpc_http3_versions());
+  grpc_err err = GRPC_OK;
+  TEST_ASSERT_NULL(grpc_server_new_ex(&(grpc_config){.port = 0,
+                                                     .ipv4_addr = "127.0.0.1",
+                                                     .http3 = {.enable = true},
+                                                     .log_level = GRPC_LOG_OFF},
+                                      &err));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_UNSUPPORTED, err);
+  TEST_ASSERT_NULL(grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
+                                                         .port = 1,
+                                                         .transport = GRPC_TRANSPORT_HTTP3,
+                                                         .tls = {.enable = true}},
+                                   &err));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_UNSUPPORTED, err);
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_client_server_tcp_end_to_end);
   RUN_TEST(test_client_streaming_bidi_retries_and_lb);
   RUN_TEST(test_hostile_protobuf_lengths);
+  RUN_TEST(test_http3_unsupported_without_build);
 #ifndef _WIN32
   RUN_TEST(test_unix_domain_socket);
 #endif

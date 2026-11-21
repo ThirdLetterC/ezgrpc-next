@@ -104,6 +104,20 @@ static void whoami(grpc_call *call, const grpc_message *req, void *userdata) {
   (void)grpc_call_reply_data(call, "ok", 2);
 }
 
+/* Replies "<x-key value>|<deadline set>". Header values from nghttp3 must be NUL-terminated like
+ * nghttp2's (grpc_call_metadata() and the grpc-timeout parser rely on it): strlen() must agree
+ * with the reported length. */
+static void meta(grpc_call *call, const grpc_message *req, void *userdata) {
+  (void)req;
+  (void)userdata;
+  size_t len = 0;
+  const char *v = grpc_call_metadata(call, "x-key", &len);
+  char out[128];
+  int n = snprintf(out, sizeof(out), "%s|%d", v != nullptr && strlen(v) == len ? v : "BAD",
+                   grpc_call_deadline(call) > 0);
+  (void)grpc_call_reply_data(call, out, (size_t)n);
+}
+
 static void fixture_start(h3_fixture *f, grpc_config cfg) {
   memset(f, 0, sizeof(*f));
   f->server = grpc_server_new(&cfg);
@@ -112,6 +126,7 @@ static void fixture_start(h3_fixture *f, grpc_config cfg) {
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(s, "/h3.Svc/Echo", echo, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(s, "/h3.Svc/Three", stream_three, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(s, "/h3.Svc/Stall", stall, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(s, "/h3.Svc/Meta", meta, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(s, "/h3.Svc/WhoAmI", whoami, f->peer_subject));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle_stream(s, "/h3.Svc/Sum",
                                                            &(grpc_stream_handler){
@@ -174,6 +189,16 @@ void test_http3_unary(void) {
     TEST_ASSERT_EQUAL_MEMORY(msg, resp.message->data, (size_t)n);
     grpc_client_response_free(&resp);
   }
+
+  /* request metadata and grpc-timeout reach the handler intact */
+  grpc_metadata md[] = {{.key = "x-key", .value = "value-123"}};
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(client, "/h3.Svc/Meta", "", 0, md, 1, 5000, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  TEST_ASSERT_NOT_NULL(resp.message);
+  TEST_ASSERT_EQUAL_UINT32(11, resp.message->len);
+  TEST_ASSERT_EQUAL_MEMORY("value-123|1", resp.message->data, 11);
+  grpc_client_response_free(&resp);
 
   /* unknown method: trailers-only UNIMPLEMENTED */
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
@@ -476,6 +501,15 @@ void test_http3_config_errors(void) {
                                                      .http3 = {.enable = true},
                                                      .log_level = GRPC_LOG_OFF},
                                       &err);
+  TEST_ASSERT_NULL(s);
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
+  /* ... and an IP address: QUIC cannot listen on a Unix socket */
+  s = grpc_server_new_ex(
+      &(grpc_config){.unix_path = "/tmp/grpc-h3-test.sock",
+                     .tls = {.cert_file = "test_cert.pem", .key_file = "test_key.pem"},
+                     .http3 = {.enable = true},
+                     .log_level = GRPC_LOG_OFF},
+      &err);
   TEST_ASSERT_NULL(s);
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
 

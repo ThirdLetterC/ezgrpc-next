@@ -207,6 +207,9 @@ endif()
       EXPORT_NAME shared
       VERSION "${PROJECT_VERSION}"
       SOVERSION "${PROJECT_VERSION_MAJOR}")
+    # dependencies from a custom prefix (GRPC_TLS_PREFIX: OpenSSL 3.5, ngtcp2, ...) stay findable
+    # after install; system library directories are never added
+    set_target_properties(grpc_shared PROPERTIES INSTALL_RPATH_USE_LINK_PATH ON)
   if(WIN32)
     # The DLL import library and the static archive must not both be grpc.lib.
     set_target_properties(grpc_shared PROPERTIES ARCHIVE_OUTPUT_NAME grpc_dll
@@ -243,6 +246,15 @@ if(GRPC_HTTP3_ENABLED)
   list(APPEND GRPC_LINK_LIBRARIES ${GRPC_HTTP3_TARGETS} ${GRPC_TLS_LIBRARIES})
 endif()
 target_link_libraries(grpc_objects PRIVATE ${GRPC_LINK_LIBRARIES})
+# Installed consumers of the static library also need ulog and every dependency; the shared
+# library records its dependencies itself.
+grpc_resolve_link_files(GRPC_INSTALL_LINK_FILES ${GRPC_LINK_LIBRARIES})
+foreach(item IN LISTS GRPC_INSTALL_LINK_FILES)
+  if(NOT item STREQUAL "Threads::Threads")
+    target_link_libraries(grpc_static PUBLIC "$<INSTALL_INTERFACE:${item}>")
+  endif()
+endforeach()
+target_link_libraries(grpc_static PUBLIC $<INSTALL_INTERFACE:ulog>)
 foreach(library_target IN LISTS GRPC_LIBRARY_TARGETS)
   target_link_libraries(${library_target} PUBLIC $<BUILD_INTERFACE:${GRPC_LINK_LIBRARIES}>)
   target_link_libraries(${library_target} PUBLIC $<INSTALL_INTERFACE:Threads::Threads>)
@@ -539,6 +551,23 @@ if(GRPC_INSTALL)
     "${CMAKE_CURRENT_BINARY_DIR}/ezGRPC-nextConfig.cmake"
     "${CMAKE_CURRENT_BINARY_DIR}/ezGRPC-nextConfigVersion.cmake"
     DESTINATION "${GRPC_INSTALL_CMAKEDIR}")
+  # pkg-config: the same dependency files for `--static`, and the feature defines in Cflags
+  set(GRPC_PC_LIBS_PRIVATE "-lulog")
+  foreach(item IN LISTS GRPC_INSTALL_LINK_FILES)
+    if(item STREQUAL "Threads::Threads")
+      string(APPEND GRPC_PC_LIBS_PRIVATE " -pthread")
+    elseif(IS_ABSOLUTE "${item}")
+      string(APPEND GRPC_PC_LIBS_PRIVATE " ${item}")
+    else()
+      string(APPEND GRPC_PC_LIBS_PRIVATE " -l${item}")
+    endif()
+  endforeach()
+  set(GRPC_PC_CFLAGS "")
+  foreach(def IN LISTS GRPC_PUBLIC_COMPILE_DEFINITIONS)
+    if(NOT def MATCHES "^\\$<")
+      string(APPEND GRPC_PC_CFLAGS " -D${def}")
+    endif()
+  endforeach()
   configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ezgrpc-next.pc.in"
     "${CMAKE_CURRENT_BINARY_DIR}/ezgrpc-next.pc" @ONLY)

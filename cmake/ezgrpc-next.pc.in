@@ -7,4 +7,5 @@ Name: ezGRPC-next
 Description: Lightweight, high-performance gRPC server library in C23
 Version: @PROJECT_VERSION@
 Libs: -L${libdir} -lgrpc
-Cflags: -I${includedir}
+Libs.private: @GRPC_PC_LIBS_PRIVATE@
+Cflags: -I${includedir}@GRPC_PC_CFLAGS@

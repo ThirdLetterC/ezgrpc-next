@@ -103,5 +103,6 @@ With TLS 1.3, a server that requires a client certificate may reject a client wi
 - **No 0-RTT** (early data) and no connection migration: the server advertises `disable_active_migration`.
 - **No draining period:** a closed connection is freed right after its CONNECTION_CLOSE is sent, without waiting out the QUIC draining period.
 - **Datagrams are sent with `uv_udp_try_send`**, one packet at a time, with no GSO or pacing beyond ngtcp2's. A full socket buffer drops the packet and QUIC loss recovery resends it.
+- **Multi-loop servers:** like the TCP listeners, the UDP socket sets `SO_REUSEPORT` on Unix, so several `grpc_server`s (one per thread) can share a port. The kernel spreads datagrams by address 4-tuple, so a connection stays on its loop. If a client's address changes mid-connection (NAT rebinding), its packets may reach a loop that doesn't know the connection, and the connection times out.
 - **Windows builds keep HTTP/3 off.** The CI does not install ngtcp2/nghttp3 there.
 - **Python `grpcio` has no HTTP/3.** HTTP/3 is tested with the library's own client (`src/tests/http3.c`). For interoperability checks, use .NET `Grpc.Net.Client` (which supports HTTP/3) or `curl --http3` with a gRPC-framed body.
