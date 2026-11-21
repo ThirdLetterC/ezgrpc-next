@@ -1,8 +1,35 @@
 @PACKAGE_INIT@
 
+# ezGRPC-next CMake package.
+#
+#   find_package(ezGRPC-next REQUIRED)                    # grpc::grpc (= grpc::static)
+#   find_package(ezGRPC-next REQUIRED COMPONENTS shared)  # also require grpc::shared
+#
+# Targets: grpc::static, grpc::shared (when built), and grpc::grpc, an alias of grpc::static.
+# Variables describing the build:
+#   ezGRPC-next_TLS_BACKEND   openssl, libressl, boringssl, awslc, wolfssl, gnutls, rustls or none
+#   ezGRPC-next_HTTP3         ON when built with HTTP/3 (QUIC)
+#   ezGRPC-next_FEATURES      the optional features compiled in (zlib, zstd, ..., http3)
+
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
 
 include("${CMAKE_CURRENT_LIST_DIR}/ezGRPC-nextTargets.cmake")
+
+set(ezGRPC-next_TLS_BACKEND "@_tls_backend@")
+set(ezGRPC-next_HTTP3 @GRPC_HTTP3_ENABLED@)
+set(ezGRPC-next_FEATURES "@GRPC_ENABLED_FEATURES@")
+
+if(TARGET grpc::static AND NOT TARGET grpc::grpc AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.18)
+  add_library(grpc::grpc ALIAS grpc::static)
+endif()
+set(ezGRPC-next_static_FOUND FALSE)
+if(TARGET grpc::static)
+  set(ezGRPC-next_static_FOUND TRUE)
+endif()
+set(ezGRPC-next_shared_FOUND FALSE)
+if(TARGET grpc::shared)
+  set(ezGRPC-next_shared_FOUND TRUE)
+endif()
 
 check_required_components(ezGRPC-next)

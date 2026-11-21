@@ -15,21 +15,26 @@
 #include "grpc_list.h"
 #include "unity.h"
 
-/* Deterministic countdown allocator for OOM fault-injection testing. */
+/* Deterministic countdown allocator for OOM fault-injection testing. It is installed once in
+ * main(), before any server thread exists, and stays installed: grpc_set_allocator() is not
+ * thread-safe, so tests switch failures on and off only through the atomic countdown
+ * (-1 = never fail, 0 = fail every allocation, n = fail after n more successes). */
 static atomic_int g_fail_after = -1;
 
 static bool should_fail(void) {
   int cur = atomic_load(&g_fail_after);
-  if (cur < 0)
-    return false;
-  if (cur == 0)
-    return true;
-  atomic_fetch_sub(&g_fail_after, 1);
-  return false;
+  for (;;) {
+    if (cur < 0)
+      return false;
+    if (cur == 0)
+      return true;
+    /* claim one successful allocation; retry if another thread took it first */
+    if (atomic_compare_exchange_weak(&g_fail_after, &cur, cur - 1))
+      return false;
+  }
 }
 
 static grpc_allocator g_base_alloc;
-static bool g_base_alloc_init = false;
 
 static void *oom_malloc(size_t sz) {
   return should_fail() ? nullptr : g_base_alloc.malloc(sz);
@@ -51,26 +56,25 @@ static void *oom_aligned_alloc(size_t align, size_t sz) {
   return should_fail() ? nullptr : g_base_alloc.aligned_alloc(align, sz);
 }
 
-static void oom_enable(int fail_after) {
-  if (!g_base_alloc_init) {
-    grpc_set_allocator(nullptr);
-    g_base_alloc = *grpc_get_allocator();
-    g_base_alloc_init = true;
-  }
-  atomic_store(&g_fail_after, fail_after);
-  grpc_allocator a = {
+/* Installs the countdown allocator on top of the default one; called once from main(). */
+static void oom_install(void) {
+  grpc_set_allocator(nullptr);
+  g_base_alloc = *grpc_get_allocator();
+  grpc_set_allocator(&(grpc_allocator){
       .malloc = oom_malloc,
       .calloc = oom_calloc,
       .realloc = oom_realloc,
       .free = oom_free,
       .aligned_alloc = oom_aligned_alloc,
-  };
-  grpc_set_allocator(&a);
+  });
+}
+
+static void oom_enable(int fail_after) {
+  atomic_store(&g_fail_after, fail_after);
 }
 
 static void oom_disable(void) {
   atomic_store(&g_fail_after, -1);
-  grpc_set_allocator(nullptr);
 }
 
 void setUp(void) {
@@ -566,6 +570,7 @@ int main(void) {
 #ifndef _WIN32
   signal(SIGPIPE, SIG_IGN);
 #endif
+  oom_install();
   UNITY_BEGIN();
   RUN_TEST(test_oom_primitives);
   RUN_TEST(test_oom_compression_and_status_details);

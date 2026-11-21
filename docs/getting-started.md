@@ -82,15 +82,45 @@ cmake --install build --prefix /usr/local
 Then in CMake:
 
 ```cmake
-find_package(ezGRPC-next REQUIRED)
-target_link_libraries(my_app PRIVATE grpc::static)
+find_package(ezGRPC-next REQUIRED)                  # or COMPONENTS shared to require grpc::shared
+target_link_libraries(my_app PRIVATE grpc::grpc)    # = grpc::static; or grpc::shared
+if(ezGRPC-next_HTTP3)                               # also ezGRPC-next_TLS_BACKEND, _FEATURES
+  message(STATUS "built with HTTP/3")
+endif()
 ```
 
-Or with `pkg-config`:
+The static target carries all of the library's dependencies, so nothing else needs to be found.
+
+Or with `pkg-config` (`--static` adds the dependencies for linking `libgrpc.a`):
 
 ```bash
 cc my_app.c $(pkg-config --cflags --libs ezgrpc-next)
+cc my_app.c $(pkg-config --cflags ezgrpc-next) /usr/local/lib/libgrpc.a $(pkg-config --static --libs-only-l --libs-only-other ezgrpc-next | sed 's/-lgrpc//')
 ```
+
+---
+
+## CMake Presets
+
+`CMakePresets.json` defines ready-made configurations. Each builds into `build/<preset>`:
+
+| Preset | Configuration |
+|:---|:---|
+| `dev` | Debug, every feature found on the system, tests and examples |
+| `release` | Release with IPO |
+| `asan` | Debug under AddressSanitizer + UndefinedBehaviorSanitizer |
+| `tsan` | Debug under ThreadSanitizer (run tests with `setarch -R` on kernels with high ASLR entropy) |
+| `http3` | Debug with HTTP/3 against `.tls/openssl` (see [HTTP/3](http3.md)) |
+| `minimal` | The library only: no TLS, codecs, serialization helpers, tests or examples |
+| `msvc` | Windows only: Visual Studio + vcpkg (`VCPKG_ROOT`), as in CI |
+
+```bash
+cmake --preset dev
+cmake --build --preset dev
+ctest --preset dev          # or --preset unit for the unit tests only
+```
+
+Put personal presets in `CMakeUserPresets.json` (ignored by git).
 
 ---
 
@@ -111,7 +141,8 @@ cc my_app.c $(pkg-config --cflags --libs ezgrpc-next)
 | `-DGRPC_ZLIB`, `-DGRPC_ZSTD`, `-DGRPC_SNAPPY` | Optional codecs (`AUTO`, `ON`, or `OFF`) |
 | `-DGRPC_DEBUG_LOGS=ON` | Enables debug logging and debug symbols |
 | `-DGRPC_TRACE=ON` | Enables per-frame HTTP/2 trace logging |
-| `-DGRPC_ASAN=ON` | Builds with AddressSanitizer (GCC/Clang) |
+| `-DGRPC_ASAN=ON` | Builds with AddressSanitizer (GCC/Clang); same as `-DGRPC_SANITIZE=address` |
+| `-DGRPC_SANITIZE=<list>` | Sanitizers for the library, tests and examples (GCC/Clang), e.g. `address;undefined` or `thread` |
 | `-DGRPC_BUILD_TESTS=OFF` | Skips unit tests |
 | `-DGRPC_BUILD_INTEGRATION_TESTS=OFF` | Skips Python client integration tests |
 | `-DGRPC_BUILD_EXAMPLES=OFF` | Skips example server targets |

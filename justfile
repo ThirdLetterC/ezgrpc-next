@@ -50,9 +50,7 @@ asan:
 
 # Build and test under ThreadSanitizer (in build-tsan)
 tsan:
-    cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug \
-      -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer" \
-      -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread" -DCMAKE_SHARED_LINKER_FLAGS="-fsanitize=thread"
+    cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DGRPC_SANITIZE=thread
     cmake --build build-tsan --parallel {{jobs}}
     setarch -R ctest --test-dir build-tsan --output-on-failure -j {{jobs}}
 

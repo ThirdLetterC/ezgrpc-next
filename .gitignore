@@ -40,6 +40,7 @@ examples/python_client_c_server/server.key
 .tls/
 /build/
 /build-*/
+CMakeUserPresets.json
 CMakeFiles/
 CMakeCache.txt
 CTestTestfile.cmake

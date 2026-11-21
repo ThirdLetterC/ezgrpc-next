@@ -1,0 +1,114 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "dev",
+      "displayName": "Development (Debug)",
+      "description": "Debug build with every feature found on the system, tests and examples.",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "release",
+      "displayName": "Release + IPO",
+      "description": "Optimized build with interprocedural optimization.",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "GRPC_IPO": "ON" }
+    },
+    {
+      "name": "asan",
+      "displayName": "AddressSanitizer + UBSan",
+      "description": "Debug build under AddressSanitizer and UndefinedBehaviorSanitizer (GCC/Clang).",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "GRPC_SANITIZE": "address;undefined" }
+    },
+    {
+      "name": "tsan",
+      "displayName": "ThreadSanitizer",
+      "description": "Debug build under ThreadSanitizer (GCC/Clang). On kernels with high ASLR entropy run the tests with `setarch -R` (just tsan does).",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "GRPC_SANITIZE": "thread" }
+    },
+    {
+      "name": "http3",
+      "displayName": "HTTP/3 (OpenSSL 3.5)",
+      "description": "Debug build with HTTP/3, using OpenSSL 3.5, ngtcp2 and nghttp3 from .tls/openssl (created by `just http3` or scripts/build-tls-backend.sh + scripts/build-quic-deps.sh).",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "GRPC_HTTP3": "ON",
+        "GRPC_TLS_BACKEND": "openssl",
+        "GRPC_TLS_PREFIX": "${sourceDir}/.tls/openssl",
+        "OPENSSL_ROOT_DIR": "${sourceDir}/.tls/openssl"
+      }
+    },
+    {
+      "name": "minimal",
+      "displayName": "Minimal library",
+      "description": "Library only: no TLS, codecs, serialization helpers, tests or examples.",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "GRPC_TLS_BACKEND": "none",
+        "GRPC_ZLIB": "OFF",
+        "GRPC_ZSTD": "OFF",
+        "GRPC_SNAPPY": "OFF",
+        "GRPC_PROTOBUF_C": "OFF",
+        "GRPC_FLATCC": "OFF",
+        "GRPC_HTTP3": "OFF",
+        "GRPC_BUILD_TESTS": "OFF",
+        "GRPC_BUILD_EXAMPLES": "OFF",
+        "GRPC_BUILD_INTEGRATION_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "msvc",
+      "displayName": "Windows / MSVC + vcpkg",
+      "description": "Visual Studio build with dependencies from vcpkg (VCPKG_ROOT), as in CI.",
+      "inherits": "base",
+      "architecture": { "value": "x64", "strategy": "set" },
+      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "GRPC_PROTOBUF_C": "OFF",
+        "GRPC_FLATCC": "OFF",
+        "GRPC_ZLIB": "ON",
+        "GRPC_ZSTD": "ON",
+        "GRPC_SNAPPY": "ON"
+      },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "tsan", "configurePreset": "tsan" },
+    { "name": "http3", "configurePreset": "http3" },
+    { "name": "minimal", "configurePreset": "minimal" },
+    { "name": "msvc", "configurePreset": "msvc", "configuration": "Debug" }
+  ],
+  "testPresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "noTestsAction": "error" }
+    },
+    { "name": "dev", "inherits": "base", "configurePreset": "dev" },
+    { "name": "release", "inherits": "base", "configurePreset": "release" },
+    { "name": "asan", "inherits": "base", "configurePreset": "asan" },
+    { "name": "tsan", "inherits": "base", "configurePreset": "tsan" },
+    { "name": "http3", "inherits": "base", "configurePreset": "http3" },
+    { "name": "unit", "inherits": "base", "configurePreset": "dev", "filter": { "include": { "label": "unit" } } },
+    { "name": "msvc", "inherits": "base", "configurePreset": "msvc", "configuration": "Debug" }
+  ]
+}

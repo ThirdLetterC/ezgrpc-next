@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.20...3.31)
 project(ezGRPC-next VERSION 1.0.0 LANGUAGES C)
 
 if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
@@ -9,6 +9,11 @@ endif()
 
 if(GRPC_IS_TOP_LEVEL AND NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+if(GRPC_IS_TOP_LEVEL AND "${CMAKE_EXPORT_COMPILE_COMMANDS}" STREQUAL "")
+  # compile_commands.json for clangd and other tools unless the caller chose (CMake pre-creates
+  # an empty cache entry; an explicit OFF is kept). Generators without support ignore it.
+  set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "Write compile_commands.json" FORCE)
 endif()
 
 if(GRPC_IS_TOP_LEVEL)
@@ -41,7 +46,9 @@ option(GRPC_BUILD_INTEGRATION_TESTS "Register Python gRPC integration tests" ${_
 option(GRPC_BUILD_DEVELOPER_TARGETS "Add source formatting targets" ${GRPC_IS_TOP_LEVEL})
 option(GRPC_INSTALL "Generate CMake install and pkg-config targets" ${GRPC_IS_TOP_LEVEL})
 option(GRPC_IPO "Enable interprocedural optimization in optimized configurations" OFF)
-option(GRPC_ASAN "Build with AddressSanitizer" OFF)
+option(GRPC_ASAN "Build with AddressSanitizer (same as GRPC_SANITIZE=address)" OFF)
+set(GRPC_SANITIZE "" CACHE STRING
+  "Sanitizers for the library, tests and examples (GCC/Clang), e.g. address;undefined or thread")
 option(GRPC_DEBUG_LOGS "Compile debug logging support" OFF)
 option(GRPC_TRACE "Compile per-frame trace logging" OFF)
 set(GRPC_ALLOCATOR "default" CACHE STRING "Allocator: default, mimalloc, or jemalloc")
@@ -269,13 +276,24 @@ foreach(library_target IN LISTS GRPC_LIBRARY_TARGETS)
   target_compile_definitions(${library_target} PUBLIC ${GRPC_PUBLIC_COMPILE_DEFINITIONS})
 endforeach()
 
+set(_grpc_sanitizers ${GRPC_SANITIZE})
 if(GRPC_ASAN)
+  list(APPEND _grpc_sanitizers address)
+endif()
+list(REMOVE_DUPLICATES _grpc_sanitizers)
+if(_grpc_sanitizers)
   if(MSVC)
-    message(FATAL_ERROR "GRPC_ASAN is currently supported only with GCC/Clang")
+    message(FATAL_ERROR "GRPC_SANITIZE / GRPC_ASAN are supported only with GCC/Clang")
   endif()
+  if("thread" IN_LIST _grpc_sanitizers AND ("address" IN_LIST _grpc_sanitizers OR
+                                            "memory" IN_LIST _grpc_sanitizers))
+    message(FATAL_ERROR "the thread sanitizer cannot be combined with address or memory")
+  endif()
+  list(JOIN _grpc_sanitizers "," _grpc_sanitize_flag)
   add_library(grpc_sanitizers INTERFACE)
-  target_compile_options(grpc_sanitizers INTERFACE -fsanitize=address -fno-omit-frame-pointer)
-  target_link_options(grpc_sanitizers INTERFACE -fsanitize=address)
+  target_compile_options(grpc_sanitizers INTERFACE
+    -fsanitize=${_grpc_sanitize_flag} -fno-omit-frame-pointer)
+  target_link_options(grpc_sanitizers INTERFACE -fsanitize=${_grpc_sanitize_flag})
   foreach(target IN LISTS GRPC_LIBRARY_TARGETS)
     target_link_libraries(${target} PUBLIC grpc_sanitizers)
   endforeach()
@@ -285,49 +303,69 @@ endif()
 
 set(GRPC_TEST_TARGETS)
 set(GRPC_EXAMPLE_TARGETS)
+
+# Generates a self-signed certificate for CN=localhost into <dir>/<cert> and <dir>/<key> with the
+# host openssl command, behind a custom target <target>. The selected TLS prefix is not searched:
+# AWS-LC's installed CLI can resolve against an incompatible system libssl at run time.
+function(grpc_add_certificate target dir cert key)
+  find_program(GRPC_HOST_OPENSSL_EXECUTABLE NAMES openssl REQUIRED NO_CMAKE_PATH)
+  file(MAKE_DIRECTORY "${dir}")
+  add_custom_command(OUTPUT "${dir}/${cert}" "${dir}/${key}"
+    COMMAND "${GRPC_HOST_OPENSSL_EXECUTABLE}" req -batch -x509 -newkey rsa:2048 -nodes
+      -keyout "${dir}/${key}" -out "${dir}/${cert}" -days 365 -subj /CN=localhost
+    VERBATIM)
+  add_custom_target(${target} DEPENDS "${dir}/${cert}" "${dir}/${key}")
+endfunction()
+
 if(GRPC_BUILD_TESTS)
   enable_testing()
+  # grpc_add_unit_test(<name> <source> [LIBRARY grpc_static|grpc_shared] [SOURCES ...]
+  #                    [INCLUDES ...] [DEFINITIONS ...] [WORKING_DIRECTORY dir] [DEPENDS target...])
+  # Builds test_<name> from <source> and Unity and registers it as test <name>.
   function(grpc_add_unit_test name source)
-    add_executable(test_${name} "${source}" src/tests/unity/unity.c)
-    target_include_directories(test_${name} PRIVATE src/tests/unity include/internal)
-    target_link_libraries(test_${name} PRIVATE grpc_static)
+    cmake_parse_arguments(arg "" "LIBRARY;WORKING_DIRECTORY" "SOURCES;INCLUDES;DEFINITIONS;DEPENDS"
+                          ${ARGN})
+    if(NOT arg_LIBRARY)
+      set(arg_LIBRARY grpc_static)
+    endif()
+    add_executable(test_${name} "${source}" src/tests/unity/unity.c ${arg_SOURCES})
+    target_include_directories(test_${name} PRIVATE src/tests/unity include/internal ${arg_INCLUDES})
+    target_link_libraries(test_${name} PRIVATE ${arg_LIBRARY})
+    if(arg_DEFINITIONS)
+      target_compile_definitions(test_${name} PRIVATE ${arg_DEFINITIONS})
+    endif()
+    if(arg_DEPENDS)
+      add_dependencies(test_${name} ${arg_DEPENDS})
+    endif()
     add_test(NAME ${name} COMMAND test_${name})
-    list(APPEND GRPC_TEST_TARGETS test_${name})
-    set(GRPC_TEST_TARGETS "${GRPC_TEST_TARGETS}" PARENT_SCOPE)
+    if(arg_WORKING_DIRECTORY)
+      set_tests_properties(${name} PROPERTIES WORKING_DIRECTORY "${arg_WORKING_DIRECTORY}")
+    endif()
+    set(GRPC_TEST_TARGETS ${GRPC_TEST_TARGETS} test_${name} PARENT_SCOPE)
   endfunction()
 
-  foreach(name IN ITEMS api list mem metadata timeout compression health interceptor status_details reflection version client integration oom)
+  foreach(name IN ITEMS api list mem metadata timeout compression health interceptor status_details
+                        reflection version client integration oom)
     grpc_add_unit_test(${name} "src/tests/${name}.c")
   endforeach()
 
   if(GRPC_BUILD_SHARED)
-    add_executable(test_version_shared src/tests/version.c src/tests/unity/unity.c)
-    target_include_directories(test_version_shared PRIVATE src/tests/unity)
-    target_link_libraries(test_version_shared PRIVATE grpc_shared)
-    add_test(NAME version_shared COMMAND test_version_shared)
-    list(APPEND GRPC_TEST_TARGETS test_version_shared)
-  endif()
-
-  if(WIN32 AND GRPC_BUILD_SHARED)
-    # Exercise the DLL import library as well as the default static target.
-    add_executable(test_mem_shared src/tests/mem.c src/tests/unity/unity.c)
-    target_include_directories(test_mem_shared PRIVATE src/tests/unity)
-    target_link_libraries(test_mem_shared PRIVATE grpc_shared)
-    add_test(NAME mem_shared COMMAND test_mem_shared)
-    list(APPEND GRPC_TEST_TARGETS test_mem_shared)
+    grpc_add_unit_test(version_shared src/tests/version.c LIBRARY grpc_shared)
+    if(WIN32)
+      # exercise the DLL import library as well as the default static target
+      grpc_add_unit_test(mem_shared src/tests/mem.c LIBRARY grpc_shared)
+    endif()
   endif()
 
   if(GRPC_PROTOBUF_C_ENABLED)
     set(proto_test_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/protobuf-tests")
     file(MAKE_DIRECTORY "${proto_test_dir}")
     add_custom_command(OUTPUT "${proto_test_dir}/test_msg.pb-c.c" "${proto_test_dir}/test_msg.pb-c.h"
-      COMMAND "${PROTOC_C_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/src/tests" "--c_out=${proto_test_dir}" "${CMAKE_CURRENT_SOURCE_DIR}/src/tests/test_msg.proto"
+      COMMAND "${PROTOC_C_EXECUTABLE}" -I "${CMAKE_CURRENT_SOURCE_DIR}/src/tests"
+        "--c_out=${proto_test_dir}" "${CMAKE_CURRENT_SOURCE_DIR}/src/tests/test_msg.proto"
       DEPENDS src/tests/test_msg.proto VERBATIM)
-    add_executable(test_pb src/tests/pb.c src/tests/unity/unity.c "${proto_test_dir}/test_msg.pb-c.c")
-    target_include_directories(test_pb PRIVATE src/tests/unity "${proto_test_dir}")
-    target_link_libraries(test_pb PRIVATE grpc_static)
-    add_test(NAME pb COMMAND test_pb)
-    list(APPEND GRPC_TEST_TARGETS test_pb)
+    grpc_add_unit_test(pb src/tests/pb.c
+      SOURCES "${proto_test_dir}/test_msg.pb-c.c" INCLUDES "${proto_test_dir}")
   endif()
 
   if(GRPC_FLATCC_ENABLED)
@@ -340,47 +378,40 @@ if(GRPC_BUILD_TESTS)
       endforeach()
     endforeach()
     add_custom_command(OUTPUT ${flat_test_outputs}
-      COMMAND "${FLATCC_EXECUTABLE}" -a "${CMAKE_CURRENT_SOURCE_DIR}/src/tests/test_msg.fbs" "${CMAKE_CURRENT_SOURCE_DIR}/src/tests/test_noid.fbs"
+      COMMAND "${FLATCC_EXECUTABLE}" -a "${CMAKE_CURRENT_SOURCE_DIR}/src/tests/test_msg.fbs"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/tests/test_noid.fbs"
       WORKING_DIRECTORY "${flat_test_dir}"
       DEPENDS src/tests/test_msg.fbs src/tests/test_noid.fbs VERBATIM)
-    add_executable(test_fb src/tests/fb.c src/tests/unity/unity.c ${flat_test_outputs})
-    target_include_directories(test_fb PRIVATE src/tests/unity "${flat_test_dir}")
-    target_link_libraries(test_fb PRIVATE grpc_static)
-    add_test(NAME fb COMMAND test_fb)
-    list(APPEND GRPC_TEST_TARGETS test_fb)
+    grpc_add_unit_test(fb src/tests/fb.c SOURCES ${flat_test_outputs} INCLUDES "${flat_test_dir}")
   endif()
 
   if(GRPC_TLS_ENABLED)
-    # Certificate generation needs a host openssl command. Do not search the
-    # selected TLS prefix: AWS-LC's installed CLI can resolve against an
-    # incompatible system libssl at runtime.
-    find_program(GRPC_HOST_OPENSSL_EXECUTABLE NAMES openssl REQUIRED NO_CMAKE_PATH)
     set(tls_test_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/tls-tests")
-    file(MAKE_DIRECTORY "${tls_test_dir}")
-    add_custom_command(OUTPUT "${tls_test_dir}/test_cert.pem" "${tls_test_dir}/test_key.pem"
-      COMMAND "${GRPC_HOST_OPENSSL_EXECUTABLE}" req -batch -x509 -newkey rsa:2048 -nodes -keyout "${tls_test_dir}/test_key.pem" -out "${tls_test_dir}/test_cert.pem" -days 365 -subj /CN=localhost
-      VERBATIM)
-    add_custom_target(test_tls_certificates DEPENDS "${tls_test_dir}/test_cert.pem" "${tls_test_dir}/test_key.pem")
-    add_executable(test_tls src/tests/tls.c src/tests/unity/unity.c)
-    target_include_directories(test_tls PRIVATE src/tests/unity include/internal)
-    target_compile_definitions(test_tls PRIVATE "EXPECTED_TLS_BACKEND=\"${_tls_backend}\"")
-    target_link_libraries(test_tls PRIVATE grpc_static)
-    add_dependencies(test_tls test_tls_certificates)
-    add_test(NAME tls COMMAND test_tls)
-    set_tests_properties(tls PROPERTIES WORKING_DIRECTORY "${tls_test_dir}")
-    list(APPEND GRPC_TEST_TARGETS test_tls)
+    grpc_add_certificate(test_tls_certificates "${tls_test_dir}" test_cert.pem test_key.pem)
+    grpc_add_unit_test(tls src/tests/tls.c
+      DEFINITIONS "EXPECTED_TLS_BACKEND=\"${_tls_backend}\""
+      WORKING_DIRECTORY "${tls_test_dir}" DEPENDS test_tls_certificates)
     if(GRPC_HTTP3_ENABLED)
-      add_executable(test_http3 src/tests/http3.c src/tests/unity/unity.c)
-      target_include_directories(test_http3 PRIVATE src/tests/unity include/internal)
-      target_link_libraries(test_http3 PRIVATE grpc_static)
-      add_dependencies(test_http3 test_tls_certificates)
-      add_test(NAME http3 COMMAND test_http3)
-      set_tests_properties(http3 PROPERTIES WORKING_DIRECTORY "${tls_test_dir}")
-      list(APPEND GRPC_TEST_TARGETS test_http3)
+      grpc_add_unit_test(http3 src/tests/http3.c
+        WORKING_DIRECTORY "${tls_test_dir}" DEPENDS test_tls_certificates)
     endif()
   endif()
-
 endif()
+
+# grpc_add_integration_test(<name> SERVER <target> CLIENT <script> PORT <n> CWD <dir>
+#                           [PYTHON_PATH dir] [ARGS ...])
+# Runs scripts/run-integration-test.py: starts the example server, then the Python client.
+function(grpc_add_integration_test name)
+  cmake_parse_arguments(arg "" "SERVER;CLIENT;PORT;CWD;PYTHON_PATH" "ARGS" ${ARGN})
+  set(extra ${arg_ARGS})
+  if(arg_PYTHON_PATH)
+    list(APPEND extra --python-path "${arg_PYTHON_PATH}")
+  endif()
+  add_test(NAME integration_${name}
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run-integration-test.py"
+      --server "$<TARGET_FILE:${arg_SERVER}>" --client "${arg_CLIENT}"
+      --port ${arg_PORT} --cwd "${arg_CWD}" ${extra})
+endfunction()
 
 if(GRPC_BUILD_EXAMPLES)
   add_executable(example_single_threaded examples/single_threaded.c)
@@ -416,25 +447,18 @@ if(GRPC_BUILD_EXAMPLES)
     list(APPEND GRPC_EXAMPLE_TARGETS example_grpc_server)
 
     if(GRPC_TLS_ENABLED AND GRPC_BUILD_INTEGRATION_TESTS)
-      find_program(GRPC_HOST_OPENSSL_EXECUTABLE NAMES openssl REQUIRED NO_CMAKE_PATH)
-      add_custom_command(OUTPUT "${proto_example_dir}/server.crt" "${proto_example_dir}/server.key"
-        COMMAND "${GRPC_HOST_OPENSSL_EXECUTABLE}" req -batch -x509 -newkey rsa:2048 -nodes -keyout "${proto_example_dir}/server.key" -out "${proto_example_dir}/server.crt" -days 365 -subj /CN=localhost
-        VERBATIM)
-      add_custom_target(example_tls_certificates DEPENDS "${proto_example_dir}/server.crt" "${proto_example_dir}/server.key")
+      grpc_add_certificate(example_tls_certificates "${proto_example_dir}" server.crt server.key)
       add_dependencies(example_grpc_server example_tls_certificates)
     endif()
 
     if(GRPC_BUILD_INTEGRATION_TESTS)
       add_dependencies(example_grpc_server example_python_proto)
-      add_test(NAME integration_grpc_cleartext
-        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run-integration-test.py"
-          --server "$<TARGET_FILE:example_grpc_server>" --client "${CMAKE_CURRENT_SOURCE_DIR}/examples/python_client_c_server/client.py"
-          --python-path "${proto_python_dir}" --port 19009 --cwd "${proto_example_dir}")
+      set(greeter_client "${CMAKE_CURRENT_SOURCE_DIR}/examples/python_client_c_server/client.py")
+      grpc_add_integration_test(grpc_cleartext SERVER example_grpc_server CLIENT "${greeter_client}"
+        PYTHON_PATH "${proto_python_dir}" PORT 19009 CWD "${proto_example_dir}")
       if(GRPC_TLS_ENABLED)
-        add_test(NAME integration_grpc_tls
-          COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run-integration-test.py"
-            --server "$<TARGET_FILE:example_grpc_server>" --client "${CMAKE_CURRENT_SOURCE_DIR}/examples/python_client_c_server/client.py"
-            --python-path "${proto_python_dir}" --port 19019 --cwd "${proto_example_dir}" --tls)
+        grpc_add_integration_test(grpc_tls SERVER example_grpc_server CLIENT "${greeter_client}"
+          PYTHON_PATH "${proto_python_dir}" PORT 19019 CWD "${proto_example_dir}" ARGS --tls)
         set_tests_properties(integration_grpc_tls PROPERTIES DEPENDS integration_grpc_cleartext)
       endif()
     endif()
@@ -457,22 +481,19 @@ if(GRPC_BUILD_EXAMPLES)
     target_link_libraries(example_flatbuffers_server PRIVATE grpc_static)
     list(APPEND GRPC_EXAMPLE_TARGETS example_flatbuffers_server)
     if(GRPC_BUILD_INTEGRATION_TESTS)
-      add_test(NAME integration_flatbuffers
-        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run-integration-test.py"
-          --server "$<TARGET_FILE:example_flatbuffers_server>" --client "${CMAKE_CURRENT_SOURCE_DIR}/examples/flatbuffers/client.py"
-          --python-path "${CMAKE_CURRENT_SOURCE_DIR}/examples/flatbuffers" --port 19029 --cwd "${flat_example_dir}")
+      grpc_add_integration_test(flatbuffers SERVER example_flatbuffers_server
+        CLIENT "${CMAKE_CURRENT_SOURCE_DIR}/examples/flatbuffers/client.py"
+        PYTHON_PATH "${CMAKE_CURRENT_SOURCE_DIR}/examples/flatbuffers" PORT 19029
+        CWD "${flat_example_dir}")
     endif()
   endif()
 
   if(GRPC_BUILD_INTEGRATION_TESTS)
-    add_test(NAME integration_single_threaded
-      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run-integration-test.py"
-        --server "$<TARGET_FILE:example_single_threaded>" --client "${CMAKE_CURRENT_SOURCE_DIR}/examples/test_examples.py"
-        --client-arg single --port 19041 --cwd "${CMAKE_CURRENT_BINARY_DIR}")
-    add_test(NAME integration_multi_threaded
-      COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run-integration-test.py"
-        --server "$<TARGET_FILE:example_multi_threaded>" --client "${CMAKE_CURRENT_SOURCE_DIR}/examples/test_examples.py"
-        --client-arg multi --port 19042 --cwd "${CMAKE_CURRENT_BINARY_DIR}")
+    set(examples_client "${CMAKE_CURRENT_SOURCE_DIR}/examples/test_examples.py")
+    grpc_add_integration_test(single_threaded SERVER example_single_threaded
+      CLIENT "${examples_client}" PORT 19041 CWD "${CMAKE_CURRENT_BINARY_DIR}" ARGS --client-arg single)
+    grpc_add_integration_test(multi_threaded SERVER example_multi_threaded
+      CLIENT "${examples_client}" PORT 19042 CWD "${CMAKE_CURRENT_BINARY_DIR}" ARGS --client-arg multi)
   endif()
 endif()
 
@@ -539,6 +560,16 @@ if(GRPC_INSTALL)
     FILE ezGRPC-nextTargets.cmake
     NAMESPACE grpc::
     DESTINATION "${GRPC_INSTALL_CMAKEDIR}")
+  set(GRPC_ENABLED_FEATURES)
+  foreach(feature IN ITEMS ZLIB ZSTD SNAPPY PROTOBUF_C FLATCC HTTP3)
+    if(GRPC_${feature}_ENABLED)
+      string(TOLOWER "${feature}" feature_name)
+      list(APPEND GRPC_ENABLED_FEATURES "${feature_name}")
+    endif()
+  endforeach()
+  if(NOT GRPC_HTTP3_ENABLED)
+    set(GRPC_HTTP3_ENABLED OFF)
+  endif()
   configure_package_config_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ezGRPC-nextConfig.cmake.in"
     "${CMAKE_CURRENT_BINARY_DIR}/ezGRPC-nextConfig.cmake"
@@ -575,9 +606,36 @@ if(GRPC_INSTALL)
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig")
 endif()
 
+# ---- configuration summary ------------------------------------------------------------------
+function(grpc_summary_flag out value)
+  if(value)
+    set(${out} "yes" PARENT_SCOPE)
+  else()
+    set(${out} "no" PARENT_SCOPE)
+  endif()
+endfunction()
+foreach(feature IN ITEMS ZLIB ZSTD SNAPPY PROTOBUF_C FLATCC HTTP3 BUILD_SHARED BUILD_TESTS
+                         BUILD_EXAMPLES BUILD_INTEGRATION_TESTS IPO)
+  if(DEFINED GRPC_${feature}_ENABLED)
+    grpc_summary_flag(_s_${feature} "${GRPC_${feature}_ENABLED}")
+  else()
+    grpc_summary_flag(_s_${feature} "${GRPC_${feature}}")
+  endif()
+endforeach()
+set(_s_http3_detail "")
 if(GRPC_HTTP3_ENABLED)
-  set(GRPC_QUIC_CRYPTO_SUFFIX " (ngtcp2_crypto_${GRPC_QUIC_CRYPTO})")
+  set(_s_http3_detail " (ngtcp2_crypto_${GRPC_QUIC_CRYPTO})")
 endif()
-message(STATUS "ezGRPC-next TLS backend: ${_tls_backend}")
-message(STATUS "ezGRPC-next IPO: ${GRPC_IPO}")
-message(STATUS "ezGRPC-next optional features: zlib=${GRPC_ZLIB_ENABLED}, zstd=${GRPC_ZSTD_ENABLED}, snappy=${GRPC_SNAPPY_ENABLED}, protobuf-c=${GRPC_PROTOBUF_C_ENABLED}, flatcc=${GRPC_FLATCC_ENABLED}, http3=${GRPC_HTTP3_ENABLED}${GRPC_QUIC_CRYPTO_SUFFIX}")
+set(_s_sanitizers "none")
+if(_grpc_sanitizers)
+  list(JOIN _grpc_sanitizers "," _s_sanitizers)
+endif()
+message(STATUS "ezGRPC-next ${PROJECT_VERSION} configuration:
+     build type     ${CMAKE_BUILD_TYPE}
+     TLS backend    ${_tls_backend}
+     allocator      ${GRPC_ALLOCATOR}
+     codecs         zlib=${_s_ZLIB} zstd=${_s_ZSTD} snappy=${_s_SNAPPY}
+     serialization  protobuf-c=${_s_PROTOBUF_C} flatcc=${_s_FLATCC}
+     HTTP/3         ${_s_HTTP3}${_s_http3_detail}
+     shared library ${_s_BUILD_SHARED}   IPO ${_s_IPO}   sanitizers ${_s_sanitizers}
+     tests          unit=${_s_BUILD_TESTS} integration=${_s_BUILD_INTEGRATION_TESTS} examples=${_s_BUILD_EXAMPLES}")
