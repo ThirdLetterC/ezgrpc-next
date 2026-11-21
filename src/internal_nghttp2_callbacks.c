@@ -43,13 +43,13 @@ static size_t parse_grpc_message(void *data, size_t len, grpc_compression_algori
     if (cflag == 1) {
       uint8_t *decomp = nullptr;
       size_t decomp_len = 0;
-      int result = grpc_decompress_limited(encoding, (const uint8_t *)msg_data, msg_len,
-                                           &decomp, &decomp_len, max_output);
-      if (result == 5) {
+      grpc_err result = grpc_decompress_limited(encoding, (const uint8_t *)msg_data, msg_len,
+                                                &decomp, &decomp_len, max_output);
+      if (result == GRPC_ERR_LIMIT) {
         *too_large = true;
         return 0;
       }
-      if (result == 0) {
+      if (result == GRPC_OK) {
         msg = message_create(0, decomp, decomp_len);
         grpc_free(decomp);
       } else {
@@ -292,6 +292,8 @@ static inline int on_frame_recv_headers(grpc_session *ezsession, const nghttp2_f
   /* a request stream without messages, e.g. an empty client stream */
   if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
     call->half_closed = true;
+    call_queue(call);
+  } else if (ezstream->route->kind == ROUTE_STREAM && ezstream->route->stream.on_start != nullptr) {
     call_queue(call);
   }
   return 0;

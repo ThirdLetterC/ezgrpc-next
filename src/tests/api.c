@@ -29,23 +29,43 @@ static void on_message([[maybe_unused]] grpc_call *call,
                        [[maybe_unused]] const grpc_message *message,
                        [[maybe_unused]] void *userdata) {}
 
+static void on_start([[maybe_unused]] grpc_call *call, [[maybe_unused]] void *userdata) {}
+
 void test_config_validation(void) {
-  /* a port is required */
-  TEST_ASSERT_NULL(grpc_server_new(nullptr));
-  TEST_ASSERT_NULL(grpc_server_new(&(grpc_config){.log_level = GRPC_LOG_OFF}));
+  grpc_err err = GRPC_OK;
+  /* nullptr config is invalid */
+  TEST_ASSERT_NULL(grpc_server_new_ex(nullptr, &err));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
+  /* port = 0 binds an OS-assigned ephemeral port */
+  grpc_server *ephemeral = grpc_server_new_ex(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF}, &err);
+  TEST_ASSERT_NOT_NULL(ephemeral);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, err);
+  TEST_ASSERT_TRUE(grpc_server_port(ephemeral) > 0);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_drain(ephemeral, 50));
+  grpc_server_free(ephemeral);
+  TEST_ASSERT_EQUAL_UINT16(0, grpc_server_port(nullptr));
+
   /* invalid addresses and limits */
-  TEST_ASSERT_NULL(grpc_server_new(&(grpc_config){
-      .port = PORT, .ipv4_addr = "not an address", .log_level = GRPC_LOG_OFF}));
-  TEST_ASSERT_NULL(grpc_server_new(&(grpc_config){
-      .port = PORT, .max_frame_size = 100, .log_level = GRPC_LOG_OFF}));
-  /* TLS needs both files */
-  TEST_ASSERT_NULL(grpc_server_new(&(grpc_config){
-      .port = PORT, .tls.cert_file = "cert.pem", .log_level = GRPC_LOG_OFF}));
+  TEST_ASSERT_NULL(grpc_server_new_ex(&(grpc_config){
+      .port = PORT, .ipv4_addr = "not an address", .log_level = GRPC_LOG_OFF}, &err));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
+  TEST_ASSERT_NULL(grpc_server_new_ex(&(grpc_config){
+      .port = PORT, .max_frame_size = 100, .log_level = GRPC_LOG_OFF}, &err));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
+  /* TLS needs both files or both PEMs */
+  TEST_ASSERT_NULL(grpc_server_new_ex(&(grpc_config){
+      .port = PORT, .tls.cert_file = "cert.pem", .log_level = GRPC_LOG_OFF}, &err));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
+  TEST_ASSERT_NULL(grpc_server_new_ex(&(grpc_config){
+      .port = PORT, .tls.cert_pem = "pem", .log_level = GRPC_LOG_OFF}, &err));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
 
   /* only the given address family */
   grpc_server *server = grpc_server_new(
       &(grpc_config){.port = PORT, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
   TEST_ASSERT_NOT_NULL(server);
+  TEST_ASSERT_EQUAL_UINT16(PORT, grpc_server_port(server));
   grpc_server_free(server);
 
   grpc_server_free(nullptr);
@@ -69,6 +89,10 @@ void test_routes(void) {
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_server_handle_stream(
                             server, "/a.B/D", &(grpc_stream_handler){.on_message = on_message},
+                            nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle_stream(
+                            server, "/a.B/StartOnly", &(grpc_stream_handler){.on_start = on_start},
                             nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_register_path(server, "/a.B/E", nullptr));
 
@@ -227,10 +251,24 @@ void test_call_null_safety(void) {
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_finish(nullptr, GRPC_STATUS_OK, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_send(nullptr, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_send_data(nullptr, "x", 1));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_reply(nullptr, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_reply_data(nullptr, "x", 1));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_set_compression(nullptr, GRPC_COMPRESS_GZIP, -1));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_send_async(nullptr, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_send_data_async(nullptr, "x", 1));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_reply_async(nullptr, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_send_metadata_async(nullptr, nullptr, 0));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_add_trailers_async(nullptr, nullptr, 0));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
+                        grpc_call_finish_with_details_async(nullptr, GRPC_STATUS_INTERNAL, nullptr,
+                                                            nullptr, 0));
   TEST_ASSERT_NULL(grpc_call_metadata(nullptr, "key", nullptr));
+  size_t idx = 0;
+  TEST_ASSERT_NULL(grpc_call_metadata_next(nullptr, "key", &idx, nullptr));
+  TEST_ASSERT_NULL(grpc_call_peer_cert_subject(nullptr));
   TEST_ASSERT_EQUAL_INT64(-1, grpc_call_deadline(nullptr));
   TEST_ASSERT_FALSE(grpc_call_is_cancelled(nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_drain(nullptr, 0));
   grpc_call_unref(nullptr);
 }
 

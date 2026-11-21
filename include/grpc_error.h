@@ -31,6 +31,12 @@ typedef enum grpc_err {
   GRPC_ERR_UNSUPPORTED = -9,
   /** A system call failed. */
   GRPC_ERR_IO = -10,
+  /** A configured size or capacity limit was exceeded. */
+  GRPC_ERR_LIMIT = -11,
+  /** Compression or decompression failed. */
+  GRPC_ERR_CODEC = -12,
+  /** The operation timed out before completing. */
+  GRPC_ERR_TIMEOUT = -13,
 } grpc_err;
 
 /**

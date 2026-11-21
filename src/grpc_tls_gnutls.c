@@ -2,12 +2,15 @@
  * through grpc_tls_io. */
 #include <errno.h>
 #include <gnutls/gnutls.h>
+#include <gnutls/x509.h>
 #include "core.h"
 #include "internal_tls.h"
 
 struct grpc_tls_ctx {
   gnutls_certificate_credentials_t cred;
   gnutls_priority_t priority;
+  bool verify_client;
+  bool require_client_cert;
 };
 
 struct grpc_tls_session {
@@ -47,19 +50,46 @@ static ssize_t io_push(gnutls_transport_ptr_t ptr, const void *buf, size_t len) 
   return (ssize_t)len;
 }
 
-grpc_tls_ctx *tls_backend_ctx_new(const char *cert_file, const char *key_file) {
+grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg) {
+  if (cfg == nullptr)
+    return nullptr;
   grpc_tls_ctx *ctx = grpc_calloc(1, sizeof(*ctx));
   if (ctx == nullptr) {
     return nullptr;
   }
-  /* the key file is checked against the certificate here as well */
-  if (gnutls_certificate_allocate_credentials(&ctx->cred) < 0 ||
-      gnutls_certificate_set_x509_key_file(ctx->cred, cert_file, key_file, GNUTLS_X509_FMT_PEM) <
-          0 ||
+  if (gnutls_certificate_allocate_credentials(&ctx->cred) < 0) {
+    tls_backend_ctx_free(ctx);
+    return nullptr;
+  }
+  int key_res = -1;
+  if (cfg->cert_pem != nullptr && cfg->key_pem != nullptr) {
+    gnutls_datum_t c = {.data = (unsigned char *)cfg->cert_pem, .size = (unsigned int)cfg->cert_pem_len};
+    gnutls_datum_t k = {.data = (unsigned char *)cfg->key_pem, .size = (unsigned int)cfg->key_pem_len};
+    key_res = gnutls_certificate_set_x509_key_mem(ctx->cred, &c, &k, GNUTLS_X509_FMT_PEM);
+  } else if (cfg->cert_file != nullptr && cfg->key_file != nullptr) {
+    key_res = gnutls_certificate_set_x509_key_file(ctx->cred, cfg->cert_file, cfg->key_file,
+                                                   GNUTLS_X509_FMT_PEM);
+  }
+  if (key_res < 0 ||
       gnutls_priority_init(&ctx->priority, "NORMAL:-VERS-ALL:+VERS-TLS1.3:+VERS-TLS1.2", nullptr) <
           0) {
     tls_backend_ctx_free(ctx);
     return nullptr;
+  }
+  if (cfg->ca_file != nullptr || cfg->ca_pem != nullptr) {
+    int ca_res;
+    if (cfg->ca_file != nullptr) {
+      ca_res = gnutls_certificate_set_x509_trust_file(ctx->cred, cfg->ca_file, GNUTLS_X509_FMT_PEM);
+    } else {
+      gnutls_datum_t ca = {.data = (unsigned char *)cfg->ca_pem, .size = (unsigned int)cfg->ca_pem_len};
+      ca_res = gnutls_certificate_set_x509_trust_mem(ctx->cred, &ca, GNUTLS_X509_FMT_PEM);
+    }
+    if (ca_res <= 0) {
+      tls_backend_ctx_free(ctx);
+      return nullptr;
+    }
+    ctx->verify_client = true;
+    ctx->require_client_cert = cfg->require_client_cert;
   }
   return ctx;
 }
@@ -93,6 +123,11 @@ grpc_tls_session *tls_backend_session_new(grpc_tls_ctx *ctx) {
       gnutls_alpn_set_protocols(tls->session, &alpn, 1, GNUTLS_ALPN_SERVER_PRECEDENCE) < 0) {
     tls_backend_session_free(tls);
     return nullptr;
+  }
+  if (ctx->verify_client) {
+    gnutls_certificate_server_set_request(
+        tls->session, ctx->require_client_cert ? GNUTLS_CERT_REQUIRE : GNUTLS_CERT_REQUEST);
+    gnutls_session_set_verify_cert(tls->session, nullptr, 0);
   }
   gnutls_transport_set_ptr(tls->session, tls);
   gnutls_transport_set_pull_function(tls->session, io_pull);
@@ -158,4 +193,22 @@ ssize_t tls_backend_write(grpc_tls_session *tls, const void *buf, size_t len) {
 
 void tls_backend_close_notify(grpc_tls_session *tls) {
   (void)gnutls_bye(tls->session, GNUTLS_SHUT_WR);
+}
+
+int tls_backend_peer_subject(grpc_tls_session *tls, char *buf, size_t len) {
+  unsigned int list_size = 0;
+  const gnutls_datum_t *certs = gnutls_certificate_get_peers(tls->session, &list_size);
+  if (certs == nullptr || list_size == 0)
+    return -1;
+  gnutls_x509_crt_t crt;
+  if (gnutls_x509_crt_init(&crt) < 0)
+    return -1;
+  int res = -1;
+  if (gnutls_x509_crt_import(crt, &certs[0], GNUTLS_X509_FMT_DER) >= 0) {
+    size_t sz = len;
+    if (gnutls_x509_crt_get_dn(crt, buf, &sz) == GNUTLS_E_SUCCESS)
+      res = 0;
+  }
+  gnutls_x509_crt_deinit(crt);
+  return res;
 }

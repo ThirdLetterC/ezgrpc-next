@@ -21,10 +21,12 @@ typedef struct grpc_metadata {
  * Decodes the Base64 value of a ``-bin`` key.
  * Returns a buffer to free with grpc_free(), or nullptr on invalid input.
  */
-GRPC_API uint8_t *grpc_metadata_decode_bin(const char *base64, size_t len, size_t *out_len);
+GRPC_API GRPC_NODISCARD uint8_t *grpc_metadata_decode_bin(const char *base64, size_t len,
+                                                          size_t *out_len);
 
 /**
  * Base64 encodes binary data for a ``-bin`` key.
  * Returns a NUL-terminated string to free with grpc_free(), or nullptr.
  */
-GRPC_API char *grpc_metadata_encode_bin(const uint8_t *data, size_t len, size_t *out_len);
+GRPC_API GRPC_NODISCARD char *grpc_metadata_encode_bin(const uint8_t *data, size_t len,
+                                                       size_t *out_len);

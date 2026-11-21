@@ -5,6 +5,8 @@
 #include <openssl/ssl.h>
 #include <openssl/crypto.h>
 #include <openssl/err.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
 #include "core.h"
 #include "internal_tls.h"
 
@@ -68,21 +70,104 @@ static int alpn_select_cb([[maybe_unused]] SSL *s, const unsigned char **out, un
   return SSL_TLSEXT_ERR_NOACK;
 }
 
-grpc_tls_ctx *tls_backend_ctx_new(const char *cert_file, const char *key_file) {
-  SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
-  if (ctx == nullptr) {
-    return nullptr;
+static bool load_pem_chain(SSL_CTX *ctx, const char *pem, size_t pem_len) {
+  if (pem == nullptr || pem_len == 0 || pem_len > INT_MAX)
+    return false;
+  BIO *bio = BIO_new_mem_buf(pem, (int)pem_len);
+  if (bio == nullptr)
+    return false;
+  X509 *leaf = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr);
+  if (leaf == nullptr || SSL_CTX_use_certificate(ctx, leaf) <= 0) {
+    X509_free(leaf);
+    BIO_free(bio);
+    return false;
   }
+  X509_free(leaf);
+  X509 *ca;
+  while ((ca = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)) != nullptr) {
+    if (SSL_CTX_add_extra_chain_cert(ctx, ca) <= 0) {
+      X509_free(ca);
+      BIO_free(bio);
+      return false;
+    }
+  }
+  ERR_clear_error();
+  BIO_free(bio);
+  return true;
+}
 
-  if (!SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION) ||
-      SSL_CTX_use_certificate_chain_file(ctx, cert_file) <= 0 ||
-      SSL_CTX_use_PrivateKey_file(ctx, key_file, SSL_FILETYPE_PEM) <= 0 ||
-      !SSL_CTX_check_private_key(ctx)) {
+static bool load_pem_key(SSL_CTX *ctx, const char *pem, size_t pem_len) {
+  if (pem == nullptr || pem_len == 0 || pem_len > INT_MAX)
+    return false;
+  BIO *bio = BIO_new_mem_buf(pem, (int)pem_len);
+  if (bio == nullptr)
+    return false;
+  EVP_PKEY *pkey = PEM_read_bio_PrivateKey(bio, nullptr, nullptr, nullptr);
+  BIO_free(bio);
+  if (pkey == nullptr)
+    return false;
+  bool ok = SSL_CTX_use_PrivateKey(ctx, pkey) > 0;
+  EVP_PKEY_free(pkey);
+  return ok;
+}
+
+static bool load_ca_pem(SSL_CTX *ctx, const char *pem, size_t pem_len) {
+  if (pem == nullptr || pem_len == 0 || pem_len > INT_MAX)
+    return false;
+  BIO *bio = BIO_new_mem_buf(pem, (int)pem_len);
+  if (bio == nullptr)
+    return false;
+  X509_STORE *store = SSL_CTX_get_cert_store(ctx);
+  int loaded = 0;
+  X509 *cert;
+  while ((cert = PEM_read_bio_X509(bio, nullptr, nullptr, nullptr)) != nullptr) {
+    if (X509_STORE_add_cert(store, cert) > 0)
+      loaded++;
+    X509_free(cert);
+  }
+  ERR_clear_error();
+  BIO_free(bio);
+  return loaded > 0;
+}
+
+grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg) {
+  if (cfg == nullptr)
+    return nullptr;
+  SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+  if (ctx == nullptr)
+    return nullptr;
+
+  if (!SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION)) {
     SSL_CTX_free(ctx);
     return nullptr;
   }
-  SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, nullptr);
 
+  bool ok = false;
+  if (cfg->cert_pem != nullptr && cfg->key_pem != nullptr) {
+    ok = load_pem_chain(ctx, cfg->cert_pem, cfg->cert_pem_len) &&
+         load_pem_key(ctx, cfg->key_pem, cfg->key_pem_len);
+  } else if (cfg->cert_file != nullptr && cfg->key_file != nullptr) {
+    ok = SSL_CTX_use_certificate_chain_file(ctx, cfg->cert_file) > 0 &&
+         SSL_CTX_use_PrivateKey_file(ctx, cfg->key_file, SSL_FILETYPE_PEM) > 0;
+  }
+  if (!ok || !SSL_CTX_check_private_key(ctx)) {
+    SSL_CTX_free(ctx);
+    return nullptr;
+  }
+
+  if (cfg->ca_file != nullptr || cfg->ca_pem != nullptr) {
+    bool ca_ok = cfg->ca_file != nullptr
+                     ? SSL_CTX_load_verify_locations(ctx, cfg->ca_file, nullptr) > 0
+                     : load_ca_pem(ctx, cfg->ca_pem, cfg->ca_pem_len);
+    if (!ca_ok) {
+      SSL_CTX_free(ctx);
+      return nullptr;
+    }
+    int mode = SSL_VERIFY_PEER | (cfg->require_client_cert ? SSL_VERIFY_FAIL_IF_NO_PEER_CERT : 0);
+    SSL_CTX_set_verify(ctx, mode, nullptr);
+  }
+
+  SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, nullptr);
   return (grpc_tls_ctx *)ctx;
 }
 
@@ -193,4 +278,17 @@ ssize_t tls_backend_write(grpc_tls_session *tls, const void *buf, size_t len) {
 void tls_backend_close_notify(grpc_tls_session *tls) {
   ERR_clear_error();
   (void)SSL_shutdown(ssl(tls));
+}
+
+int tls_backend_peer_subject(grpc_tls_session *tls, char *buf, size_t len) {
+  if (len == 0)
+    return -1;
+  X509 *cert = SSL_get_peer_certificate(ssl(tls));
+  if (cert == nullptr)
+    return -1;
+  X509_NAME *subject = X509_get_subject_name(cert);
+  char *res = subject != nullptr ? X509_NAME_oneline(subject, buf, (int)(len > INT_MAX ? INT_MAX : len))
+                                 : nullptr;
+  X509_free(cert);
+  return res != nullptr ? 0 : -1;
 }

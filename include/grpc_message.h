@@ -37,13 +37,13 @@ struct grpc_message {
  * Creates a message holding a copy of ``data``.
  * Returns nullptr when out of memory.
  */
-GRPC_API grpc_message *grpc_message_new(const void *data, size_t len);
+GRPC_API GRPC_NODISCARD grpc_message *grpc_message_new(const void *data, size_t len);
 
 /**
  * Creates a message with ``len`` uninitialized bytes, for serializing in place.
  * Returns nullptr when out of memory.
  */
-GRPC_API grpc_message *grpc_message_alloc(size_t len);
+GRPC_API GRPC_NODISCARD grpc_message *grpc_message_alloc(size_t len);
 
 /**
  * Frees a message. Accepts nullptr.

@@ -24,13 +24,14 @@ ssize_t grpc_tls_read(grpc_session *session, void *buf, size_t len);
 ssize_t grpc_tls_write(grpc_session *session, const void *buf, size_t len);
 void grpc_tls_close_notify(grpc_session *session);
 void grpc_tls_session_free(grpc_session *session);
+int grpc_tls_peer_subject(grpc_session *session, char *buf, size_t len);
 
 /* The backend contract. Same return conventions as above. */
 typedef struct grpc_tls_session grpc_tls_session;
 
 const char *tls_backend_name(void);
 const char *tls_backend_version(void);
-grpc_tls_ctx *tls_backend_ctx_new(const char *cert_file, const char *key_file);
+grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg);
 void tls_backend_ctx_free(grpc_tls_ctx *ctx);
 void *tls_backend_ctx_native(grpc_tls_ctx *ctx);
 grpc_tls_session *tls_backend_session_new(grpc_tls_ctx *ctx);
@@ -41,6 +42,7 @@ int tls_backend_handshake(grpc_tls_session *tls);
 ssize_t tls_backend_read(grpc_tls_session *tls, void *buf, size_t len);
 ssize_t tls_backend_write(grpc_tls_session *tls, const void *buf, size_t len);
 void tls_backend_close_notify(grpc_tls_session *tls);
+int tls_backend_peer_subject(grpc_tls_session *tls, char *buf, size_t len);
 
 /* Ciphertext queues for backends that move bytes through I/O callbacks
  * (wolfSSL, GnuTLS, rustls): the callbacks pull from `in` and push to `out`. */

@@ -56,15 +56,35 @@ static int read_file(const char *path, grpc_buf *out) {
   return res;
 }
 
-grpc_tls_ctx *tls_backend_ctx_new(const char *cert_file, const char *key_file) {
+grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg) {
+  if (cfg == nullptr)
+    return nullptr;
   grpc_buf cert = {}, key = {};
   const struct rustls_certified_key *certified_key = nullptr;
   const struct rustls_server_config *config = nullptr;
 
-  if (read_file(cert_file, &cert) || read_file(key_file, &key))
+  const uint8_t *cert_data = nullptr;
+  size_t cert_len = 0;
+  const uint8_t *key_data = nullptr;
+  size_t key_len = 0;
+  if (cfg->cert_pem != nullptr && cfg->key_pem != nullptr) {
+    cert_data = (const uint8_t *)cfg->cert_pem;
+    cert_len = cfg->cert_pem_len;
+    key_data = (const uint8_t *)cfg->key_pem;
+    key_len = cfg->key_pem_len;
+  } else if (cfg->cert_file != nullptr && cfg->key_file != nullptr) {
+    if (read_file(cfg->cert_file, &cert) || read_file(cfg->key_file, &key))
+      goto out;
+    cert_data = cert.data;
+    cert_len = cert.len;
+    key_data = key.data;
+    key_len = key.len;
+  } else {
     goto out;
+  }
+
   /* also checks that the key belongs to the certificate */
-  if (rustls_certified_key_build(cert.data, cert.len, key.data, key.len, &certified_key) !=
+  if (rustls_certified_key_build(cert_data, cert_len, key_data, key_len, &certified_key) !=
       RUSTLS_RESULT_OK)
     goto out;
 
@@ -223,4 +243,9 @@ ssize_t tls_backend_write(grpc_tls_session *tls, const void *buf, size_t len) {
 
 void tls_backend_close_notify(grpc_tls_session *tls) {
   rustls_connection_send_close_notify(tls->conn);
+}
+
+int tls_backend_peer_subject([[maybe_unused]] grpc_tls_session *tls, [[maybe_unused]] char *buf,
+                             [[maybe_unused]] size_t len) {
+  return -1;
 }

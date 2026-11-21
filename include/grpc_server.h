@@ -29,7 +29,8 @@ typedef enum grpc_log_level {
  *   grpc_server *srv = grpc_server_new(&(grpc_config){.port = 50051});
  */
 typedef struct grpc_config {
-  /** Port for both address families. Required. */
+  /** Port for both address families. 0 requests an OS-assigned ephemeral port
+   * (query it with grpc_server_port()). */
   uint16_t port;
   /** IPv4 address to listen on. When both addresses are nullptr, the server
    * listens on "0.0.0.0" and "::". When only one is set, only that one. */
@@ -46,10 +47,23 @@ typedef struct grpc_config {
   uint32_t max_message_size;
   /** Largest HTTP/2 frame, in bytes. Default 16 KiB. */
   uint32_t max_frame_size;
-  /** PEM certificate chain and private key. Setting both enables TLS. */
+  /** Default response compression when accepted by the client. Default GRPC_COMPRESS_IDENTITY. */
+  grpc_compression_algorithm default_compression;
+  /** Default response compression level (0 or GRPC_COMPRESSION_LEVEL_DEFAULT for codec default). */
+  int default_compression_level;
+  /** TLS settings: provide either cert_file+key_file or cert_pem+key_pem.
+   * Optionally configure ca_file/ca_pem and require_client_cert for mTLS. */
   struct {
     const char *cert_file;
     const char *key_file;
+    const char *cert_pem;
+    size_t cert_pem_len;
+    const char *key_pem;
+    size_t key_pem_len;
+    const char *ca_file;
+    const char *ca_pem;
+    size_t ca_pem_len;
+    bool require_client_cert;
   } tls;
   /** Initial log threshold. Defaults to GRPC_LOG_INFO. */
   grpc_log_level log_level;
@@ -71,6 +85,8 @@ typedef void (*grpc_handler_fn)(grpc_call *call, const grpc_message *request,
  * bidirectional methods. Messages are valid until the callback returns.
  */
 typedef struct grpc_stream_handler {
+  /** Called once when the call starts (headers received, after interceptors). Optional. */
+  void (*on_start)(grpc_call *call, void *userdata);
   /** A request message arrived. */
   void (*on_message)(grpc_call *call, const grpc_message *message, void *userdata);
   /** The client finished sending. Optional. */
@@ -80,10 +96,22 @@ typedef struct grpc_stream_handler {
 } grpc_stream_handler;
 
 /**
- * Creates a server and starts listening. ``config`` may be nullptr only to
- * fail: ``port`` is required. Returns nullptr on failure, after logging why.
+ * Creates a server and starts listening. Returns nullptr on failure, after logging why.
+ * Use grpc_server_new_ex() to also obtain a grpc_err code on failure.
  */
-GRPC_API grpc_server *grpc_server_new(const grpc_config *config);
+GRPC_API GRPC_NODISCARD grpc_server *grpc_server_new(const grpc_config *config);
+
+/**
+ * Like grpc_server_new(), but writes the error code to ``*out_err`` (if non-null).
+ */
+GRPC_API GRPC_NODISCARD grpc_server *grpc_server_new_ex(const grpc_config *config,
+                                                        grpc_err *out_err);
+
+/**
+ * Returns the bound TCP port, or 0 if ``server`` is nullptr.
+ * Useful when configured with ``config.port = 0`` (ephemeral port).
+ */
+GRPC_API uint16_t grpc_server_port(const grpc_server *server);
 
 /**
  * Closes every connection and frees the server. Release the references taken
@@ -134,6 +162,14 @@ GRPC_API grpc_err grpc_server_run(grpc_server *server);
  * signal handler.
  */
 GRPC_API void grpc_server_stop(grpc_server *server);
+
+/**
+ * Gracefully drains the server: stops accepting new connections, sends HTTP/2
+ * GOAWAY to all active clients, and polls until all in-flight calls finish or
+ * ``timeout_ms`` elapses (-1: wait indefinitely, 0: non-blocking check).
+ * Returns GRPC_OK once drained, or GRPC_ERR_TIMEOUT if active calls remain.
+ */
+GRPC_API grpc_err grpc_server_drain(grpc_server *server, int timeout_ms);
 
 /**
  * Runs one iteration of the event loop: writes the responses queued since

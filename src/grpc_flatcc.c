@@ -113,3 +113,11 @@ GRPC_API grpc_err grpc_call_send_fb(grpc_call *call, flatcc_builder_t *builder) 
   }
   return grpc_call_send(call, msg);
 }
+
+GRPC_API grpc_err grpc_call_reply_fb(grpc_call *call, flatcc_builder_t *builder) {
+  grpc_err err = grpc_call_send_fb(call, builder);
+  if (err != GRPC_OK) {
+    return err;
+  }
+  return grpc_call_finish(call, GRPC_STATUS_OK, nullptr);
+}

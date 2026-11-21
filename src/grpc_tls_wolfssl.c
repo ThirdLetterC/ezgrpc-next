@@ -44,7 +44,9 @@ static int io_send([[maybe_unused]] WOLFSSL *ssl, char *buf, int sz, void *ctx) 
   return tls_io_push(&tls->io, buf, (size_t)sz) ? WOLFSSL_CBIO_ERR_GENERAL : sz;
 }
 
-grpc_tls_ctx *tls_backend_ctx_new(const char *cert_file, const char *key_file) {
+grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg) {
+  if (cfg == nullptr)
+    return nullptr;
   static pthread_once_t once = PTHREAD_ONCE_INIT;
   pthread_once(&once, wolfssl_init_once);
 
@@ -53,9 +55,24 @@ grpc_tls_ctx *tls_backend_ctx_new(const char *cert_file, const char *key_file) {
     return nullptr;
   }
 
-  if (wolfSSL_CTX_SetMinVersion(ctx, WOLFSSL_TLSV1_2) != WOLFSSL_SUCCESS ||
-      wolfSSL_CTX_use_certificate_chain_file(ctx, cert_file) != WOLFSSL_SUCCESS ||
-      wolfSSL_CTX_use_PrivateKey_file(ctx, key_file, WOLFSSL_FILETYPE_PEM) != WOLFSSL_SUCCESS
+  if (wolfSSL_CTX_SetMinVersion(ctx, WOLFSSL_TLSV1_2) != WOLFSSL_SUCCESS) {
+    wolfSSL_CTX_free(ctx);
+    return nullptr;
+  }
+
+  bool ok = false;
+  if (cfg->cert_pem != nullptr && cfg->key_pem != nullptr) {
+    ok = wolfSSL_CTX_use_certificate_chain_buffer(ctx, (const unsigned char *)cfg->cert_pem,
+                                                  (long)cfg->cert_pem_len) == WOLFSSL_SUCCESS &&
+         wolfSSL_CTX_use_PrivateKey_buffer(ctx, (const unsigned char *)cfg->key_pem,
+                                           (long)cfg->key_pem_len,
+                                           WOLFSSL_FILETYPE_PEM) == WOLFSSL_SUCCESS;
+  } else if (cfg->cert_file != nullptr && cfg->key_file != nullptr) {
+    ok = wolfSSL_CTX_use_certificate_chain_file(ctx, cfg->cert_file) == WOLFSSL_SUCCESS &&
+         wolfSSL_CTX_use_PrivateKey_file(ctx, cfg->key_file, WOLFSSL_FILETYPE_PEM) ==
+             WOLFSSL_SUCCESS;
+  }
+  if (!ok
 #if !defined(NO_CHECK_PRIVATE_KEY)
       || wolfSSL_CTX_check_private_key(ctx) != WOLFSSL_SUCCESS
 #endif
@@ -63,6 +80,23 @@ grpc_tls_ctx *tls_backend_ctx_new(const char *cert_file, const char *key_file) {
     wolfSSL_CTX_free(ctx);
     return nullptr;
   }
+
+  if (cfg->ca_file != nullptr || cfg->ca_pem != nullptr) {
+    bool ca_ok = cfg->ca_file != nullptr
+                     ? wolfSSL_CTX_load_verify_locations(ctx, cfg->ca_file, nullptr) ==
+                           WOLFSSL_SUCCESS
+                     : wolfSSL_CTX_load_verify_buffer(ctx, (const unsigned char *)cfg->ca_pem,
+                                                      (long)cfg->ca_pem_len,
+                                                      WOLFSSL_FILETYPE_PEM) == WOLFSSL_SUCCESS;
+    if (!ca_ok) {
+      wolfSSL_CTX_free(ctx);
+      return nullptr;
+    }
+    int mode = WOLFSSL_VERIFY_PEER |
+               (cfg->require_client_cert ? WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT : 0);
+    wolfSSL_CTX_set_verify(ctx, mode, nullptr);
+  }
+
   wolfSSL_CTX_SetIORecv(ctx, io_recv);
   wolfSSL_CTX_SetIOSend(ctx, io_send);
 
@@ -155,4 +189,14 @@ ssize_t tls_backend_write(grpc_tls_session *tls, const void *buf, size_t len) {
 
 void tls_backend_close_notify(grpc_tls_session *tls) {
   (void)wolfSSL_shutdown(tls->ssl);
+}
+
+int tls_backend_peer_subject(grpc_tls_session *tls, char *buf, size_t len) {
+  WOLFSSL_X509 *cert = wolfSSL_get_peer_certificate(tls->ssl);
+  if (cert == nullptr)
+    return -1;
+  WOLFSSL_X509_NAME *name = wolfSSL_X509_get_subject_name(cert);
+  char *res = name != nullptr ? wolfSSL_X509_NAME_oneline(name, buf, (int)len) : nullptr;
+  wolfSSL_X509_free(cert);
+  return res != nullptr ? 0 : -1;
 }

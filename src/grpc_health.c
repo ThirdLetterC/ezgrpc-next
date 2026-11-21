@@ -11,12 +11,21 @@ typedef struct service_health_entry {
   grpc_health_status status;
 } service_health_entry;
 
+typedef struct health_watcher {
+  grpc_call *call;
+  char service[MAX_SERVICE_NAME_LEN];
+  grpc_health_status last_status;
+  struct health_watcher *next;
+} health_watcher;
+
 /* per server. guarded by `lock`, since statuses may be set from any thread */
 struct health_state {
   pthread_mutex_t lock;
   grpc_health_status overall;
   service_health_entry *entries;
   size_t nb_entries;
+  /* Accessed on the server event-loop thread. */
+  health_watcher *watchers;
 };
 
 static struct health_state *health_state_get(grpc_server *server) {
@@ -35,12 +44,43 @@ void health_free(grpc_server *server) {
   struct health_state *health = server->health;
   if (health == nullptr)
     return;
+  health_watcher *w = health->watchers;
+  while (w != nullptr) {
+    health_watcher *next = w->next;
+    grpc_call_unref(w->call);
+    grpc_free(w);
+    w = next;
+  }
   for (size_t i = 0; i < health->nb_entries; i++)
     grpc_free(health->entries[i].name);
   grpc_free(health->entries);
   pthread_mutex_destroy(&health->lock);
   grpc_free(health);
   server->health = nullptr;
+}
+
+static void notify_watchers_on_loop(void *arg) {
+  grpc_server *server = arg;
+  struct health_state *health = server->health;
+  if (health == nullptr)
+    return;
+  health_watcher **link = &health->watchers;
+  while (*link != nullptr) {
+    health_watcher *w = *link;
+    if (grpc_call_is_cancelled(w->call)) {
+      *link = w->next;
+      grpc_call_unref(w->call);
+      grpc_free(w);
+      continue;
+    }
+    grpc_health_status cur = grpc_health_get_status(server, w->service);
+    if (cur != w->last_status) {
+      w->last_status = cur;
+      uint8_t response[2] = {0x08, (uint8_t)cur};
+      (void)grpc_call_send_data(w->call, response, sizeof(response));
+    }
+    link = &w->next;
+  }
 }
 
 GRPC_API grpc_err grpc_health_set_status(grpc_server *server, const char *service,
@@ -53,13 +93,16 @@ GRPC_API grpc_err grpc_health_set_status(grpc_server *server, const char *servic
     return GRPC_ERR_NOMEM;
 
   grpc_err err = GRPC_OK;
+  bool changed = false;
   pthread_mutex_lock(&health->lock);
   if (service == nullptr || *service == '\0') {
+    changed = (health->overall != status);
     health->overall = status;
     goto out;
   }
   for (size_t i = 0; i < health->nb_entries; i++) {
     if (strcmp(health->entries[i].name, service) == 0) {
+      changed = (health->entries[i].status != status);
       health->entries[i].status = status;
       goto out;
     }
@@ -75,8 +118,11 @@ GRPC_API grpc_err grpc_health_set_status(grpc_server *server, const char *servic
     goto out;
   }
   health->entries[health->nb_entries++] = (service_health_entry){name, status};
+  changed = true;
 out:
   pthread_mutex_unlock(&health->lock);
+  if (err == GRPC_OK && changed && server->async_active)
+    (void)grpc_server_post(server, notify_watchers_on_loop, server);
   return err;
 }
 
@@ -173,10 +219,63 @@ static void health_check(grpc_call *call, const grpc_message *request, void *use
   (void)grpc_call_finish(call, GRPC_STATUS_OK, nullptr);
 }
 
+/* /grpc.health.v1.Health/Watch */
+static void health_watch_message(grpc_call *call, const grpc_message *request, void *userdata) {
+  grpc_server *server = userdata;
+  struct health_state *health = server->health;
+  if (health == nullptr)
+    return;
+  char service_name[MAX_SERVICE_NAME_LEN] = {};
+  if (request->len > 0)
+    parse_health_request_service(request->data, request->len, service_name, sizeof(service_name));
+
+  grpc_health_status status = grpc_health_get_status(server, service_name);
+  uint8_t response[2] = {0x08, (uint8_t)status};
+  if (grpc_call_send_data(call, response, sizeof(response)) != GRPC_OK)
+    return;
+
+  health_watcher *w = grpc_calloc(1, sizeof(*w));
+  if (w == nullptr)
+    return;
+  w->call = grpc_call_ref(call);
+  memcpy(w->service, service_name, sizeof(w->service));
+  w->last_status = status;
+  w->next = health->watchers;
+  health->watchers = w;
+}
+
+static void health_watch_cancel(grpc_call *call, void *userdata) {
+  grpc_server *server = userdata;
+  struct health_state *health = server->health;
+  if (health == nullptr)
+    return;
+  health_watcher **link = &health->watchers;
+  while (*link != nullptr) {
+    health_watcher *w = *link;
+    if (w->call == call) {
+      *link = w->next;
+      grpc_call_unref(w->call);
+      grpc_free(w);
+      return;
+    }
+    link = &w->next;
+  }
+}
+
 GRPC_API grpc_err grpc_health_enable(grpc_server *server) {
   if (server == nullptr)
     return GRPC_ERR_INVALID;
   if (health_state_get(server) == nullptr)
     return GRPC_ERR_NOMEM;
-  return grpc_server_handle(server, GRPC_HEALTH_PATH_CHECK, health_check, server);
+  grpc_err err = grpc_server_handle(server, GRPC_HEALTH_PATH_CHECK, health_check, server);
+  if (err != GRPC_OK)
+    return err;
+  grpc_stream_handler watch_handler = {
+      .on_message = health_watch_message,
+      .on_cancel = health_watch_cancel,
+  };
+  err = grpc_server_handle_stream(server, GRPC_HEALTH_PATH_WATCH, &watch_handler, server);
+  if (err != GRPC_OK)
+    (void)grpc_server_unregister(server, GRPC_HEALTH_PATH_CHECK);
+  return err;
 }

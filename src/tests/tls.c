@@ -47,9 +47,63 @@ void test_tls_server(void) {
   grpc_server_free(server);
 }
 
+static char *slurp_file(const char *path, size_t *out_len) {
+  FILE *fp = fopen(path, "rb");
+  if (fp == nullptr)
+    return nullptr;
+  fseek(fp, 0, SEEK_END);
+  long sz = ftell(fp);
+  rewind(fp);
+  if (sz <= 0) {
+    fclose(fp);
+    return nullptr;
+  }
+  char *buf = malloc((size_t)sz + 1);
+  if (buf == nullptr) {
+    fclose(fp);
+    return nullptr;
+  }
+  size_t n = fread(buf, 1, (size_t)sz, fp);
+  fclose(fp);
+  buf[n] = '\0';
+  if (out_len != nullptr)
+    *out_len = n;
+  return buf;
+}
+
+void test_tls_in_memory_pem_and_mtls(void) {
+  size_t cert_len = 0, key_len = 0;
+  char *cert_pem = slurp_file("test_cert.pem", &cert_len);
+  char *key_pem = slurp_file("test_key.pem", &key_len);
+  TEST_ASSERT_NOT_NULL(cert_pem);
+  TEST_ASSERT_NOT_NULL(key_pem);
+
+  grpc_server *server = grpc_server_new(&(grpc_config){
+      .port = 0,
+      .ipv4_addr = "127.0.0.1",
+      .tls = {
+          .cert_pem = cert_pem,
+          .cert_pem_len = cert_len,
+          .key_pem = key_pem,
+          .key_pem_len = key_len,
+          .ca_pem = cert_pem,
+          .ca_pem_len = cert_len,
+          .require_client_cert = true,
+      },
+      .log_level = GRPC_LOG_OFF,
+  });
+  TEST_ASSERT_NOT_NULL(server);
+  TEST_ASSERT_NOT_NULL(grpc_server_tls_native(server));
+  grpc_server_free(server);
+
+  free(cert_pem);
+  free(key_pem);
+}
+
 #if defined(GRPC_TLS_OPENSSL) || defined(GRPC_TLS_LIBRESSL) || defined(GRPC_TLS_BORINGSSL) || defined(GRPC_TLS_AWSLC)
 void test_tls_error_isolation(void) {
-  grpc_tls_ctx *ctx = tls_backend_ctx_new("test_cert.pem", "test_key.pem");
+  grpc_tls_config cfg = {.cert_file = "test_cert.pem", .key_file = "test_key.pem"};
+  grpc_tls_ctx *ctx = tls_backend_ctx_new(&cfg);
   TEST_ASSERT_NOT_NULL(ctx);
   grpc_tls_session *session = tls_backend_session_new(ctx);
   TEST_ASSERT_NOT_NULL(session);
@@ -69,6 +123,7 @@ int main(void) {
   RUN_TEST(test_tls_backend);
   RUN_TEST(test_tls_invalid_files);
   RUN_TEST(test_tls_server);
+  RUN_TEST(test_tls_in_memory_pem_and_mtls);
 #if defined(GRPC_TLS_OPENSSL) || defined(GRPC_TLS_LIBRESSL) || defined(GRPC_TLS_BORINGSSL) || defined(GRPC_TLS_AWSLC)
   RUN_TEST(test_tls_error_isolation);
 #endif

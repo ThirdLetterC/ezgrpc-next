@@ -210,7 +210,7 @@ GRPC_API grpc_err grpc_server_handle(grpc_server *server, const char *path,
 GRPC_API grpc_err grpc_server_handle_stream(grpc_server *server, const char *path,
                                                      const grpc_stream_handler *handler,
                                                      void *userdata) {
-  if (handler == nullptr || handler->on_message == nullptr)
+  if (handler == nullptr || (handler->on_message == nullptr && handler->on_start == nullptr))
     return GRPC_ERR_INVALID;
   return server_add_route(server, path, ROUTE_STREAM, nullptr, handler, userdata);
 }
@@ -240,9 +240,9 @@ static void grpc_winsock_init(void) {
 }
 #endif
 
-/* binds and listens on one address. returns the socket or -1 */
+/* binds and listens on one address. returns the socket or GRPC_INVALID_SOCKET */
 static uv_os_sock_t open_listener(grpc_server *server, int family, const char *addr, uint16_t port,
-                                  int backlog) {
+                                  int backlog, uint16_t *bound_port, grpc_err *out_err) {
   struct sockaddr_storage ss = {};
   int sslen;
   if (family == AF_INET) {
@@ -251,6 +251,8 @@ static uv_os_sock_t open_listener(grpc_server *server, int family, const char *a
     sin->sin_port = htons(port);
     if (inet_pton(AF_INET, addr, &sin->sin_addr) != 1) {
       LOG_ERROR(server, "invalid IPv4 address '%s'\n", addr);
+      if (out_err != nullptr)
+        *out_err = GRPC_ERR_INVALID;
       return GRPC_INVALID_SOCKET;
     }
     sslen = sizeof(*sin);
@@ -260,6 +262,8 @@ static uv_os_sock_t open_listener(grpc_server *server, int family, const char *a
     sin6->sin6_port = htons(port);
     if (inet_pton(AF_INET6, addr, &sin6->sin6_addr) != 1) {
       LOG_ERROR(server, "invalid IPv6 address '%s'\n", addr);
+      if (out_err != nullptr)
+        *out_err = GRPC_ERR_INVALID;
       return GRPC_INVALID_SOCKET;
     }
     sslen = sizeof(*sin6);
@@ -275,6 +279,8 @@ static uv_os_sock_t open_listener(grpc_server *server, int family, const char *a
 #endif
   if (fd == GRPC_INVALID_SOCKET) {
     LOG_ERROR(server, "socket: %s\n", grpc_socket_error());
+    if (out_err != nullptr)
+      *out_err = GRPC_ERR_IO;
     return GRPC_INVALID_SOCKET;
   }
   (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&(int){1}, sizeof(int));
@@ -288,12 +294,26 @@ static uv_os_sock_t open_listener(grpc_server *server, int family, const char *a
   if (bind(fd, (struct sockaddr *)&ss, sslen) == -1) {
     LOG_ERROR(server, "bind %s port %u: %s\n", addr, port, grpc_socket_error());
     grpc_socket_close(fd);
+    if (out_err != nullptr)
+      *out_err = GRPC_ERR_IO;
     return GRPC_INVALID_SOCKET;
   }
   if (listen(fd, backlog) == -1) {
     LOG_ERROR(server, "listen %s port %u: %s\n", addr, port, grpc_socket_error());
     grpc_socket_close(fd);
+    if (out_err != nullptr)
+      *out_err = GRPC_ERR_IO;
     return GRPC_INVALID_SOCKET;
+  }
+  if (bound_port != nullptr) {
+    struct sockaddr_storage bound = {};
+    socklen_t blen = sizeof(bound);
+    if (getsockname(fd, (struct sockaddr *)&bound, &blen) == 0) {
+      if (bound.ss_family == AF_INET)
+        *bound_port = ntohs(((struct sockaddr_in *)&bound)->sin_port);
+      else if (bound.ss_family == AF_INET6)
+        *bound_port = ntohs(((struct sockaddr_in6 *)&bound)->sin6_port);
+    }
   }
   return fd;
 }
@@ -329,16 +349,22 @@ static void on_async(uv_async_t *handle) {
   run_posted(server);
 }
 
-GRPC_API grpc_server *grpc_server_new(const grpc_config *config) {
-  if (config == nullptr || config->port == 0) {
-    fprintf(config != nullptr && config->log_file != nullptr ? config->log_file : stderr,
-            "grpc_server_new: a port is required\n");
+GRPC_API grpc_server *grpc_server_new_ex(const grpc_config *config, grpc_err *out_err) {
+  if (out_err != nullptr)
+    *out_err = GRPC_OK;
+  if (config == nullptr) {
+    if (out_err != nullptr)
+      *out_err = GRPC_ERR_INVALID;
     return nullptr;
   }
 
+  grpc_err err = GRPC_ERR_NOMEM;
   grpc_server *server = grpc_calloc(1, sizeof(*server));
-  if (server == nullptr)
+  if (server == nullptr) {
+    if (out_err != nullptr)
+      *out_err = GRPC_ERR_NOMEM;
     return nullptr;
+  }
   server->ipv4_sockfd = GRPC_INVALID_SOCKET;
   server->ipv6_sockfd = GRPC_INVALID_SOCKET;
   server->next_deadline_ms = UINT64_MAX;
@@ -361,18 +387,20 @@ GRPC_API grpc_server *grpc_server_new(const grpc_config *config) {
       cfg->log_level == GRPC_LOG_DEFAULT ? GRPC_LOG_INFO : cfg->log_level;
   if (initial_level < GRPC_LOG_OFF || initial_level > GRPC_LOG_TRACE) {
     fprintf(stderr, "grpc: invalid log level\n");
+    err = GRPC_ERR_INVALID;
     goto err;
   }
   atomic_init(&server->log_level, initial_level);
   server->log_file = cfg->log_file != nullptr ? cfg->log_file : stderr;
   cfg->log_file = server->log_file;
-  if (logger_server_add(server) != GRPC_OK)
+  if ((err = logger_server_add(server)) != GRPC_OK)
     goto err;
 
   /* HTTP/2 limits: a frame is 16 KiB to 16 MiB, a window at most 2^31 - 1 */
   if (cfg->max_frame_size < (16u * 1024) || cfg->max_frame_size > (1u << 24) - 1 ||
       cfg->max_message_size > INT32_MAX) {
     LOG_ERROR(server, "max_frame_size or max_message_size is out of range\n");
+    err = GRPC_ERR_INVALID;
     goto err;
   }
 
@@ -382,30 +410,67 @@ GRPC_API grpc_server *grpc_server_new(const grpc_config *config) {
     ipv6_addr = "::";
   }
   if ((ipv4_addr != nullptr && (server->ipv4_addr = grpc_strdup(ipv4_addr)) == nullptr) ||
-      (ipv6_addr != nullptr && (server->ipv6_addr = grpc_strdup(ipv6_addr)) == nullptr))
+      (ipv6_addr != nullptr && (server->ipv6_addr = grpc_strdup(ipv6_addr)) == nullptr)) {
+    err = GRPC_ERR_NOMEM;
     goto err;
+  }
   /* the copies outlive the caller's strings */
   cfg->ipv4_addr = server->ipv4_addr;
   cfg->ipv6_addr = server->ipv6_addr;
-  cfg->tls.cert_file = cfg->tls.key_file = nullptr;
+  cfg->tls = (typeof(cfg->tls)){};
 
-  if ((config->tls.cert_file == nullptr) != (config->tls.key_file == nullptr)) {
-    LOG_ERROR(server, "TLS needs both tls.cert_file and tls.key_file\n");
+  bool has_tls_files = config->tls.cert_file != nullptr || config->tls.key_file != nullptr;
+  bool has_tls_pems = config->tls.cert_pem != nullptr || config->tls.key_pem != nullptr;
+  if (has_tls_files && has_tls_pems) {
+    LOG_ERROR(server, "TLS cannot specify both file paths and in-memory PEM buffers\n");
+    err = GRPC_ERR_INVALID;
     goto err;
   }
-  if (config->tls.cert_file != nullptr &&
-      tls_enable(server, config->tls.cert_file, config->tls.key_file) != GRPC_OK)
+  if (has_tls_files && (config->tls.cert_file == nullptr || config->tls.key_file == nullptr)) {
+    LOG_ERROR(server, "TLS needs both tls.cert_file and tls.key_file\n");
+    err = GRPC_ERR_INVALID;
     goto err;
+  }
+  if (has_tls_pems && (config->tls.cert_pem == nullptr || config->tls.key_pem == nullptr)) {
+    LOG_ERROR(server, "TLS needs both tls.cert_pem and tls.key_pem\n");
+    err = GRPC_ERR_INVALID;
+    goto err;
+  }
+  if (has_tls_files || has_tls_pems) {
+    grpc_tls_config tls_cfg = {
+        .cert_file = config->tls.cert_file,
+        .key_file = config->tls.key_file,
+        .cert_pem = config->tls.cert_pem,
+        .cert_pem_len = config->tls.cert_pem != nullptr && config->tls.cert_pem_len == 0
+                            ? strlen(config->tls.cert_pem)
+                            : config->tls.cert_pem_len,
+        .key_pem = config->tls.key_pem,
+        .key_pem_len = config->tls.key_pem != nullptr && config->tls.key_pem_len == 0
+                           ? strlen(config->tls.key_pem)
+                           : config->tls.key_pem_len,
+        .ca_file = config->tls.ca_file,
+        .ca_pem = config->tls.ca_pem,
+        .ca_pem_len = config->tls.ca_pem != nullptr && config->tls.ca_pem_len == 0
+                          ? strlen(config->tls.ca_pem)
+                          : config->tls.ca_pem_len,
+        .require_client_cert = config->tls.require_client_cert,
+    };
+    if ((err = tls_enable(server, &tls_cfg)) != GRPC_OK)
+      goto err;
+  }
 
+  uint16_t bound_port = cfg->port;
   if (server->ipv4_addr != nullptr &&
-      (server->ipv4_sockfd = open_listener(server, AF_INET, server->ipv4_addr, cfg->port,
-                                           cfg->backlog)) == GRPC_INVALID_SOCKET)
+      (server->ipv4_sockfd = open_listener(server, AF_INET, server->ipv4_addr, bound_port,
+                                           cfg->backlog, &bound_port, &err)) == GRPC_INVALID_SOCKET)
     goto err;
   if (server->ipv6_addr != nullptr &&
-      (server->ipv6_sockfd = open_listener(server, AF_INET6, server->ipv6_addr, cfg->port,
-                                           cfg->backlog)) == GRPC_INVALID_SOCKET)
+      (server->ipv6_sockfd = open_listener(server, AF_INET6, server->ipv6_addr, bound_port,
+                                           cfg->backlog, &bound_port, &err)) == GRPC_INVALID_SOCKET)
     goto err;
+  cfg->port = bound_port;
 
+  err = GRPC_ERR_IO;
   if (uv_loop_init(&server->loop) != 0)
     goto err;
   server->loop_initialized = true;
@@ -437,6 +502,7 @@ GRPC_API grpc_server *grpc_server_new(const grpc_config *config) {
       goto err;
   }
 
+  err = GRPC_ERR_NOMEM;
   if (nghttp2_session_callbacks_new(&server->ngcallbacks) != 0)
     goto err;
   server_setup_ngcallbacks(server->ngcallbacks);
@@ -465,8 +531,18 @@ GRPC_API grpc_server *grpc_server_new(const grpc_config *config) {
   return server;
 
 err:
+  if (out_err != nullptr)
+    *out_err = err;
   grpc_server_free(server);
   return nullptr;
+}
+
+GRPC_API grpc_server *grpc_server_new(const grpc_config *config) {
+  return grpc_server_new_ex(config, nullptr);
+}
+
+GRPC_API uint16_t grpc_server_port(const grpc_server *server) {
+  return server != nullptr ? server->config.port : 0;
 }
 
 GRPC_API void grpc_server_free(grpc_server *server) {
@@ -605,6 +681,65 @@ GRPC_API void grpc_server_stop(grpc_server *server) {
   atomic_store(&server->stop, true);
   /* async-signal-safe */
   uv_async_send(&server->async);
+}
+
+static size_t server_active_streams(const grpc_server *server) {
+  size_t total = 0;
+  for (size_t i = 0; i < server->nb_sessions; i++) {
+    if (server->sessions[i].is_active && !server->sessions[i].is_closing)
+      total += server->sessions[i].nb_streams;
+  }
+  return total;
+}
+
+GRPC_API grpc_err grpc_server_drain(grpc_server *server, int timeout_ms) {
+  if (server == nullptr)
+    return GRPC_ERR_INVALID;
+
+  /* Stop accepting new connections. */
+  if (server->ipv4_listener_active) {
+    uv_close((uv_handle_t *)&server->ipv4_listener, nullptr);
+    server->ipv4_listener_active = false;
+  }
+  if (server->ipv6_listener_active) {
+    uv_close((uv_handle_t *)&server->ipv6_listener, nullptr);
+    server->ipv6_listener_active = false;
+  }
+
+  /* Send HTTP/2 GOAWAY on every active session. */
+  for (size_t i = 0; i < server->nb_sessions; i++) {
+    grpc_session *s = &server->sessions[i];
+    if (s->is_active && !s->is_closing && s->ngsession != nullptr) {
+      int32_t last_id = nghttp2_session_get_last_proc_stream_id(s->ngsession);
+      (void)nghttp2_submit_goaway(s->ngsession, NGHTTP2_FLAG_NONE, last_id, NGHTTP2_NO_ERROR,
+                                  nullptr, 0);
+      session_schedule_flush(s);
+    }
+  }
+  server_flush_sessions(server);
+  atomic_store(&server->stop, true);
+
+  uint64_t deadline = timeout_ms > 0 ? grpc_time_now_ms() + (uint64_t)timeout_ms : 0;
+  while (server_active_streams(server) > 0) {
+    int wait_ms = -1;
+    if (timeout_ms == 0) {
+      (void)grpc_server_poll(server, 0);
+      break;
+    }
+    if (timeout_ms > 0) {
+      uint64_t now = grpc_time_now_ms();
+      if (now >= deadline)
+        break;
+      uint64_t rem = deadline - now;
+      wait_ms = rem > 100 ? 100 : (int)rem;
+    }
+    int res = grpc_server_poll(server, wait_ms);
+    if (res < 0)
+      return (grpc_err)res;
+  }
+
+  server_flush_sessions(server);
+  return server_active_streams(server) == 0 ? GRPC_OK : GRPC_ERR_TIMEOUT;
 }
 
 GRPC_API grpc_err grpc_server_post(grpc_server *server, void (*fn)(void *arg),

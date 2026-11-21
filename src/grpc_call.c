@@ -148,6 +148,76 @@ static void retain_request_headers(grpc_call *call, const grpc_stream *stream) {
   call->nb_req_headers = stream->nb_headers;
 }
 
+static bool codec_is_supported(grpc_compression_algorithm alg) {
+  switch (alg) {
+  case GRPC_COMPRESS_IDENTITY:
+    return true;
+  case GRPC_COMPRESS_GZIP:
+  case GRPC_COMPRESS_DEFLATE:
+#if defined(GRPC_ENABLE_ZLIB)
+    return true;
+#else
+    return false;
+#endif
+  case GRPC_COMPRESS_ZSTD:
+#if defined(GRPC_ENABLE_ZSTD)
+    return true;
+#else
+    return false;
+#endif
+  case GRPC_COMPRESS_SNAPPY:
+#if defined(GRPC_ENABLE_SNAPPY)
+    return true;
+#else
+    return false;
+#endif
+  default:
+    return false;
+  }
+}
+
+static const char *codec_token(grpc_compression_algorithm alg) {
+  switch (alg) {
+  case GRPC_COMPRESS_GZIP:
+    return "gzip";
+  case GRPC_COMPRESS_DEFLATE:
+    return "deflate";
+  case GRPC_COMPRESS_ZSTD:
+    return "zstd";
+  case GRPC_COMPRESS_SNAPPY:
+    return "snappy";
+  default:
+    return "identity";
+  }
+}
+
+/* Returns true if the client's grpc-accept-encoding header lists `alg`. */
+static bool client_accepts_encoding(const grpc_call *call, grpc_compression_algorithm alg) {
+  if (alg == GRPC_COMPRESS_IDENTITY)
+    return true;
+  const char *tok = codec_token(alg);
+  size_t tok_len = strlen(tok);
+  size_t idx = 0, val_len = 0;
+  const char *val;
+  while ((val = grpc_call_metadata_next(call, "grpc-accept-encoding", &idx, &val_len)) != nullptr) {
+    const char *p = val;
+    const char *end = val + val_len;
+    while (p < end) {
+      while (p < end && (*p == ' ' || *p == '\t' || *p == ','))
+        p++;
+      const char *start = p;
+      while (p < end && *p != ',')
+        p++;
+      const char *trim = p;
+      while (trim > start && (trim[-1] == ' ' || trim[-1] == '\t'))
+        trim--;
+      if ((size_t)(trim - start) == tok_len && strncasecmp(start, tok, tok_len) == 0)
+        return true;
+    }
+  }
+  return false;
+}
+
 grpc_call *call_new(grpc_session *session, grpc_stream *stream) {
   grpc_call *call = grpc_calloc(1, sizeof(*call));
   if (call == nullptr)
@@ -162,7 +232,16 @@ grpc_call *call_new(grpc_session *session, grpc_stream *stream) {
   call->stream_id = stream->stream_id;
   call->start_ms = grpc_time_now_ms();
   memcpy(call->peer, session->peer, sizeof(call->peer));
+  memcpy(call->peer_cert_subject, session->peer_cert_subject, sizeof(call->peer_cert_subject));
   grpc_list_init(&call->pending);
+  grpc_compression_algorithm def_alg = session->server->config.default_compression;
+  if (def_alg != GRPC_COMPRESS_IDENTITY && codec_is_supported(def_alg) &&
+      client_accepts_encoding(call, def_alg)) {
+    call->auto_compression = def_alg;
+    call->auto_compression_level = session->server->config.default_compression_level == 0
+                                       ? GRPC_COMPRESSION_LEVEL_DEFAULT
+                                       : session->server->config.default_compression_level;
+  }
   return call;
 }
 
@@ -379,6 +458,25 @@ static grpc_err call_check(const grpc_call *call) {
   return GRPC_OK;
 }
 
+GRPC_API grpc_err grpc_call_set_compression(grpc_call *call,
+                                            grpc_compression_algorithm algorithm, int level) {
+  grpc_err err = call_check(call);
+  if (err != GRPC_OK)
+    return err;
+  if (call->headers_sent)
+    return GRPC_ERR_STATE;
+  if (algorithm != GRPC_COMPRESS_IDENTITY && !codec_is_supported(algorithm))
+    return GRPC_ERR_UNSUPPORTED;
+  if (algorithm == GRPC_COMPRESS_IDENTITY || !client_accepts_encoding(call, algorithm)) {
+    call->auto_compression = GRPC_COMPRESS_IDENTITY;
+    call->auto_compression_level = GRPC_COMPRESSION_LEVEL_DEFAULT;
+    return GRPC_OK;
+  }
+  call->auto_compression = algorithm;
+  call->auto_compression_level = level;
+  return GRPC_OK;
+}
+
 GRPC_API grpc_err grpc_call_send_metadata(grpc_call *call,
                                                    const grpc_metadata *metadata,
                                                    size_t count) {
@@ -405,6 +503,15 @@ GRPC_API grpc_err grpc_call_send(grpc_call *call, grpc_message *message) {
   if (err != GRPC_OK) {
     grpc_message_free(message);
     return err;
+  }
+
+  if (message->cflag == 0 && call->auto_compression != GRPC_COMPRESS_IDENTITY) {
+    grpc_message *compressed =
+        grpc_message_compress(message, call->auto_compression, call->auto_compression_level);
+    if (compressed != nullptr) {
+      grpc_message_free(message);
+      message = compressed;
+    }
   }
 
   if (!call->headers_sent) {
@@ -452,6 +559,20 @@ GRPC_API grpc_err grpc_call_send_data(grpc_call *call, const void *data,
   return grpc_call_send(call, message);
 }
 
+GRPC_API grpc_err grpc_call_reply(grpc_call *call, grpc_message *message) {
+  grpc_err err = grpc_call_send(call, message);
+  if (err != GRPC_OK)
+    return err;
+  return grpc_call_finish(call, GRPC_STATUS_OK, nullptr);
+}
+
+GRPC_API grpc_err grpc_call_reply_data(grpc_call *call, const void *data, size_t len) {
+  grpc_err err = grpc_call_send_data(call, data, len);
+  if (err != GRPC_OK)
+    return err;
+  return grpc_call_finish(call, GRPC_STATUS_OK, nullptr);
+}
+
 GRPC_API grpc_err grpc_call_finish(grpc_call *call, grpc_status status,
                                             const char *message) {
   grpc_err err = call_check(call);
@@ -474,20 +595,32 @@ GRPC_API const char *grpc_call_peer(const grpc_call *call) {
   return call != nullptr ? call->peer : nullptr;
 }
 
-GRPC_API const char *grpc_call_metadata(const grpc_call *call, const char *key,
-                                              size_t *len) {
-  if (call == nullptr || key == nullptr)
+GRPC_API const char *grpc_call_peer_cert_subject(const grpc_call *call) {
+  return call != nullptr && call->peer_cert_subject[0] != '\0' ? call->peer_cert_subject : nullptr;
+}
+
+GRPC_API const char *grpc_call_metadata_next(const grpc_call *call, const char *key,
+                                             size_t *index, size_t *len) {
+  if (call == nullptr || key == nullptr || index == nullptr)
     return nullptr;
   size_t klen = strlen(key);
-  for (size_t i = 0; i < call->nb_req_headers; i++) {
+  for (size_t i = *index; i < call->nb_req_headers; i++) {
     const grpc_header *h = &call->req_headers[i];
     if (h->namelen == klen && strncasecmp(h->name, key, klen) == 0) {
+      *index = i + 1;
       if (len != nullptr)
         *len = h->valuelen;
       return h->value;
     }
   }
+  *index = call->nb_req_headers;
   return nullptr;
+}
+
+GRPC_API const char *grpc_call_metadata(const grpc_call *call, const char *key,
+                                              size_t *len) {
+  size_t idx = 0;
+  return grpc_call_metadata_next(call, key, &idx, len);
 }
 
 GRPC_API size_t grpc_call_metadata_count(const grpc_call *call) {
@@ -552,24 +685,58 @@ GRPC_API void grpc_call_on_cancel(grpc_call *call,
 
 /* ---- from other threads -------------------------------------------------------- */
 
+typedef enum async_op_kind {
+  ASYNC_OP_SEND,
+  ASYNC_OP_REPLY,
+  ASYNC_OP_FINISH,
+  ASYNC_OP_METADATA,
+  ASYNC_OP_TRAILERS,
+} async_op_kind;
+
 typedef struct async_op async_op;
 struct async_op {
+  async_op_kind kind;
   grpc_call *call;
   grpc_message *message;
-  bool finish;
   grpc_status status;
   char *text;
+  grpc_metadata *metadata;
+  size_t metadata_count;
 };
+
+static void async_op_free(async_op *op) {
+  if (op == nullptr)
+    return;
+  for (size_t i = 0; i < op->metadata_count; i++) {
+    grpc_free((void *)op->metadata[i].key);
+    grpc_free((void *)op->metadata[i].value);
+  }
+  grpc_free(op->metadata);
+  grpc_free(op->text);
+  grpc_free(op);
+}
 
 static void run_async_op(void *arg) {
   async_op *op = arg;
-  if (op->finish)
-    (void)grpc_call_finish(op->call, op->status, op->text);
-  else
+  switch (op->kind) {
+  case ASYNC_OP_SEND:
     (void)grpc_call_send(op->call, op->message);
+    break;
+  case ASYNC_OP_REPLY:
+    (void)grpc_call_reply(op->call, op->message);
+    break;
+  case ASYNC_OP_FINISH:
+    (void)grpc_call_finish(op->call, op->status, op->text);
+    break;
+  case ASYNC_OP_METADATA:
+    (void)grpc_call_send_metadata(op->call, op->metadata, op->metadata_count);
+    break;
+  case ASYNC_OP_TRAILERS:
+    (void)grpc_call_add_trailers(op->call, op->metadata, op->metadata_count);
+    break;
+  }
   grpc_call_unref(op->call);
-  grpc_free(op->text);
-  grpc_free(op);
+  async_op_free(op);
 }
 
 static grpc_err post_async_op(async_op *op) {
@@ -579,10 +746,63 @@ static grpc_err post_async_op(async_op *op) {
   if (err != GRPC_OK) {
     grpc_call_unref(op->call);
     grpc_message_free(op->message);
-    grpc_free(op->text);
-    grpc_free(op);
+    async_op_free(op);
   }
   return err;
+}
+
+static grpc_err post_async_metadata(grpc_call *call, async_op_kind kind,
+                                    const grpc_metadata *metadata, size_t count) {
+  if (call == nullptr || (metadata == nullptr && count > 0))
+    return GRPC_ERR_INVALID;
+  async_op *op = grpc_calloc(1, sizeof(*op));
+  if (op == nullptr)
+    return GRPC_ERR_NOMEM;
+  op->kind = kind;
+  op->call = call;
+  if (count > 0) {
+    op->metadata = grpc_calloc(count, sizeof(*op->metadata));
+    if (op->metadata == nullptr) {
+      grpc_free(op);
+      return GRPC_ERR_NOMEM;
+    }
+    for (size_t i = 0; i < count; i++) {
+      if (metadata[i].key == nullptr || metadata[i].value == nullptr) {
+        op->metadata_count = i;
+        async_op_free(op);
+        return GRPC_ERR_INVALID;
+      }
+      size_t klen = metadata[i].key_len ? metadata[i].key_len : strlen(metadata[i].key);
+      size_t vlen = metadata[i].value_len ? metadata[i].value_len : strlen(metadata[i].value);
+      if (klen == 0 || metadata[i].key[0] == ':') {
+        op->metadata_count = i;
+        async_op_free(op);
+        return GRPC_ERR_INVALID;
+      }
+      char *k = grpc_strndup(metadata[i].key, klen);
+      char *v = grpc_strndup(metadata[i].value, vlen);
+      if (k == nullptr || v == nullptr) {
+        grpc_free(k);
+        grpc_free(v);
+        op->metadata_count = i;
+        async_op_free(op);
+        return GRPC_ERR_NOMEM;
+      }
+      op->metadata[i] = (grpc_metadata){.key = k, .key_len = klen, .value = v, .value_len = vlen};
+    }
+    op->metadata_count = count;
+  }
+  return post_async_op(op);
+}
+
+GRPC_API grpc_err grpc_call_send_metadata_async(grpc_call *call, const grpc_metadata *metadata,
+                                                size_t count) {
+  return post_async_metadata(call, ASYNC_OP_METADATA, metadata, count);
+}
+
+GRPC_API grpc_err grpc_call_add_trailers_async(grpc_call *call, const grpc_metadata *metadata,
+                                               size_t count) {
+  return post_async_metadata(call, ASYNC_OP_TRAILERS, metadata, count);
 }
 
 GRPC_API grpc_err grpc_call_send_async(grpc_call *call, grpc_message *message) {
@@ -595,6 +815,32 @@ GRPC_API grpc_err grpc_call_send_async(grpc_call *call, grpc_message *message) {
     grpc_message_free(message);
     return GRPC_ERR_NOMEM;
   }
+  op->kind = ASYNC_OP_SEND;
+  op->call = call;
+  op->message = message;
+  return post_async_op(op);
+}
+
+GRPC_API grpc_err grpc_call_send_data_async(grpc_call *call, const void *data, size_t len) {
+  if (call == nullptr || (data == nullptr && len > 0))
+    return GRPC_ERR_INVALID;
+  grpc_message *message = grpc_message_new(data, len);
+  if (message == nullptr)
+    return GRPC_ERR_NOMEM;
+  return grpc_call_send_async(call, message);
+}
+
+GRPC_API grpc_err grpc_call_reply_async(grpc_call *call, grpc_message *message) {
+  if (call == nullptr || message == nullptr) {
+    grpc_message_free(message);
+    return GRPC_ERR_INVALID;
+  }
+  async_op *op = grpc_calloc(1, sizeof(*op));
+  if (op == nullptr) {
+    grpc_message_free(message);
+    return GRPC_ERR_NOMEM;
+  }
+  op->kind = ASYNC_OP_REPLY;
   op->call = call;
   op->message = message;
   return post_async_op(op);
@@ -607,8 +853,8 @@ GRPC_API grpc_err grpc_call_finish_async(grpc_call *call, grpc_status status,
   async_op *op = grpc_calloc(1, sizeof(*op));
   if (op == nullptr)
     return GRPC_ERR_NOMEM;
+  op->kind = ASYNC_OP_FINISH;
   op->call = call;
-  op->finish = true;
   op->status = status;
   if (message != nullptr && (op->text = grpc_strdup(message)) == nullptr) {
     grpc_free(op);
@@ -717,8 +963,12 @@ static void dispatch_call(grpc_call *call) {
       call->cancel_fn = call->route->stream.on_cancel;
       call->cancel_userdata = call->route->userdata;
     }
-    if (!interceptors_run_on_call(call))
+    if (!interceptors_run_on_call(call)) {
       call->rejected = true;
+    } else if (call->route->kind == ROUTE_STREAM && call->route->stream.on_start != nullptr &&
+               !call->finished) {
+      call->route->stream.on_start(call, call->route->userdata);
+    }
   }
   if (call->rejected) {
     drop_pending(call);

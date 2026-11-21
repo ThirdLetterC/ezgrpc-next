@@ -134,6 +134,7 @@ static void on_session_close(uv_handle_t *handle) {
   session->is_writing = false;
   memset(&session->sockaddr, 0, sizeof(session->sockaddr));
   session->peer[0] = '\0';
+  session->peer_cert_subject[0] = '\0';
   session->is_closing = false;
   session->is_active = false;
 
@@ -291,6 +292,8 @@ static int session_recv_tls(grpc_session *ezsession, const u8 *data, size_t len)
     if (hres == 0) {
       return 0; // Handshake in progress
     }
+    (void)grpc_tls_peer_subject(ezsession, ezsession->peer_cert_subject,
+                                sizeof(ezsession->peer_cert_subject));
   }
 
   /* the ciphertext now lives in the read BIO, so the read buffer can hold the plaintext */

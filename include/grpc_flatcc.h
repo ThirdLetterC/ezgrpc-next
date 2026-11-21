@@ -83,3 +83,9 @@ GRPC_API grpc_message *grpc_fb_pack(flatcc_builder_t *builder);
  * grpc_call_send(), and resets the builder.
  */
 GRPC_API grpc_err grpc_call_send_fb(grpc_call *call, flatcc_builder_t *builder);
+
+/**
+ * Sends the buffer finished in ``builder``, resets the builder, and finishes
+ * ``call`` with GRPC_STATUS_OK.
+ */
+GRPC_API grpc_err grpc_call_reply_fb(grpc_call *call, flatcc_builder_t *builder);

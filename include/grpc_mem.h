@@ -29,10 +29,10 @@ GRPC_API const grpc_allocator *grpc_get_allocator(void);
 /** The name of the default allocator: "libc", "mimalloc" or "jemalloc". */
 GRPC_API const char *grpc_get_allocator_name(void);
 
-GRPC_API void *grpc_malloc(size_t size);
-GRPC_API void *grpc_calloc(size_t nmemb, size_t size);
-GRPC_API void *grpc_realloc(void *ptr, size_t size);
+GRPC_API GRPC_NODISCARD void *grpc_malloc(size_t size);
+GRPC_API GRPC_NODISCARD void *grpc_calloc(size_t nmemb, size_t size);
+GRPC_API GRPC_NODISCARD void *grpc_realloc(void *ptr, size_t size);
 GRPC_API void grpc_free(void *ptr);
-GRPC_API void *grpc_aligned_alloc(size_t alignment, size_t size);
-GRPC_API char *grpc_strdup(const char *s);
-GRPC_API char *grpc_strndup(const char *s, size_t n);
+GRPC_API GRPC_NODISCARD void *grpc_aligned_alloc(size_t alignment, size_t size);
+GRPC_API GRPC_NODISCARD char *grpc_strdup(const char *s);
+GRPC_API GRPC_NODISCARD char *grpc_strndup(const char *s, size_t n);

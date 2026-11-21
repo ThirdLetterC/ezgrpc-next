@@ -223,10 +223,148 @@ GRPC_API grpc_err grpc_status_details_decode(const char *base64_str, int32_t *ou
   return GRPC_OK;
 }
 
+GRPC_API void grpc_status_details_free(grpc_status_details *details) {
+  if (details == nullptr)
+    return;
+  grpc_free(details->message);
+  for (size_t i = 0; i < details->nb_details; i++) {
+    grpc_free((void *)details->details[i].type_url);
+    grpc_free((void *)details->details[i].value);
+  }
+  grpc_free(details->details);
+  *details = (grpc_status_details){};
+}
+
+GRPC_API grpc_err grpc_status_details_decode_all(const char *base64_str,
+                                                 grpc_status_details *out) {
+  if (base64_str == nullptr || out == nullptr)
+    return GRPC_ERR_INVALID;
+  *out = (grpc_status_details){};
+
+  size_t raw_len = 0;
+  uint8_t *raw = grpc_metadata_decode_bin(base64_str, strlen(base64_str), &raw_len);
+  if (raw == nullptr)
+    return GRPC_ERR_INVALID;
+
+  size_t cap = 0;
+  size_t seek = 0;
+  while (seek < raw_len) {
+    uint8_t tag = raw[seek++];
+    uint8_t field_num = tag >> 3;
+    uint8_t wire_type = tag & 0x07;
+
+    if (field_num == 1 && wire_type == 0) {
+      out->code = (int32_t)read_varint(raw, raw_len, &seek);
+    } else if (field_num == 2 && wire_type == 2) {
+      size_t mlen = (size_t)read_varint(raw, raw_len, &seek);
+      if (seek + mlen > raw_len) {
+        grpc_free(raw);
+        grpc_status_details_free(out);
+        return GRPC_ERR_INVALID;
+      }
+      grpc_free(out->message);
+      out->message = grpc_malloc(mlen + 1);
+      if (out->message == nullptr) {
+        grpc_free(raw);
+        grpc_status_details_free(out);
+        return GRPC_ERR_NOMEM;
+      }
+      memcpy(out->message, raw + seek, mlen);
+      out->message[mlen] = '\0';
+      seek += mlen;
+    } else if (field_num == 3 && wire_type == 2) {
+      size_t any_len = (size_t)read_varint(raw, raw_len, &seek);
+      if (seek + any_len > raw_len) {
+        grpc_free(raw);
+        grpc_status_details_free(out);
+        return GRPC_ERR_INVALID;
+      }
+      size_t any_end = seek + any_len;
+      char *url = nullptr;
+      uint8_t *val = nullptr;
+      size_t vlen = 0;
+      while (seek < any_end) {
+        uint8_t any_tag = raw[seek++];
+        uint8_t any_field = any_tag >> 3;
+        uint8_t any_wire = any_tag & 0x07;
+        if (any_field == 1 && any_wire == 2) {
+          size_t ulen = (size_t)read_varint(raw, any_end, &seek);
+          if (seek + ulen > any_end)
+            break;
+          grpc_free(url);
+          url = grpc_malloc(ulen + 1);
+          if (url == nullptr) {
+            grpc_free(val);
+            grpc_free(raw);
+            grpc_status_details_free(out);
+            return GRPC_ERR_NOMEM;
+          }
+          memcpy(url, raw + seek, ulen);
+          url[ulen] = '\0';
+          seek += ulen;
+        } else if (any_field == 2 && any_wire == 2) {
+          size_t len = (size_t)read_varint(raw, any_end, &seek);
+          if (seek + len > any_end)
+            break;
+          grpc_free(val);
+          val = len > 0 ? grpc_malloc(len) : nullptr;
+          if (len > 0 && val == nullptr) {
+            grpc_free(url);
+            grpc_free(raw);
+            grpc_status_details_free(out);
+            return GRPC_ERR_NOMEM;
+          }
+          if (len > 0)
+            memcpy(val, raw + seek, len);
+          vlen = len;
+          seek += len;
+        } else if (any_wire == 0) {
+          read_varint(raw, any_end, &seek);
+        } else if (any_wire == 2) {
+          size_t sk = (size_t)read_varint(raw, any_end, &seek);
+          seek = seek + sk <= any_end ? seek + sk : any_end;
+        } else {
+          break;
+        }
+      }
+      seek = any_end;
+      if (out->nb_details == cap) {
+        size_t next_cap = cap ? cap * 2 : 4;
+        grpc_status_detail_entry *arr =
+            grpc_realloc(out->details, next_cap * sizeof(*arr));
+        if (arr == nullptr) {
+          grpc_free(url);
+          grpc_free(val);
+          grpc_free(raw);
+          grpc_status_details_free(out);
+          return GRPC_ERR_NOMEM;
+        }
+        out->details = arr;
+        cap = next_cap;
+      }
+      out->details[out->nb_details++] = (grpc_status_detail_entry){
+          .type_url = url,
+          .value = val,
+          .value_len = vlen,
+      };
+    } else if (wire_type == 0) {
+      read_varint(raw, raw_len, &seek);
+    } else if (wire_type == 2) {
+      size_t sk = (size_t)read_varint(raw, raw_len, &seek);
+      seek = seek + sk <= raw_len ? seek + sk : raw_len;
+    } else {
+      break;
+    }
+  }
+
+  grpc_free(raw);
+  return GRPC_OK;
+}
+
 GRPC_API grpc_err grpc_call_finish_with_details(grpc_call *call, grpc_status status,
-                                                         const char *message,
-                                                         const grpc_status_detail_entry *details,
-                                                         size_t nb_details) {
+                                                const char *message,
+                                                const grpc_status_detail_entry *details,
+                                                size_t nb_details) {
   if (call == nullptr || (details == nullptr && nb_details > 0))
     return GRPC_ERR_INVALID;
 
@@ -247,4 +385,63 @@ GRPC_API grpc_err grpc_call_finish_with_details(grpc_call *call, grpc_status sta
   if (err != GRPC_OK)
     return err;
   return grpc_call_finish(call, status, message);
+}
+
+typedef struct async_details_op {
+  grpc_call *call;
+  grpc_status status;
+  char *message;
+  char *b64_status;
+  size_t b64_len;
+} async_details_op;
+
+static void run_async_details_op(void *arg) {
+  async_details_op *op = arg;
+  grpc_metadata trailer = {
+      .key = GRPC_STATUS_DETAILS_TRAILER,
+      .key_len = strlen(GRPC_STATUS_DETAILS_TRAILER),
+      .value = op->b64_status,
+      .value_len = op->b64_len,
+  };
+  if (grpc_call_add_trailers(op->call, &trailer, 1) == GRPC_OK)
+    (void)grpc_call_finish(op->call, op->status, op->message);
+  grpc_call_unref(op->call);
+  grpc_free(op->message);
+  grpc_free(op->b64_status);
+  grpc_free(op);
+}
+
+GRPC_API grpc_err grpc_call_finish_with_details_async(grpc_call *call, grpc_status status,
+                                                      const char *message,
+                                                      const grpc_status_detail_entry *details,
+                                                      size_t nb_details) {
+  if (call == nullptr || (details == nullptr && nb_details > 0))
+    return GRPC_ERR_INVALID;
+
+  async_details_op *op = grpc_calloc(1, sizeof(*op));
+  if (op == nullptr)
+    return GRPC_ERR_NOMEM;
+  op->call = call;
+  op->status = status;
+  op->b64_status =
+      grpc_status_details_encode((int32_t)status, message, details, nb_details, &op->b64_len);
+  if (op->b64_status == nullptr) {
+    grpc_free(op);
+    return GRPC_ERR_NOMEM;
+  }
+  if (message != nullptr && (op->message = grpc_strdup(message)) == nullptr) {
+    grpc_free(op->b64_status);
+    grpc_free(op);
+    return GRPC_ERR_NOMEM;
+  }
+
+  grpc_call_ref(call);
+  grpc_err err = grpc_server_post(call->server, run_async_details_op, op);
+  if (err != GRPC_OK) {
+    grpc_call_unref(call);
+    grpc_free(op->message);
+    grpc_free(op->b64_status);
+    grpc_free(op);
+  }
+  return err;
 }

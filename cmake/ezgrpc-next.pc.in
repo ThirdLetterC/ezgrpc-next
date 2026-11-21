@@ -1,0 +1,10 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${exec_prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: ezGRPC-next
+Description: Lightweight, high-performance gRPC server library in C23
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -lgrpc
+Cflags: -I${includedir}

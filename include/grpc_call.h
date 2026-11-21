@@ -40,12 +40,26 @@ GRPC_API const char *grpc_call_method(const grpc_call *call);
 GRPC_API const char *grpc_call_peer(const grpc_call *call);
 
 /**
+ * The verified TLS client certificate subject (e.g. ``"/CN=client"``), or
+ * nullptr when TLS or client certificate authentication is not active.
+ */
+GRPC_API const char *grpc_call_peer_cert_subject(const grpc_call *call);
+
+/**
  * Looks up request metadata by key (case-insensitive). Returns the value,
  * NUL-terminated and valid as long as the call, or nullptr if absent.
  * ``len`` may be nullptr.
  */
 GRPC_API const char *grpc_call_metadata(const grpc_call *call, const char *key,
                                               size_t *len);
+
+/**
+ * Iterates over all request metadata values matching ``key`` (case-insensitive).
+ * Set ``*index = 0`` before the first call. Each call returns the next matching
+ * value and advances ``*index``, or returns nullptr when no more values exist.
+ */
+GRPC_API const char *grpc_call_metadata_next(const grpc_call *call, const char *key,
+                                             size_t *index, size_t *len);
 
 /** The number of request headers, including pseudo-headers such as ``:path``. */
 GRPC_API size_t grpc_call_metadata_count(const grpc_call *call);
@@ -99,6 +113,15 @@ GRPC_API void grpc_call_on_cancel(grpc_call *call,
 /* ---- answering ---------------------------------------------------------- */
 
 /**
+ * Configures automatic compression for uncompressed response messages sent on
+ * this call. Must be called before the first message is sent. Negotiates
+ * against the client's ``grpc-accept-encoding`` header; if the client does not
+ * advertise ``algorithm``, responses remain uncompressed.
+ */
+GRPC_API grpc_err grpc_call_set_compression(grpc_call *call,
+                                            grpc_compression_algorithm algorithm, int level);
+
+/**
  * Sends initial metadata (response headers). Only before the first message.
  */
 GRPC_API grpc_err grpc_call_send_metadata(grpc_call *call,
@@ -116,6 +139,17 @@ GRPC_API grpc_err grpc_call_send(grpc_call *call, grpc_message *message);
  */
 GRPC_API grpc_err grpc_call_send_data(grpc_call *call, const void *data,
                                                size_t len);
+
+/**
+ * Sends ``message`` and finishes the call with GRPC_STATUS_OK (unary shortcut).
+ * Takes ownership of ``message``, also on failure.
+ */
+GRPC_API grpc_err grpc_call_reply(grpc_call *call, grpc_message *message);
+
+/**
+ * Sends a copy of ``len`` bytes of ``data`` and finishes the call with GRPC_STATUS_OK.
+ */
+GRPC_API grpc_err grpc_call_reply_data(grpc_call *call, const void *data, size_t len);
 
 /**
  * Adds trailing metadata, sent by grpc_call_finish().
@@ -141,10 +175,35 @@ GRPC_API grpc_call *grpc_call_ref(grpc_call *call);
 GRPC_API void grpc_call_unref(grpc_call *call);
 
 /**
+ * Thread-safe grpc_call_send_metadata(). Copies ``metadata`` and queues it on
+ * the server thread. The caller must hold a reference to the call.
+ */
+GRPC_API grpc_err grpc_call_send_metadata_async(grpc_call *call, const grpc_metadata *metadata,
+                                                size_t count);
+
+/**
+ * Thread-safe grpc_call_add_trailers(). Copies ``metadata`` and queues it on
+ * the server thread. The caller must hold a reference to the call.
+ */
+GRPC_API grpc_err grpc_call_add_trailers_async(grpc_call *call, const grpc_metadata *metadata,
+                                               size_t count);
+
+/**
  * Thread-safe grpc_call_send(): queues the message for the server thread
  * and wakes it up. The caller must hold a reference to the call.
  */
 GRPC_API grpc_err grpc_call_send_async(grpc_call *call, grpc_message *message);
+
+/**
+ * Thread-safe grpc_call_send_data(). The caller must hold a reference.
+ */
+GRPC_API grpc_err grpc_call_send_data_async(grpc_call *call, const void *data, size_t len);
+
+/**
+ * Thread-safe grpc_call_reply(). Takes ownership of ``message``. The caller must
+ * hold a reference.
+ */
+GRPC_API grpc_err grpc_call_reply_async(grpc_call *call, grpc_message *message);
 
 /**
  * Thread-safe grpc_call_finish(). The caller must hold a reference.

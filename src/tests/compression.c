@@ -117,13 +117,13 @@ void test_decompression_limits(void) {
     for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
       uint8_t *output = nullptr;
       size_t size = 123;
-      int rc = grpc_decompress_limited(algorithms[codec], packed, packed_len, &output, &size, limits[i]);
+      grpc_err rc = grpc_decompress_limited(algorithms[codec], packed, packed_len, &output, &size, limits[i]);
       if (limits[i] < sizeof(input)) {
-        TEST_ASSERT_EQUAL_INT(5, rc);
+        TEST_ASSERT_EQUAL_INT(GRPC_ERR_LIMIT, rc);
         TEST_ASSERT_NULL(output);
         TEST_ASSERT_EQUAL_UINT64(0, size);
       } else {
-        TEST_ASSERT_EQUAL_INT(0, rc);
+        TEST_ASSERT_EQUAL_INT(GRPC_OK, rc);
         TEST_ASSERT_EQUAL_UINT64(sizeof(input), size);
         TEST_ASSERT_EQUAL_MEMORY(input, output, size);
       }

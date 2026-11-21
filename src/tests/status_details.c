@@ -71,9 +71,41 @@ void test_status_details_basic_roundtrip(void) {
   grpc_free(dec_msg);
 }
 
+void test_status_details_decode_all_multiple(void) {
+  const uint8_t p1[] = {0x01, 0x02, 0x03};
+  const uint8_t p2[] = {0x0A, 0x0B};
+  grpc_status_detail_entry entries[] = {
+      {.type_url = "type.googleapis.com/google.rpc.ErrorInfo", .value = p1, .value_len = sizeof(p1)},
+      {.type_url = "type.googleapis.com/google.rpc.RetryInfo", .value = p2, .value_len = sizeof(p2)},
+  };
+
+  size_t enc_len = 0;
+  char *b64 = grpc_status_details_encode((int32_t)GRPC_STATUS_UNAVAILABLE, "try again", entries, 2,
+                                         &enc_len);
+  TEST_ASSERT_NOT_NULL(b64);
+
+  grpc_status_details decoded = {};
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_status_details_decode_all(b64, &decoded));
+  TEST_ASSERT_EQUAL_INT32((int32_t)GRPC_STATUS_UNAVAILABLE, decoded.code);
+  TEST_ASSERT_EQUAL_STRING("try again", decoded.message);
+  TEST_ASSERT_EQUAL_UINT64(2, decoded.nb_details);
+  TEST_ASSERT_EQUAL_STRING("type.googleapis.com/google.rpc.ErrorInfo", decoded.details[0].type_url);
+  TEST_ASSERT_EQUAL_UINT64(sizeof(p1), decoded.details[0].value_len);
+  TEST_ASSERT_EQUAL_MEMORY(p1, decoded.details[0].value, sizeof(p1));
+  TEST_ASSERT_EQUAL_STRING("type.googleapis.com/google.rpc.RetryInfo", decoded.details[1].type_url);
+  TEST_ASSERT_EQUAL_UINT64(sizeof(p2), decoded.details[1].value_len);
+  TEST_ASSERT_EQUAL_MEMORY(p2, decoded.details[1].value, sizeof(p2));
+
+  grpc_status_details_free(&decoded);
+  TEST_ASSERT_EQUAL_UINT64(0, decoded.nb_details);
+  TEST_ASSERT_NULL(decoded.message);
+  grpc_free(b64);
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_status_details_roundtrip_with_any);
   RUN_TEST(test_status_details_basic_roundtrip);
+  RUN_TEST(test_status_details_decode_all_multiple);
   return UNITY_END();
 }

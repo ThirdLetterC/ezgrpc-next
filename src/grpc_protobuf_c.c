@@ -64,3 +64,11 @@ GRPC_API grpc_err grpc_call_send_pb(grpc_call *call, const ProtobufCMessage *mes
   }
   return grpc_call_send(call, msg);
 }
+
+GRPC_API grpc_err grpc_call_reply_pb(grpc_call *call, const ProtobufCMessage *message) {
+  grpc_err err = grpc_call_send_pb(call, message);
+  if (err != GRPC_OK) {
+    return err;
+  }
+  return grpc_call_finish(call, GRPC_STATUS_OK, nullptr);
+}

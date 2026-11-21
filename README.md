@@ -8,46 +8,43 @@
 
 ## Features
 
-- **Poll-based API**: one call (`grpc_server_poll()`) runs the event loop and returns a batch of events (connections, messages, cancellations, deadlines) for you to handle.
+- **Handler & poll APIs**: register unary/server-streaming (`grpc_server_handle()`), client/bidi-streaming (`grpc_server_handle_stream()` with `on_start`/`on_message`/`on_end`/`on_cancel`), or poll-driven (`grpc_server_register_path()` + `grpc_server_poll()`) methods.
 - **All 4 RPC modes**: unary, server streaming, client streaming and bidirectional streaming.
-- **TLS with ALPN**: HTTP/2 over TLS 1.2 and 1.3, negotiating `h2`. Seven TLS libraries are supported: OpenSSL, LibreSSL, BoringSSL, AWS-LC, wolfSSL, GnuTLS and rustls (see [TLS backends](#tls-backends)).
-- **Protobuf-C helpers**: optional [`protobuf-c`](https://github.com/protobuf-c/protobuf-c) integration (`GRPC_PB_UNPACK`, `grpc_pb_create_response`).
-- **FlatBuffers helpers**: optional [`flatcc`](https://github.com/dvidelabs/flatcc) integration with verified, zero-copy reads (`GRPC_FB_UNPACK`, `grpc_fb_create_response`).
-- **Interceptors**: pre-call hooks run with `grpc_server_intercept_pre()`, post-call hooks with `grpc_server_intercept_post()`. A built-in Bearer token interceptor is available (`grpc_interceptor_create_bearer_auth`).
-- **Health checking**: the standard `/grpc.health.v1.Health/Check` service with per-service status.
+- **TLS with ALPN & mTLS**: HTTP/2 over TLS 1.2 and 1.3 negotiating `h2`, from files or in-memory PEM buffers, with optional client certificate verification (`grpc_call_peer_cert_subject()`). Seven TLS libraries are supported: OpenSSL, LibreSSL, BoringSSL, AWS-LC, wolfSSL, GnuTLS and rustls (see [TLS backends](#tls-backends)).
+- **Protobuf-C helpers**: optional [`protobuf-c`](https://github.com/protobuf-c/protobuf-c) integration (`GRPC_PB_UNPACK`, `grpc_call_send_pb`, `grpc_call_reply_pb`).
+- **FlatBuffers helpers**: optional [`flatcc`](https://github.com/dvidelabs/flatcc) integration with verified, zero-copy reads (`GRPC_FB_UNPACK`, `grpc_call_send_fb`, `grpc_call_reply_fb`).
+- **Interceptors**: automatic `on_call` / `on_done` hooks added via `grpc_server_add_interceptor()`. A built-in Bearer token interceptor is available (`grpc_interceptor_bearer_auth`).
+- **Health checking**: standard `/grpc.health.v1.Health/Check` and streaming `/grpc.health.v1.Health/Watch` with per-service status.
 - **Server reflection**: `grpc.reflection.v1` and `v1alpha` `ServerReflectionInfo`.
-- **Metadata**: read request headers, send initial metadata and trailers, and Base64 `*-bin` values.
-- **Deadlines**: `grpc-timeout` is parsed. Expired streams are ended with `DEADLINE_EXCEEDED` and reported as `GRPC_EVENT_TIMEOUT`.
-- **Message compression**: gzip and deflate through zlib, plus optional Zstandard and Snappy codecs. Select the codec and compression level per message.
-- **Rich error model**: `google.rpc.Status` with `Any` details (e.g. `ErrorInfo`) sent in `grpc-status-details-bin`.
+- **Metadata**: case-insensitive single and multi-value request headers (`grpc_call_metadata`, `grpc_call_metadata_next`), initial metadata, trailers, and Base64 `*-bin` values.
+- **Deadlines**: `grpc-timeout` is parsed. Expired calls are ended with `DEADLINE_EXCEEDED` and cancelled.
+- **Message compression**: gzip and deflate through zlib, plus optional Zstandard and Snappy codecs—both per-message and automatic negotiation via `grpc_config.default_compression` or `grpc_call_set_compression()`.
+- **Rich error model**: `google.rpc.Status` with multiple `Any` details sent in `grpc-status-details-bin` (`grpc_call_finish_with_details`, `grpc_status_details_decode_all`).
+- **Graceful shutdown**: `grpc_server_drain()` stops accepting new connections, sends HTTP/2 `GOAWAY`, and waits for in-flight calls.
 - **Pluggable allocators**: libc `malloc`, `mimalloc`, `jemalloc`, or your own allocator set at runtime.
 
 ---
 
 ## Architecture
 
-You register service paths, then poll for events and answer them:
+Register method handlers (or event-driven paths), then run the event loop with `grpc_server_run()` or step it manually with `grpc_server_poll()`:
 
 ```c
-struct grpc_event {
-  union {
-    grpc_event_message  message;   // Received gRPC messages on a stream
-    grpc_event_dataloss dataloss;  // Truncated message at end of stream
-    grpc_event_cancel   cancel;    // Stream cancelled by the client (RST_STREAM)
-    grpc_event_timeout  timeout;   // Stream deadline exceeded
-  };
-  grpc_event_type type;            // GRPC_EVENT_CONNECT, _DISCONNECT, _MESSAGE, ...
-  grpc_session_uuid session_uuid;  // Identifies the client connection
-  void *userdata;                     // The pointer you registered with the path
-};
+typedef struct grpc_event {
+  grpc_event_type type;        // GRPC_EVENT_MESSAGE, GRPC_EVENT_END, GRPC_EVENT_CANCEL
+  grpc_call *call;             // The call handle (valid until next poll; ref to keep)
+  const grpc_message *message; // Payload for GRPC_EVENT_MESSAGE
+  void *userdata;              // Pointer passed to grpc_server_register_path()
+} grpc_event;
 ```
 
 ### I/O model
 
-Each `grpc_server` owns one libuv loop, driven by `grpc_server_poll()`:
+Each `grpc_server` owns one libuv loop, driven by `grpc_server_run()` or `grpc_server_poll()`:
 
 - Connections are libuv TCP streams (`uv_tcp_t`). Received bytes go straight from a shared read buffer into nghttp2.
-- `grpc_server_session_stream_send()`, `..._stream_end()` and similar calls only **queue** frames. At the start of the next `grpc_server_poll()`, everything queued for a connection (headers, data and trailers of all its streams) is written with a single write. If your next poll may be delayed, call `grpc_server_flush()`.
+- `grpc_call_send()`, `grpc_call_reply()`, `grpc_call_finish()` and similar calls only **queue** frames. Everything queued for a connection (headers, data and trailers of all its streams) is flushed in a single write. If your next poll may be delayed, call `grpc_server_flush()`.
+- Worker threads can safely answer calls with `grpc_call_ref()` + `grpc_call_send_async()` / `grpc_call_reply_async()` / `grpc_call_finish_async()`, or schedule arbitrary callbacks via `grpc_server_post()`.
 - The TLS library never touches the socket: ciphertext is passed to and from it in memory, so each batch is encrypted with a single write call and every TLS library is driven the same way.
 
 ### Using more cores
@@ -305,110 +302,60 @@ All backends behave the same way: they load a PEM certificate chain and private 
 #include <string.h>
 #include "grpc.h"
 
-static void handle_message(grpc_server *server, grpc_event *event) {
-  /* the request messages; this server ignores their content */
-  grpc_message *request;
-  while ((request = grpc_messages_pop(event->message.messages)) != nullptr)
-    grpc_message_free(request);
-
-  /* a unary call answers once the client has finished sending */
-  if (!event->message.end_stream)
-    return;
-
+static void say_hello(grpc_call *call, const grpc_message *request, void *userdata) {
+  (void)request;
+  (void)userdata;
   const char reply[] = "Hello from ezGRPC-next!";
-  grpc_messages *response = grpc_messages_new(nullptr);
-  grpc_messages_push(response, grpc_message_new(0, (void *)reply, strlen(reply)));
-
-  /* both calls only queue frames; the next poll writes them */
-  grpc_server_session_stream_send(server, event->session_uuid, event->message.stream_id,
-                                     response);
-  grpc_server_session_stream_end(server, event->session_uuid, event->message.stream_id,
-                                    GRPC_STATUS_OK);
-  grpc_messages_free(response);
+  (void)grpc_call_reply_data(call, reply, strlen(reply));
 }
 
 int main(void) {
-  grpc_global_init(0);
-
-  grpc_server *server = grpc_server_new("0.0.0.0", 19009, /* IPv4 */
-                                              "::", 19009,      /* IPv6 */
-                                              1024,             /* listen backlog */
-                                              nullptr,          /* server settings */
-                                              nullptr);         /* HTTP/2 settings */
-  if (server == nullptr)
+  grpc_err err;
+  grpc_server *server = grpc_server_new_ex(
+      &(grpc_config){
+          .port = 19009, /* or 0 for an OS-assigned ephemeral port */
+          .log_level = GRPC_LOG_INFO,
+      },
+      &err);
+  if (server == nullptr) {
+    fprintf(stderr, "failed to start server: %s\n", grpc_strerror(err));
     return 1;
-
-  /* optional */
-  /* grpc_server_enable_tls(server, "server.crt", "server.key"); */
-  grpc_health_register(server);
-  grpc_reflection_register(server);
-
-  /* the userdata pointer comes back in every event for this path */
-  static int say_hello;
-  grpc_server_register_path(server, "/helloworld.Greeter/SayHello", &say_hello, 0, 0);
-
-  grpc_events *events = grpc_events_new(nullptr);
-  for (;;) {
-    /* writes queued responses, then waits up to 500 ms for new events */
-    if (grpc_server_poll(server, events, 500) < 0)
-      break;
-
-    /* events come in blocks; read until none are left */
-    grpc_event *block;
-    size_t count;
-    while ((block = grpc_events_read(events, &count)) != nullptr) {
-      for (size_t i = 0; i < count; i++) {
-        grpc_event *event = &block[i];
-        if (grpc_health_handle_event(server, event) ||
-            grpc_reflection_handle_event(server, event)) {
-          /* answered by the built-in services */
-        } else if (event->type == GRPC_EVENT_MESSAGE && event->userdata == &say_hello) {
-          handle_message(server, event);
-        } else if (event->type == GRPC_EVENT_DATALOSS) {
-          grpc_server_session_stream_end(server, event->session_uuid,
-                                            event->dataloss.stream_id,
-                                            GRPC_STATUS_DATA_LOSS);
-        }
-
-        /* the application owns the received messages */
-        if (event->type == GRPC_EVENT_MESSAGE)
-          grpc_messages_free(event->message.messages);
-      }
-      grpc_free(block);
-    }
   }
 
-  grpc_events_free(events);
+  (void)grpc_health_enable(server);
+  (void)grpc_reflection_enable(server);
+  (void)grpc_server_handle(server, "/helloworld.Greeter/SayHello", say_hello, nullptr);
+
+  (void)grpc_server_run(server);
+  (void)grpc_server_drain(server, 5000);
   grpc_server_free(server);
-  grpc_global_cleanup();
   return 0;
 }
 ```
 
-Paths that are not registered are answered with `UNIMPLEMENTED` automatically and produce no event.
+Paths that are not registered are answered with `UNIMPLEMENTED` automatically.
 
 ### 2. Protobuf-C requests and responses
 
-With `protobuf-c` installed, unpack requests and pack responses directly:
+With `protobuf-c` installed, unpack requests and reply directly:
 
 ```c
 #include "helloworld.pb-c.h"
 
-grpc_message *req_msg = grpc_messages_pop(event->message.messages);
-Helloworld__HelloRequest *req = GRPC_PB_UNPACK(
-    Helloworld__HelloRequest, &helloworld__hello_request__descriptor, req_msg);
-grpc_message_free(req_msg);
+static void say_hello_pb(grpc_call *call, const grpc_message *req_msg, void *userdata) {
+  (void)userdata;
+  Helloworld__HelloRequest *req = GRPC_PB_UNPACK(
+      Helloworld__HelloRequest, &helloworld__hello_request__descriptor, req_msg);
+  if (req == nullptr) {
+    (void)grpc_call_finish(call, GRPC_STATUS_INVALID_ARGUMENT, "bad protobuf");
+    return;
+  }
 
-Helloworld__HelloReply reply = HELLOWORLD__HELLO_REPLY__INIT;
-reply.message = "Hello, world!";
-grpc_messages *res_msgs = grpc_pb_create_response((ProtobufCMessage *)&reply);
-
-grpc_server_session_stream_send(server, event->session_uuid, event->message.stream_id, res_msgs);
-grpc_server_session_stream_end(server, event->session_uuid, event->message.stream_id,
-                                  GRPC_STATUS_OK);
-
-grpc_messages_free(res_msgs);
-GRPC_PB_FREE_UNPACKED(req);
+  Helloworld__HelloReply reply = HELLOWORLD__HELLO_REPLY__INIT;
+  reply.message = "Hello, world!";
+  (void)grpc_call_reply_pb(call, (const ProtobufCMessage *)&reply);
+  GRPC_PB_FREE_UNPACKED(req);
+}
 ```
 
 ### 3. FlatBuffers requests and responses
@@ -420,47 +367,45 @@ With [flatcc](https://github.com/dvidelabs/flatcc), generate C code for a schema
 #include "greeter_verifier.h"
 
 flatcc_builder_t builder;
-grpc_fb_builder_init(&builder); /* once; uses the grpc allocator */
+(void)grpc_fb_builder_init(&builder); /* once; uses the grpc allocator */
 
-/* verifies the buffer and returns its root table, or nullptr if it is not a
- * valid greeter.HelloRequest. The table points into req_msg: keep it alive */
+/* verifies the buffer and returns its root table, or nullptr if invalid */
 greeter_HelloRequest_table_t req = GRPC_FB_UNPACK(greeter_HelloRequest, req_msg);
 if (req == nullptr) {
-  grpc_server_session_stream_end2(server, event->session_uuid, event->message.stream_id,
-                                     GRPC_STATUS_INVALID_ARGUMENT, nullptr, nullptr, 0);
+  (void)grpc_call_finish(call, GRPC_STATUS_INVALID_ARGUMENT, nullptr);
   return;
 }
 
-/* fields absent from the buffer read as nullptr (strings) or their default */
 const char *name = greeter_HelloRequest_name(req);
 greeter_HelloReply_start_as_root(&builder);
 greeter_HelloReply_message_create_str(&builder, name != nullptr ? name : "World");
 greeter_HelloReply_end_as_root(&builder);
 
-/* copies the finished buffer into a message and resets the builder for reuse */
-grpc_messages *res_msgs = grpc_fb_create_response(&builder);
-grpc_server_session_stream_send(server, event->session_uuid, event->message.stream_id, res_msgs);
-grpc_server_session_stream_end(server, event->session_uuid, event->message.stream_id,
-                                  GRPC_STATUS_OK);
-grpc_messages_free(res_msgs);
+/* sends the finished buffer, resets the builder, and finishes with OK */
+(void)grpc_call_reply_fb(call, &builder);
 ```
 
 FlatBuffers services use the usual gRPC paths (`/greeter.Greeter/SayHello` for `rpc_service Greeter` in `namespace greeter`). flatcc requires `attribute "streaming";` in schemas that mark streaming methods. Message payloads (`grpc_message.data`) are aligned like `malloc()` memory, so buffers can be read where they are received.
 
 ### 4. Metadata, trailers and rich errors
 
-Read a request header and end the stream with custom trailers:
+Read request headers (including repeated keys) and end the call with custom trailers:
 
 ```c
-size_t len;
-const char *agent = grpc_metadata_get(server, event->session_uuid, event->message.stream_id,
-                                         "user-agent", &len);
+size_t len = 0;
+const char *agent = grpc_call_metadata(call, "user-agent", &len);
 
-grpc_metadata_entry trailers[] = {
-    {.key = "x-custom-reply", .value = "pong", .key_len = 14, .value_len = 4},
+size_t idx = 0;
+const char *val;
+while ((val = grpc_call_metadata_next(call, "x-tag", &idx, &len)) != nullptr) {
+  /* handle each x-tag header value */
+}
+
+grpc_metadata trailers[] = {
+    {.key = "x-custom-reply", .value = "pong"},
 };
-grpc_server_session_stream_end2(server, event->session_uuid, event->message.stream_id,
-                                   GRPC_STATUS_OK, nullptr, trailers, 1);
+(void)grpc_call_add_trailers(call, trailers, 1);
+(void)grpc_call_finish(call, GRPC_STATUS_OK, nullptr);
 ```
 
 Return an error with `google.rpc.Status` details, serialized into `grpc-status-details-bin`:
@@ -472,26 +417,20 @@ grpc_status_detail_entry detail = {
     .value_len = error_info_len,
 };
 
-grpc_server_session_stream_end_with_status_details(
-    server, event->session_uuid, event->message.stream_id,
-    GRPC_STATUS_INVALID_ARGUMENT, "Invalid name provided",
-    &detail, 1,     /* details */
-    nullptr, 0);    /* extra trailers */
+(void)grpc_call_finish_with_details(
+    call, GRPC_STATUS_INVALID_ARGUMENT, "Invalid name provided", &detail, 1);
 ```
 
 ### 5. Bearer token authentication
 
 ```c
-static bool validate_token(const char *token, void *user_data) {
+static bool validate_token(const char *token, void *userdata) {
+  (void)userdata;
   return strcmp(token, "secret") == 0;
 }
 
-grpc_interceptor auth = grpc_interceptor_create_bearer_auth(validate_token, nullptr);
-grpc_server_add_interceptor(server, &auth);
-
-/* in the event loop, before running a handler: */
-if (!grpc_server_intercept_pre(server, event, "SayHello"))
-  continue; /* the stream was already ended with UNAUTHENTICATED */
+grpc_interceptor auth = grpc_interceptor_bearer_auth(validate_token, nullptr);
+(void)grpc_server_add_interceptor(server, &auth);
 ```
 
 ---

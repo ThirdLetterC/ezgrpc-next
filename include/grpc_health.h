@@ -6,6 +6,7 @@
 typedef struct grpc_server grpc_server;
 
 #define GRPC_HEALTH_PATH_CHECK "/grpc.health.v1.Health/Check"
+#define GRPC_HEALTH_PATH_WATCH "/grpc.health.v1.Health/Watch"
 
 typedef enum grpc_health_status {
   GRPC_HEALTH_UNKNOWN = 0,

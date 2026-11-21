@@ -39,6 +39,7 @@ option(GRPC_BUILD_EXAMPLES "Build example servers" ${GRPC_IS_TOP_LEVEL})
 option(GRPC_BUILD_SHARED "Build the shared library alongside the static library" ON)
 option(GRPC_BUILD_INTEGRATION_TESTS "Register Python gRPC integration tests" ${_grpc_default_tests})
 option(GRPC_BUILD_DEVELOPER_TARGETS "Add source formatting targets" ${GRPC_IS_TOP_LEVEL})
+option(GRPC_INSTALL "Generate CMake install and pkg-config targets" ${GRPC_IS_TOP_LEVEL})
 option(GRPC_IPO "Enable interprocedural optimization in optimized configurations" OFF)
 option(GRPC_ASAN "Build with AddressSanitizer" OFF)
 option(GRPC_DEBUG_LOGS "Compile debug logging support" OFF)
@@ -148,30 +149,27 @@ if(NOT GRPC_HAS_C23_CONSTEXPR)
   # Clang 18 accepts -std=c23 but does not yet implement C23 constexpr.
   target_compile_definitions(grpc_objects PRIVATE constexpr=const)
 endif()
-target_compile_definitions(grpc_objects PUBLIC _GNU_SOURCE _FORTIFY_SOURCE=2)
-target_compile_definitions(grpc_objects PRIVATE
-  ULOG_BUILD_EXTRA_OUTPUTS=1 ULOG_BUILD_TOPICS_MODE=2 ULOG_BUILD_COLOR=0
-  ULOG_BUILD_SOURCE_LOCATION=0 ULOG_BUILD_TIME=0 ULOG_BUILD_WARN_NOT_ENABLED=0)
+set(GRPC_PUBLIC_COMPILE_DEFINITIONS _GNU_SOURCE _FORTIFY_SOURCE=2)
 if(NOT GRPC_HAS_NULLPTR)
-  target_compile_definitions(grpc_objects PUBLIC "$<$<COMPILE_LANGUAGE:C>:nullptr=((void*)0)>")
+  list(APPEND GRPC_PUBLIC_COMPILE_DEFINITIONS "$<$<COMPILE_LANGUAGE:C>:nullptr=((void*)0)>")
 endif()
 if(NOT GRPC_HAS_ALIGNOF)
-  target_compile_definitions(grpc_objects PUBLIC "$<$<COMPILE_LANGUAGE:C>:alignof=_Alignof>")
+  list(APPEND GRPC_PUBLIC_COMPILE_DEFINITIONS "$<$<COMPILE_LANGUAGE:C>:alignof=_Alignof>")
 endif()
 if(GRPC_ALLOCATOR_DEFINE)
-  target_compile_definitions(grpc_objects PUBLIC "${GRPC_ALLOCATOR_DEFINE}")
+  list(APPEND GRPC_PUBLIC_COMPILE_DEFINITIONS "${GRPC_ALLOCATOR_DEFINE}")
 endif()
 foreach(feature IN ITEMS ZLIB ZSTD SNAPPY PROTOBUF_C FLATCC)
   if(GRPC_${feature}_ENABLED)
-    target_compile_definitions(grpc_objects PUBLIC "GRPC_ENABLE_${feature}")
+    list(APPEND GRPC_PUBLIC_COMPILE_DEFINITIONS "GRPC_ENABLE_${feature}")
   endif()
 endforeach()
 if(GRPC_TLS_ENABLED)
   string(TOUPPER "${_tls_backend}" _tls_backend_macro)
-  target_compile_definitions(grpc_objects PUBLIC GRPC_ENABLE_TLS "GRPC_TLS_${_tls_backend_macro}")
+  list(APPEND GRPC_PUBLIC_COMPILE_DEFINITIONS GRPC_ENABLE_TLS "GRPC_TLS_${_tls_backend_macro}")
 endif()
 if(GRPC_DEBUG_LOGS)
-  target_compile_definitions(grpc_objects PUBLIC GRPC_DEBUG)
+  list(APPEND GRPC_PUBLIC_COMPILE_DEFINITIONS GRPC_DEBUG)
   if(MSVC)
     target_compile_options(grpc_objects PRIVATE /Zi /Od)
   else()
@@ -179,8 +177,12 @@ if(GRPC_DEBUG_LOGS)
   endif()
 endif()
 if(GRPC_TRACE)
-  target_compile_definitions(grpc_objects PUBLIC GRPC_TRACE)
+  list(APPEND GRPC_PUBLIC_COMPILE_DEFINITIONS GRPC_TRACE)
 endif()
+target_compile_definitions(grpc_objects PUBLIC ${GRPC_PUBLIC_COMPILE_DEFINITIONS})
+target_compile_definitions(grpc_objects PRIVATE
+  ULOG_BUILD_EXTRA_OUTPUTS=1 ULOG_BUILD_TOPICS_MODE=2 ULOG_BUILD_COLOR=0
+  ULOG_BUILD_SOURCE_LOCATION=0 ULOG_BUILD_TIME=0 ULOG_BUILD_WARN_NOT_ENABLED=0)
 if(GRPC_FLATCC_ENABLED)
   target_include_directories(grpc_objects PUBLIC "${FLATCC_INCLUDE_DIR}")
 endif()
@@ -188,15 +190,16 @@ if(_tls_backend STREQUAL "rustls")
   target_include_directories(grpc_objects PRIVATE "${RUSTLS_INCLUDE_DIR}")
 endif()
 
-add_library(grpc_static STATIC $<TARGET_OBJECTS:grpc_objects>)
-set_target_properties(grpc_static PROPERTIES OUTPUT_NAME grpc)
-set(GRPC_LIBRARY_TARGETS grpc_static)
-if(GRPC_BUILD_SHARED)
-  add_library(grpc_shared SHARED $<TARGET_OBJECTS:grpc_objects>)
-  set_target_properties(grpc_shared PROPERTIES
-    OUTPUT_NAME grpc
-    VERSION "${PROJECT_VERSION}"
-    SOVERSION "${PROJECT_VERSION_MAJOR}")
+  add_library(grpc_static STATIC $<TARGET_OBJECTS:grpc_objects>)
+  set_target_properties(grpc_static PROPERTIES OUTPUT_NAME grpc EXPORT_NAME static)
+  set(GRPC_LIBRARY_TARGETS grpc_static)
+  if(GRPC_BUILD_SHARED)
+    add_library(grpc_shared SHARED $<TARGET_OBJECTS:grpc_objects>)
+    set_target_properties(grpc_shared PROPERTIES
+      OUTPUT_NAME grpc
+      EXPORT_NAME shared
+      VERSION "${PROJECT_VERSION}"
+      SOVERSION "${PROJECT_VERSION_MAJOR}")
   if(WIN32)
     # The DLL import library and the static archive must not both be grpc.lib.
     set_target_properties(grpc_shared PROPERTIES ARCHIVE_OUTPUT_NAME grpc_dll
@@ -230,14 +233,17 @@ if(GRPC_FLATCC_ENABLED)
 endif()
 target_link_libraries(grpc_objects PRIVATE ${GRPC_LINK_LIBRARIES})
 foreach(library_target IN LISTS GRPC_LIBRARY_TARGETS)
-  target_link_libraries(${library_target} PUBLIC ${GRPC_LINK_LIBRARIES})
-  target_include_directories(${library_target} PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
-  target_include_directories(${library_target} PUBLIC $<BUILD_INTERFACE:${GRPC_GENERATED_INCLUDE_DIR}>)
+  target_link_libraries(${library_target} PUBLIC $<BUILD_INTERFACE:${GRPC_LINK_LIBRARIES}>)
+  target_link_libraries(${library_target} PUBLIC $<INSTALL_INTERFACE:Threads::Threads>)
+  target_include_directories(${library_target} PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${GRPC_GENERATED_INCLUDE_DIR}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
   if(GRPC_FLATCC_ENABLED)
     target_include_directories(${library_target} PUBLIC $<BUILD_INTERFACE:${FLATCC_INCLUDE_DIR}>)
   endif()
   target_link_libraries(${library_target} PUBLIC grpc_build_options)
-  target_compile_definitions(${library_target} PUBLIC $<TARGET_PROPERTY:grpc_objects,INTERFACE_COMPILE_DEFINITIONS>)
+  target_compile_definitions(${library_target} PUBLIC ${GRPC_PUBLIC_COMPILE_DEFINITIONS})
 endforeach()
 
 if(GRPC_ASAN)
@@ -477,6 +483,47 @@ if(GRPC_BUILD_DEVELOPER_TARGETS)
     add_custom_target(format COMMAND "${CMAKE_COMMAND}" -E echo "Install clang-format to use this target" COMMAND "${CMAKE_COMMAND}" -E false)
     add_custom_target(format-check COMMAND "${CMAKE_COMMAND}" -E echo "Install clang-format to use this target" COMMAND "${CMAKE_COMMAND}" -E false)
   endif()
+endif()
+
+if(GRPC_INSTALL)
+  include(CMakePackageConfigHelpers)
+  set(GRPC_INSTALL_CMAKEDIR "${CMAKE_INSTALL_LIBDIR}/cmake/ezGRPC-next")
+  set(GRPC_INSTALL_TARGETS ${GRPC_LIBRARY_TARGETS} grpc_build_options ulog)
+  if(TARGET grpc_sanitizers)
+    list(APPEND GRPC_INSTALL_TARGETS grpc_sanitizers)
+  endif()
+  install(TARGETS ${GRPC_INSTALL_TARGETS}
+    EXPORT ezGRPC-nextTargets
+    ARCHIVE DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}"
+    RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}")
+  install(DIRECTORY include/
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+    FILES_MATCHING PATTERN "*.h"
+    PATTERN "internal" EXCLUDE)
+  install(FILES "${GRPC_GENERATED_INCLUDE_DIR}/grpc_version_config.h"
+    DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+  install(EXPORT ezGRPC-nextTargets
+    FILE ezGRPC-nextTargets.cmake
+    NAMESPACE grpc::
+    DESTINATION "${GRPC_INSTALL_CMAKEDIR}")
+  configure_package_config_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ezGRPC-nextConfig.cmake.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/ezGRPC-nextConfig.cmake"
+    INSTALL_DESTINATION "${GRPC_INSTALL_CMAKEDIR}")
+  write_basic_package_version_file(
+    "${CMAKE_CURRENT_BINARY_DIR}/ezGRPC-nextConfigVersion.cmake"
+    VERSION "${PROJECT_VERSION}"
+    COMPATIBILITY SameMajorVersion)
+  install(FILES
+    "${CMAKE_CURRENT_BINARY_DIR}/ezGRPC-nextConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/ezGRPC-nextConfigVersion.cmake"
+    DESTINATION "${GRPC_INSTALL_CMAKEDIR}")
+  configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ezgrpc-next.pc.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/ezgrpc-next.pc" @ONLY)
+  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/ezgrpc-next.pc"
+    DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig")
 endif()
 
 message(STATUS "ezGRPC-next TLS backend: ${_tls_backend}")

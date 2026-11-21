@@ -21,10 +21,10 @@ GRPC_API void *grpc_server_tls_native(grpc_server *server) {
                                                          : nullptr;
 }
 
-grpc_err tls_enable(grpc_server *server, const char *cert_file, const char *key_file) {
-  grpc_tls_ctx *ctx = tls_backend_ctx_new(cert_file, key_file);
+grpc_err tls_enable(grpc_server *server, const grpc_tls_config *cfg) {
+  grpc_tls_ctx *ctx = tls_backend_ctx_new(cfg);
   if (ctx == nullptr) {
-    LOG_ERROR(server, "cannot load the TLS certificate '%s' and key '%s'\n", cert_file, key_file);
+    LOG_ERROR(server, "cannot load the TLS certificate/key configuration\n");
     return GRPC_ERR_INVALID;
   }
   if (server->tls_ctx != nullptr)
@@ -116,6 +116,12 @@ void grpc_tls_session_free(grpc_session *session) {
   }
 }
 
+int grpc_tls_peer_subject(grpc_session *session, char *buf, size_t len) {
+  if (session == nullptr || session->tls == nullptr || buf == nullptr || len == 0)
+    return -1;
+  return tls_backend_peer_subject(session->tls, buf, len);
+}
+
 #else /* built without TLS */
 
 GRPC_API const char *grpc_tls_backend(void) {
@@ -130,8 +136,7 @@ GRPC_API void *grpc_server_tls_native([[maybe_unused]] grpc_server *server) {
   return nullptr;
 }
 
-grpc_err tls_enable(grpc_server *server, [[maybe_unused]] const char *cert_file,
-                       [[maybe_unused]] const char *key_file) {
+grpc_err tls_enable(grpc_server *server, [[maybe_unused]] const grpc_tls_config *cfg) {
   LOG_ERROR(server, "TLS is configured, but grpc is built without TLS (TLS=none)\n");
   return GRPC_ERR_UNSUPPORTED;
 }
@@ -169,5 +174,10 @@ ssize_t grpc_tls_write([[maybe_unused]] grpc_session *session,
 void grpc_tls_close_notify([[maybe_unused]] grpc_session *session) {}
 
 void grpc_tls_session_free([[maybe_unused]] grpc_session *session) {}
+
+int grpc_tls_peer_subject([[maybe_unused]] grpc_session *session, [[maybe_unused]] char *buf,
+                          [[maybe_unused]] size_t len) {
+  return -1;
+}
 
 #endif

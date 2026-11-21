@@ -56,3 +56,8 @@ GRPC_API void grpc_pb_free_unpacked(ProtobufCMessage *message);
  * Serializes ``message`` and sends it on ``call``, like grpc_call_send().
  */
 GRPC_API grpc_err grpc_call_send_pb(grpc_call *call, const ProtobufCMessage *message);
+
+/**
+ * Serializes ``message``, sends it on ``call``, and finishes the call with GRPC_STATUS_OK.
+ */
+GRPC_API grpc_err grpc_call_reply_pb(grpc_call *call, const ProtobufCMessage *message);

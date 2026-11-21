@@ -67,6 +67,12 @@ GRPC_API const char *grpc_strerror(grpc_err err) {
     return "not supported by this build";
   case GRPC_ERR_IO:
     return "I/O error";
+  case GRPC_ERR_LIMIT:
+    return "output limit exceeded";
+  case GRPC_ERR_CODEC:
+    return "compression or decompression failed";
+  case GRPC_ERR_TIMEOUT:
+    return "operation timed out";
   }
   return "unknown error";
 }

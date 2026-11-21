@@ -12,7 +12,7 @@ typedef double grpc_max_align_t;
 typedef max_align_t grpc_max_align_t;
 #endif
 
-#if defined(_MSC_VER) && !defined(__cplusplus)
+#if defined(_MSC_VER)
 #ifndef alignas
 #define alignas _Alignas
 #endif
@@ -29,9 +29,20 @@ typedef max_align_t grpc_max_align_t;
 #endif
 #endif
 
+#ifndef GRPC_NODISCARD
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
+#define GRPC_NODISCARD [[nodiscard]]
+#elif defined(__GNUC__) || defined(__clang__)
+#define GRPC_NODISCARD __attribute__((warn_unused_result))
+#elif defined(_MSC_VER)
+#define GRPC_NODISCARD _Check_return_
+#else
+#define GRPC_NODISCARD
+#endif
+#endif
+
 /* Provide nullptr for compilers that accept C2x but lack the C23 keyword. */
-#if !defined(__cplusplus) && \
-    (defined(_MSC_VER) || !defined(__STDC_VERSION__) || __STDC_VERSION__ < 202311L)
+#if defined(_MSC_VER) || !defined(__STDC_VERSION__) || __STDC_VERSION__ < 202311L
 #ifndef nullptr
 #define nullptr ((void *)0)
 #endif

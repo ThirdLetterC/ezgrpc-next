@@ -104,6 +104,7 @@ struct grpc_call {
   /* The client's deadline; 0 means there is none. */
   u64 deadline_ms;
   char peer[INET6_ADDRSTRLEN + 8];
+  char peer_cert_subject[256];
 
   /* Header views and nghttp2 refs retained for the call lifetime. */
   grpc_header req_headers[CONFIG_STREAM_MAX_HEADERS];
@@ -124,6 +125,9 @@ struct grpc_call {
   bool headers_sent : 1;
   /* Encoding announced with the first compressed response message. */
   grpc_compression_algorithm compression;
+  /* Automatic compression configured for uncompressed response messages. */
+  grpc_compression_algorithm auto_compression;
+  int auto_compression_level;
   bool finished : 1;
   bool closed : 1;
   bool cancelled : 1;
@@ -219,6 +223,8 @@ struct grpc_session {
   struct sockaddr_storage sockaddr;
   /* Peer address in "ip:port" or "[ip]:port" form. */
   char peer[INET6_ADDRSTRLEN + 8];
+  /* Verified TLS client certificate subject, if any. */
+  char peer_cert_subject[256];
 
   /* Open streams, allocated when a HEADERS frame is about to arrive. */
   grpc_stream *streams;
@@ -379,7 +385,20 @@ void health_free(grpc_server *server);
 void reflection_free(grpc_server *server);
 
 /* grpc_tls.c */
-grpc_err tls_enable(grpc_server *server, const char *cert_file, const char *key_file);
+typedef struct grpc_tls_config {
+  const char *cert_file;
+  const char *key_file;
+  const char *cert_pem;
+  size_t cert_pem_len;
+  const char *key_pem;
+  size_t key_pem_len;
+  const char *ca_file;
+  const char *ca_pem;
+  size_t ca_pem_len;
+  bool require_client_cert;
+} grpc_tls_config;
+
+grpc_err tls_enable(grpc_server *server, const grpc_tls_config *cfg);
 void tls_free(grpc_server *server);
 
 /* grpc_message.c: a message with a compressed flag */
