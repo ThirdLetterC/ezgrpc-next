@@ -20,7 +20,6 @@ void stream_link(grpc_session *session, grpc_stream *stream);
 void stream_unlink(grpc_session *session, grpc_stream *stream);
 
 int list_cmp_ezheader_name(const void *data, const void *userdata);
-void ezlog(const char *fmt, ...);
 void ezflog(FILE *fp, const char *fmt, ...);
 char *ezgetdt(char *buf, size_t len);
 

@@ -102,15 +102,6 @@ char *ezgetdt(char *buf, size_t len) {
   return buf;
 }
 
-void ezlog(const char *fmt, ...) {
-  va_list args;
-  va_start(args, fmt);
-  char dt[128] = {};
-  fprintf(stderr, "[%s] ", ezgetdt(dt, sizeof(dt)));
-  vfprintf(stderr, fmt, args);
-  va_end(args);
-}
-
 void ezflog(FILE *fp, const char *fmt, ...) {
   va_list args;
   va_start(args, fmt);

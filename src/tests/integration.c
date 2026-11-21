@@ -599,6 +599,26 @@ static ssize_t raw_h2_read_cb([[maybe_unused]] nghttp2_session *s, [[maybe_unuse
   return (ssize_t)n;
 }
 
+static ssize_t raw_h2_chunked_read_cb([[maybe_unused]] nghttp2_session *s,
+                                      [[maybe_unused]] int32_t stream_id, uint8_t *buf, size_t len,
+                                      uint32_t *flags, nghttp2_data_source *src,
+                                      [[maybe_unused]] void *ud) {
+  raw_h2_payload *p = src->ptr;
+  size_t rem = p->len - p->off;
+  /* Cap first chunk at 200 bytes so server parses msg1 (155B) and leaves 45B at recv_start=155 */
+  size_t cap = p->off == 0 ? 200 : rem;
+  size_t n = rem < cap ? rem : cap;
+  if (n > len)
+    n = len;
+  if (n > 0) {
+    memcpy(buf, p->data + p->off, n);
+    p->off += n;
+  }
+  if (p->off == p->len)
+    *flags = NGHTTP2_DATA_FLAG_EOF;
+  return (ssize_t)n;
+}
+
 static int raw_h2_on_frame([[maybe_unused]] nghttp2_session *s, const nghttp2_frame *f, void *ud) {
   int *done = ud;
   if (f->hd.stream_id > 0 &&
@@ -713,9 +733,10 @@ static void run_raw_h2_requests(uint16_t port) {
       {(uint8_t *)":path", (uint8_t *)"/web.Svc/Echo", 5, 13, NGHTTP2_NV_FLAG_NONE},
       {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
       {(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)"te", (uint8_t *)"trailers", 2, 8, NGHTTP2_NV_FLAG_NONE},
       {(uint8_t *)"grpc-encoding", (uint8_t *)"identity", 13, 8, NGHTTP2_NV_FLAG_NONE},
   };
-  nghttp2_submit_request(sess, nullptr, id_hdrs, 6, &dp_trunc, nullptr);
+  nghttp2_submit_request(sess, nullptr, id_hdrs, 7, &dp_trunc, nullptr);
 
   /* 9 & 10. Oversized gzip-compressed message (both gRPC and gRPC-Web-Text) -> RESOURCE_EXHAUSTED */
   char big_plain[2048];
@@ -741,9 +762,10 @@ static void run_raw_h2_requests(uint16_t port) {
       {(uint8_t *)":path", (uint8_t *)"/web.Svc/Echo", 5, 13, NGHTTP2_NV_FLAG_NONE},
       {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
       {(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)"te", (uint8_t *)"trailers", 2, 8, NGHTTP2_NV_FLAG_NONE},
       {(uint8_t *)"grpc-encoding", (uint8_t *)"gzip", 13, 4, NGHTTP2_NV_FLAG_NONE},
   };
-  nghttp2_submit_request(sess, nullptr, gz_hdrs, 6, &dp_zraw, nullptr);
+  nghttp2_submit_request(sess, nullptr, gz_hdrs, 7, &dp_zraw, nullptr);
 
   size_t zb64_len = 0;
   char *zb64 = grpc_metadata_encode_bin(zframe, 5 + zlen, &zb64_len);
@@ -770,9 +792,10 @@ static void run_raw_h2_requests(uint16_t port) {
       {(uint8_t *)":path", (uint8_t *)"/web.Svc/Codec", 5, 14, NGHTTP2_NV_FLAG_NONE},
       {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
       {(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)"te", (uint8_t *)"trailers", 2, 8, NGHTTP2_NV_FLAG_NONE},
       {(uint8_t *)"grpc-accept-encoding", (uint8_t *)"deflate ", 20, 8, NGHTTP2_NV_FLAG_NONE},
   };
-  nghttp2_submit_request(sess, nullptr, ae_hdrs, 6, &dp_ae, nullptr);
+  nghttp2_submit_request(sess, nullptr, ae_hdrs, 7, &dp_ae, nullptr);
 
   /* 10c. Headers-only END_STREAM (no DATA) on valid gRPC path -> half_closed + call_queue */
   nghttp2_nv empty_hdrs[] = {
@@ -781,8 +804,36 @@ static void run_raw_h2_requests(uint16_t port) {
       {(uint8_t *)":path", (uint8_t *)"/web.Svc/NoBody", 5, 15, NGHTTP2_NV_FLAG_NONE},
       {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
       {(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)"te", (uint8_t *)"trailers", 2, 8, NGHTTP2_NV_FLAG_NONE},
   };
-  nghttp2_submit_request(sess, nullptr, empty_hdrs, 5, nullptr, nullptr);
+  nghttp2_submit_request(sess, nullptr, empty_hdrs, 6, nullptr, nullptr);
+
+  /* 10d. Invalid compressed payload (cflag=1, bad gzip) + trailing 2 bytes after msg (L27, L56) */
+  const uint8_t bad_gz_frame[] = {0x01, 0x00, 0x00, 0x00, 0x03, 'b', 'a', 'd', 0x00, 0x00};
+  raw_h2_payload p_bgz = {.data = bad_gz_frame, .len = sizeof(bad_gz_frame), .off = 0};
+  nghttp2_data_provider dp_bgz = {.source.ptr = &p_bgz, .read_callback = raw_h2_read_cb};
+  nghttp2_submit_request(sess, nullptr, gz_hdrs, 7, &dp_bgz, nullptr);
+
+  /* 10e. Two-chunk DATA stream to trigger recv_data memmove compaction (recv_start > 0) */
+  uint8_t compact_buf[310];
+  compact_buf[0] = 0;
+  uint32_t m150 = htonl(150);
+  memcpy(compact_buf + 1, &m150, 4);
+  memset(compact_buf + 5, 'A', 150);
+  compact_buf[155] = 0;
+  memcpy(compact_buf + 156, &m150, 4);
+  memset(compact_buf + 160, 'B', 150);
+  raw_h2_payload p_cmp = {.data = compact_buf, .len = sizeof(compact_buf), .off = 0};
+  nghttp2_data_provider dp_cmp = {.source.ptr = &p_cmp, .read_callback = raw_h2_chunked_read_cb};
+  nghttp2_nv cmp_hdrs[] = {
+      {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)":scheme", (uint8_t *)"http", 7, 4, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)":path", (uint8_t *)"/web.Svc/Echo", 5, 13, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)"te", (uint8_t *)"trailers", 2, 8, NGHTTP2_NV_FLAG_NONE},
+  };
+  nghttp2_submit_request(sess, nullptr, cmp_hdrs, 6, &dp_cmp, nullptr);
 
   /* Flush outbound HTTP/2 frames */
   for (;;) {
@@ -796,7 +847,7 @@ static void run_raw_h2_requests(uint16_t port) {
   struct timeval tv = {.tv_sec = 0, .tv_usec = 200000};
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   uint8_t rbuf[4096];
-  for (int i = 0; i < 40 && streams_done < 10; i++) {
+  for (int i = 0; i < 60 && streams_done < 13; i++) {
     ssize_t n = recv(fd, rbuf, sizeof(rbuf), 0);
     if (n <= 0)
       break;
@@ -809,7 +860,7 @@ static void run_raw_h2_requests(uint16_t port) {
       raw_h2_send_all(fd, out, (size_t)wn);
     }
   }
-  TEST_ASSERT_TRUE(streams_done >= 10);
+  TEST_ASSERT_TRUE(streams_done >= 12);
 
   /* 11. Too many headers (> 256) + Rapid PINGs to trigger ping-strike ENHANCE_YOUR_CALM */
   nghttp2_nv many_hdrs[265];
@@ -1263,7 +1314,7 @@ uds_test:;
       &(grpc_config){.port = 0, .log_level = (grpc_log_level)99}, &err));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
 
-  /* Keepalive timeout: raw socket connects, ignores server PING -> server closes on timeout */
+  /* Keepalive timeout + PING ACK: raw socket ignores PING (timeout), grpc_client ACKs PING */
   grpc_server *ka_srv = grpc_server_new(&(grpc_config){
       .port = 0,
       .ipv4_addr = "127.0.0.1",
@@ -1272,8 +1323,14 @@ uds_test:;
       .log_level = GRPC_LOG_DEBUG,
   });
   TEST_ASSERT_NOT_NULL(ka_srv);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(ka_srv, "/ka.Svc/Ping", no_body_handler,
+                                                    nullptr));
   TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, ka_srv));
 #ifndef _WIN32
+  grpc_client *ka_c = grpc_client_new(
+      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(ka_srv), .timeout_ms = 2000},
+      &err);
+  TEST_ASSERT_NOT_NULL(ka_c);
   int raw_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (raw_fd >= 0) {
     struct sockaddr_in sin = {0};
@@ -1281,11 +1338,15 @@ uds_test:;
     sin.sin_port = htons(grpc_server_port(ka_srv));
     inet_pton(AF_INET, "127.0.0.1", &sin.sin_addr);
     if (connect(raw_fd, (struct sockaddr *)&sin, sizeof(sin)) == 0) {
-      /* Wait for 250ms timer to send PING, then another 250ms tick to hit keepalive_timeout_ms */
-      uv_sleep(560);
+      /* Wait for 250ms timer to send PING, let ka_c ACK it, then wait for raw_fd timeout */
+      uv_sleep(280);
+      (void)grpc_client_unary(ka_c, "/ka.Svc/Ping", "", 0, nullptr, 0, 1000, &resp);
+      grpc_client_response_free(&resp);
+      uv_sleep(280);
     }
     close(raw_fd);
   }
+  grpc_client_free(ka_c);
 #endif
   grpc_server_stop(ka_srv);
   pthread_join(th, nullptr);
@@ -1547,6 +1608,273 @@ uds_test:;
   grpc_server_free(srv_ok);
 }
 
+#ifndef _WIN32
+static void burst_8mb_handler(grpc_call *call, [[maybe_unused]] const grpc_message *req,
+                              [[maybe_unused]] void *ud) {
+  size_t sz = 8 * 1024 * 1024;
+  char *buf = grpc_malloc(sz);
+  if (buf != nullptr) {
+    memset(buf, 'B', sz);
+    (void)grpc_call_reply_data(call, buf, sz);
+    grpc_free(buf);
+  } else {
+    (void)grpc_call_finish(call, GRPC_STATUS_RESOURCE_EXHAUSTED, "oom");
+  }
+}
+
+typedef struct slow_h2_srv_ctx {
+  int listen_fd;
+  bool abort_mid_write;
+} slow_h2_srv_ctx;
+
+static int slow_h2_on_frame(nghttp2_session *s, const nghttp2_frame *f, void *ud) {
+  int *got_eos = ud;
+  if (f->hd.stream_id > 0 && (f->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
+    *got_eos = 1;
+    nghttp2_nv resp_hdrs[] = {
+        {(uint8_t *)":status", (uint8_t *)"200", 7, 3, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)"grpc-status", (uint8_t *)"0", 11, 1, NGHTTP2_NV_FLAG_NONE},
+    };
+    nghttp2_submit_response(s, f->hd.stream_id, resp_hdrs, 3, nullptr);
+  }
+  return 0;
+}
+
+static void *slow_h2_server_thread(void *arg) {
+  slow_h2_srv_ctx *ctx = arg;
+  int cfd = accept(ctx->listen_fd, nullptr, nullptr);
+  if (cfd < 0)
+    return nullptr;
+
+  int got_eos = 0;
+  nghttp2_session_callbacks *cbs = nullptr;
+  nghttp2_session_callbacks_new(&cbs);
+  nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, slow_h2_on_frame);
+  nghttp2_session *sess = nullptr;
+  nghttp2_session_server_new(&sess, cbs, &got_eos);
+  nghttp2_session_callbacks_del(cbs);
+
+  nghttp2_settings_entry iv[] = {
+      {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 16 * 1024 * 1024},
+  };
+  nghttp2_submit_settings(sess, NGHTTP2_FLAG_NONE, iv, 1);
+  nghttp2_session_set_local_window_size(sess, NGHTTP2_FLAG_NONE, 0, 16 * 1024 * 1024);
+  for (;;) {
+    const uint8_t *out;
+    ssize_t n = nghttp2_session_mem_send(sess, &out);
+    if (n <= 0)
+      break;
+    raw_h2_send_all(cfd, out, (size_t)n);
+  }
+
+  /* Pause so client's 8 MiB write fills the socket buffer and triggers async uv_write */
+  uv_sleep(50);
+
+  if (ctx->abort_mid_write) {
+    struct linger lg = {.l_onoff = 1, .l_linger = 0};
+    setsockopt(cfd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    nghttp2_session_del(sess);
+    close(cfd);
+    return nullptr;
+  }
+
+  struct timeval tv = {.tv_sec = 3, .tv_usec = 0};
+  setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  uint8_t rbuf[32768];
+  while (!got_eos) {
+    ssize_t n = recv(cfd, rbuf, sizeof(rbuf), 0);
+    if (n <= 0)
+      break;
+    nghttp2_session_mem_recv(sess, rbuf, (size_t)n);
+    for (;;) {
+      const uint8_t *out;
+      ssize_t wn = nghttp2_session_mem_send(sess, &out);
+      if (wn <= 0)
+        break;
+      raw_h2_send_all(cfd, out, (size_t)wn);
+    }
+  }
+  for (;;) {
+    const uint8_t *out;
+    ssize_t wn = nghttp2_session_mem_send(sess, &out);
+    if (wn <= 0)
+      break;
+    raw_h2_send_all(cfd, out, (size_t)wn);
+  }
+  nghttp2_session_del(sess);
+  close(cfd);
+  return nullptr;
+}
+
+void test_integration_async_write_backpressure(void) {
+  /* 1. Server-side async uv_write / on_session_write via 8 MiB burst + small SO_RCVBUF */
+  grpc_server *srv = grpc_server_new(&(grpc_config){
+      .port = 0,
+      .ipv4_addr = "127.0.0.1",
+      .max_message_size = 16 * 1024 * 1024,
+      .log_level = GRPC_LOG_OFF,
+  });
+  TEST_ASSERT_NOT_NULL(srv);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(srv, "/bp.Svc/Burst", burst_8mb_handler,
+                                                    nullptr));
+  pthread_t th;
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, srv));
+
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  TEST_ASSERT_TRUE(fd >= 0);
+  int rcvbuf = 4096;
+  setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+  struct sockaddr_in sin = {0};
+  sin.sin_family = AF_INET;
+  sin.sin_port = htons(grpc_server_port(srv));
+  inet_pton(AF_INET, "127.0.0.1", &sin.sin_addr);
+  TEST_ASSERT_EQUAL_INT(0, connect(fd, (struct sockaddr *)&sin, sizeof(sin)));
+
+  int done = 0;
+  nghttp2_session_callbacks *cbs = nullptr;
+  nghttp2_session_callbacks_new(&cbs);
+  nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, raw_h2_on_frame);
+  nghttp2_session *sess = nullptr;
+  nghttp2_session_client_new(&sess, cbs, &done);
+  nghttp2_session_callbacks_del(cbs);
+
+  nghttp2_settings_entry iv[] = {{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 16 * 1024 * 1024}};
+  nghttp2_submit_settings(sess, NGHTTP2_FLAG_NONE, iv, 1);
+  nghttp2_session_set_local_window_size(sess, NGHTTP2_FLAG_NONE, 0, 16 * 1024 * 1024);
+  const uint8_t req_frame[] = {0, 0, 0, 0, 1, 'x'};
+  raw_h2_payload p = {.data = req_frame, .len = sizeof(req_frame), .off = 0};
+  nghttp2_data_provider dp = {.source.ptr = &p, .read_callback = raw_h2_read_cb};
+  nghttp2_nv hdrs[] = {
+      {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)":scheme", (uint8_t *)"http", 7, 4, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)":path", (uint8_t *)"/bp.Svc/Burst", 5, 13, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)"te", (uint8_t *)"trailers", 2, 8, NGHTTP2_NV_FLAG_NONE},
+  };
+  nghttp2_submit_request(sess, nullptr, hdrs, 6, &dp, nullptr);
+  for (;;) {
+    const uint8_t *out;
+    ssize_t n = nghttp2_session_mem_send(sess, &out);
+    if (n <= 0)
+      break;
+    raw_h2_send_all(fd, out, (size_t)n);
+  }
+  /* Pause so server's 8 MiB burst fills the tiny socket buffer -> uv_write + on_session_write */
+  uv_sleep(50);
+  struct timeval tv = {.tv_sec = 3, .tv_usec = 0};
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  uint8_t rbuf[32768];
+  while (!done) {
+    ssize_t n = recv(fd, rbuf, sizeof(rbuf), 0);
+    if (n <= 0)
+      break;
+    nghttp2_session_mem_recv(sess, rbuf, (size_t)n);
+    for (;;) {
+      const uint8_t *out;
+      ssize_t wn = nghttp2_session_mem_send(sess, &out);
+      if (wn <= 0)
+        break;
+      raw_h2_send_all(fd, out, (size_t)wn);
+    }
+  }
+  TEST_ASSERT_EQUAL_INT(1, done);
+  nghttp2_session_del(sess);
+  close(fd);
+
+  /* 1b. Server-side abort mid async uv_write (on_session_write status < 0) */
+  int fd2 = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd2 >= 0) {
+    setsockopt(fd2, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    if (connect(fd2, (struct sockaddr *)&sin, sizeof(sin)) == 0) {
+      int done2 = 0;
+      nghttp2_session_callbacks *cbs2 = nullptr;
+      nghttp2_session_callbacks_new(&cbs2);
+      nghttp2_session *sess2 = nullptr;
+      nghttp2_session_client_new(&sess2, cbs2, &done2);
+      nghttp2_session_callbacks_del(cbs2);
+      nghttp2_submit_settings(sess2, NGHTTP2_FLAG_NONE, iv, 1);
+      nghttp2_session_set_local_window_size(sess2, NGHTTP2_FLAG_NONE, 0, 16 * 1024 * 1024);
+      raw_h2_payload p2 = {.data = req_frame, .len = sizeof(req_frame), .off = 0};
+      nghttp2_data_provider dp2 = {.source.ptr = &p2, .read_callback = raw_h2_read_cb};
+      nghttp2_submit_request(sess2, nullptr, hdrs, 6, &dp2, nullptr);
+      for (;;) {
+        const uint8_t *out;
+        ssize_t n = nghttp2_session_mem_send(sess2, &out);
+        if (n <= 0)
+          break;
+        raw_h2_send_all(fd2, out, (size_t)n);
+      }
+      uv_sleep(50);
+      struct linger lg = {.l_onoff = 1, .l_linger = 0};
+      setsockopt(fd2, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+      nghttp2_session_del(sess2);
+    }
+    close(fd2);
+    uv_sleep(30);
+  }
+
+  grpc_server_stop(srv);
+  pthread_join(th, nullptr);
+  grpc_server_free(srv);
+
+  /* 2. Client-side async uv_write / on_sub_write via 8 MiB upload to slow raw HTTP/2 server */
+  int lfd = socket(AF_INET, SOCK_STREAM, 0);
+  TEST_ASSERT_TRUE(lfd >= 0);
+  int opt = 1;
+  setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  int lrcv = 4096;
+  setsockopt(lfd, SOL_SOCKET, SO_RCVBUF, &lrcv, sizeof(lrcv));
+  struct sockaddr_in lsin = {0};
+  lsin.sin_family = AF_INET;
+  lsin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  lsin.sin_port = 0;
+  TEST_ASSERT_EQUAL_INT(0, bind(lfd, (struct sockaddr *)&lsin, sizeof(lsin)));
+  TEST_ASSERT_EQUAL_INT(0, listen(lfd, 4));
+  socklen_t slen = sizeof(lsin);
+  TEST_ASSERT_EQUAL_INT(0, getsockname(lfd, (struct sockaddr *)&lsin, &slen));
+  uint16_t lport = ntohs(lsin.sin_port);
+
+  slow_h2_srv_ctx sctx = {.listen_fd = lfd};
+  pthread_t sth;
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&sth, nullptr, slow_h2_server_thread, &sctx));
+
+  grpc_err err = GRPC_OK;
+  grpc_client *c = grpc_client_new(
+      &(grpc_client_config){.host = "127.0.0.1", .port = lport, .timeout_ms = 5000}, &err);
+  TEST_ASSERT_NOT_NULL(c);
+  size_t big = 8 * 1024 * 1024;
+  char *payload = grpc_malloc(big);
+  TEST_ASSERT_NOT_NULL(payload);
+  memset(payload, 'C', big);
+  grpc_client_response resp = {0};
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_client_unary(c, "/bp.Svc/Upload", payload, big, nullptr, 0, 5000, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  grpc_client_response_free(&resp);
+  grpc_free(payload);
+  grpc_client_free(c);
+  pthread_join(sth, nullptr);
+
+  /* 3. Abort mid async uv_write on client (on_sub_write status < 0) */
+  slow_h2_srv_ctx sctx2 = {.listen_fd = lfd, .abort_mid_write = true};
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&sth, nullptr, slow_h2_server_thread, &sctx2));
+  grpc_client *c2 = grpc_client_new(
+      &(grpc_client_config){.host = "127.0.0.1", .port = lport, .timeout_ms = 2000}, &err);
+  TEST_ASSERT_NOT_NULL(c2);
+  payload = grpc_malloc(big);
+  TEST_ASSERT_NOT_NULL(payload);
+  memset(payload, 'D', big);
+  (void)grpc_client_unary(c2, "/bp.Svc/Upload", payload, big, nullptr, 0, 2000, &resp);
+  grpc_client_response_free(&resp);
+  grpc_free(payload);
+  grpc_client_free(c2);
+  pthread_join(sth, nullptr);
+  close(lfd);
+}
+#endif
+
 int main(void) {
 #ifndef _WIN32
   signal(SIGPIPE, SIG_IGN);
@@ -1557,5 +1885,8 @@ int main(void) {
   RUN_TEST(test_integration_poll_events_and_maintenance);
   RUN_TEST(test_integration_grpc_web_cors_ipv6_and_client_edge_cases);
   RUN_TEST(test_integration_maintenance_drain_and_edge_paths);
+#ifndef _WIN32
+  RUN_TEST(test_integration_async_write_backpressure);
+#endif
   return UNITY_END();
 }
