@@ -1,3 +1,23 @@
+/* grpc_client.c - synchronous gRPC client over HTTP/2 (nghttp2 + libuv)
+ *
+ * A grpc_client owns one subchannel per target (a single host/port or Unix socket, or each entry
+ * of config.targets). Each subchannel has its own TCP/pipe handle, nghttp2 client session and a
+ * private libuv loop. Nothing runs in the background: the loop is driven with uv_run only while
+ * the caller blocks inside a client function (connect, recv, finish), so a client and its streams
+ * must be used from one thread at a time. Requests pick a subchannel round-robin; a subchannel
+ * that failed is reconnected lazily on its next use.
+ *
+ * Each subchannel tracks a single active_stream that the nghttp2 callbacks route data to, so one
+ * subchannel carries one RPC at a time. A per-subchannel timer bounds connect/TLS handshake
+ * (config.timeout_ms) and then the active RPC's deadline, which is also sent as grpc-timeout.
+ * Unary and server-streaming calls retry transport failures and UNAVAILABLE with exponential
+ * backoff. TLS is supported only with OpenSSL-compatible backends, using memory BIOs so libuv
+ * still owns the socket.
+ *
+ * Responses, messages and metadata handed to the caller are grpc_malloc memory; release them with
+ * grpc_client_response_free / grpc_message_free (grpc_free), never libc free.
+ */
+
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
@@ -20,6 +40,9 @@
 
 typedef struct client_subchannel client_subchannel;
 
+/* One RPC on a subchannel. send_buf holds framed request bytes not yet taken by nghttp2,
+ * recv_buf holds response bytes not yet forming a complete message, and resp accumulates
+ * headers, trailers and status until grpc_client_stream_finish hands it to the caller. */
 struct grpc_client_stream {
   client_subchannel *sub;
   int32_t stream_id;
@@ -38,6 +61,8 @@ struct grpc_client_stream {
   void *on_message_userdata;
 };
 
+/* One connection to one target, with its own loop; obuf collects bytes to write, wbuf is the
+ * buffer owned by an in-flight uv_write, and tls_obuf stages nghttp2 output before encryption. */
 struct client_subchannel {
   grpc_client *parent;
   char *host;
@@ -79,6 +104,7 @@ struct client_subchannel {
   grpc_client_stream *active_stream;
 };
 
+/* The channel: a copy of the config plus the subchannel pool and its round-robin cursor. */
 struct grpc_client {
   grpc_client_config config;
   client_subchannel *subs;
@@ -89,10 +115,12 @@ struct grpc_client {
 #endif
 };
 
+/* Returns the subchannel handle as a uv_stream_t, whichever of TCP or pipe it is. */
 static inline uv_stream_t *sub_stream(client_subchannel *s) {
   return s->is_unix ? (uv_stream_t *)&s->handle.pipe : (uv_stream_t *)&s->handle.tcp;
 }
 
+/* Returns the subchannel handle as a uv_handle_t, whichever of TCP or pipe it is. */
 static inline uv_handle_t *sub_handle(client_subchannel *s) {
   return s->is_unix ? (uv_handle_t *)&s->handle.pipe : (uv_handle_t *)&s->handle.tcp;
 }
@@ -100,6 +128,8 @@ static inline uv_handle_t *sub_handle(client_subchannel *s) {
 /* ---- TLS helpers (OpenSSL-compatible backends) ------------------------------ */
 
 #if defined(GRPC_CLIENT_HAS_OPENSSL)
+/* Adds every certificate in a PEM buffer to the context's trust store. Returns true if at least
+ * one certificate was added. */
 static bool client_load_ca_pem(SSL_CTX *ctx, const char *pem, size_t len) {
   if (pem == nullptr || len == 0 || len > INT_MAX)
     return false;
@@ -119,6 +149,9 @@ static bool client_load_ca_pem(SSL_CTX *ctx, const char *pem, size_t len) {
   return loaded > 0;
 }
 
+/* Builds the shared client SSL_CTX: TLS 1.2+, ALPN "h2", peer verification against ca_file,
+ * ca_pem or the system default paths (unless insecure_skip_verify), and an optional client
+ * certificate/key for mTLS (both files are required together). Returns nullptr on any error. */
 static SSL_CTX *client_ssl_ctx_new(const grpc_client_config *cfg) {
   SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
   if (ctx == nullptr)
@@ -163,6 +196,8 @@ static SSL_CTX *client_ssl_ctx_new(const grpc_client_config *cfg) {
   return ctx;
 }
 
+/* Moves pending ciphertext from the SSL write BIO into obuf for sending. Returns 0 on success,
+ * 1 on allocation or BIO failure. */
 static int client_tls_drain(client_subchannel *s) {
   BIO *wbio = SSL_get_wbio(s->ssl);
   size_t pending;
@@ -182,6 +217,8 @@ static int client_tls_drain(client_subchannel *s) {
 
 static void sub_flush(client_subchannel *s);
 
+/* uv_write completion for the wbuf write started by sub_flush: marks the write finished, fails
+ * the active stream on error and otherwise flushes anything queued meanwhile. */
 static void on_sub_write(uv_write_t *req, int status) {
   client_subchannel *s = req->data;
   s->is_writing = false;
@@ -199,6 +236,12 @@ static void on_sub_write(uv_write_t *req, int status) {
   sub_flush(s);
 }
 
+/* Pulls all pending frames out of nghttp2 (through SSL when TLS is on) into obuf and writes
+ * them: first with uv_try_write, then the remainder with an async uv_write after swapping obuf
+ * into wbuf, so obuf can keep accumulating while the write is in flight. Only one uv_write is
+ * outstanding at a time; while it is, this returns early and on_sub_write calls back. Errors
+ * mark the active stream done with an error and, for I/O errors, the subchannel closed. Before
+ * the TLS handshake completes, only handshake bytes are sent. */
 static void sub_flush(client_subchannel *s) {
   if (s->closed || s->is_writing)
     return;
@@ -310,6 +353,8 @@ static void sub_flush(client_subchannel *s) {
   s->is_writing = true;
 }
 
+/* Appends a copy of a header name/value to a grpc_metadata array grown with grpc_realloc.
+ * Allocation failures drop the entry silently. */
 static void md_list_append(grpc_metadata **arr, size_t *count, const uint8_t *name, size_t nlen,
                            const uint8_t *val, size_t vlen) {
   grpc_metadata *next = grpc_realloc(*arr, (*count + 1) * sizeof(*next));
@@ -326,6 +371,10 @@ static void md_list_append(grpc_metadata **arr, size_t *count, const uint8_t *na
   (*arr)[(*count)++] = (grpc_metadata){.key = k, .key_len = nlen, .value = v, .value_len = vlen};
 }
 
+/* nghttp2 header callback: records grpc-status, grpc-message and grpc-encoding for the active
+ * stream and stores every header (including those) as response metadata. Fields arriving before
+ * the initial HEADERS completes go to headers, unless the frame ends the stream (a
+ * trailers-only response); later ones go to trailers. Headers for other streams are ignored. */
 static int client_on_header([[maybe_unused]] nghttp2_session *session, const nghttp2_frame *frame,
                             const uint8_t *name, size_t namelen, const uint8_t *value,
                             size_t valuelen, [[maybe_unused]] uint8_t flags, void *user_data) {
@@ -363,6 +412,11 @@ static int client_on_header([[maybe_unused]] nghttp2_session *session, const ngh
   return 0;
 }
 
+/* Splits complete length-prefixed gRPC messages off the front of recv_buf. Compressed messages
+ * (flag 1 with a known grpc-encoding) are decompressed within max_message_size; a flag of 1 with
+ * identity encoding is passed through as-is. Each message goes to on_message (then freed) when
+ * set, otherwise to recv_queue. Leaves a partial trailing message in recv_buf; on error sets
+ * st->err and marks the stream done. */
 static void stream_drain_messages(grpc_client_stream *st) {
   client_subchannel *s = st->sub;
   size_t off = 0;
@@ -411,6 +465,9 @@ static void stream_drain_messages(grpc_client_stream *st) {
   }
 }
 
+/* nghttp2 DATA callback: appends the active stream's bytes to recv_buf and extracts complete
+ * messages. Fails the stream with GRPC_ERR_LIMIT once the buffered bytes would exceed
+ * max_message_size plus the 5-byte prefix. */
 static int client_on_data_chunk([[maybe_unused]] nghttp2_session *session,
                                 [[maybe_unused]] uint8_t flags, int32_t stream_id,
                                 const uint8_t *data, size_t len, void *user_data) {
@@ -432,6 +489,8 @@ static int client_on_data_chunk([[maybe_unused]] nghttp2_session *session,
   return 0;
 }
 
+/* nghttp2 frame callback: notes the end of the initial HEADERS (so later fields are trailers)
+ * and marks the active stream done on END_STREAM. */
 static int client_on_frame_recv([[maybe_unused]] nghttp2_session *session,
                                 const nghttp2_frame *frame, void *user_data) {
   client_subchannel *s = user_data;
@@ -445,6 +504,8 @@ static int client_on_frame_recv([[maybe_unused]] nghttp2_session *session,
   return 0;
 }
 
+/* nghttp2 stream-close callback: marks the active stream done, turning an abnormal close
+ * (RST_STREAM / GOAWAY error code) into GRPC_ERR_CLOSED unless an error is already set. */
 static int client_on_stream_close([[maybe_unused]] nghttp2_session *session, int32_t stream_id,
                                   uint32_t error_code, void *user_data) {
   client_subchannel *s = user_data;
@@ -457,6 +518,9 @@ static int client_on_stream_close([[maybe_unused]] nghttp2_session *session, int
   return 0;
 }
 
+/* nghttp2 data-provider callback for the request body: copies queued bytes from send_buf, sets
+ * EOF once the send side is half-closed and drained, and returns NGHTTP2_ERR_DEFERRED when there
+ * is nothing to send yet (resumed by nghttp2_session_resume_data on the next send/close). */
 static ssize_t client_data_read([[maybe_unused]] nghttp2_session *session,
                                 [[maybe_unused]] int32_t stream_id, uint8_t *buf, size_t length,
                                 uint32_t *data_flags, nghttp2_data_source *source,
@@ -482,12 +546,18 @@ static ssize_t client_data_read([[maybe_unused]] nghttp2_session *session,
   return (ssize_t)n;
 }
 
+/* libuv alloc callback: reads always land in the subchannel's fixed 64 KiB rbuf. */
 static void on_sub_alloc(uv_handle_t *handle, [[maybe_unused]] size_t suggested_size,
                          uv_buf_t *buf) {
   client_subchannel *s = handle->data;
   *buf = uv_buf_init((char *)s->rbuf, (unsigned int)sizeof(s->rbuf));
 }
 
+/* libuv read callback. EOF or a read error closes the subchannel and fails the active stream
+ * with GRPC_ERR_CLOSED. With TLS, feeds ciphertext into the SSL read BIO, advances the handshake
+ * if needed, then decrypts into rbuf (reused, as the read data is already in the BIO) and passes
+ * the plaintext to nghttp2. Without TLS, passes the bytes to nghttp2 directly. Flushes afterwards
+ * so nghttp2 replies (SETTINGS ACK, WINDOW_UPDATE, ...) go out. */
 static void on_sub_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
   client_subchannel *s = stream->data;
   if (nread == 0)
@@ -574,22 +644,27 @@ static void on_sub_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
   sub_flush(s);
 }
 
+/* Connect completion: records the status that sub_connect's wait loop polls for. */
 static void on_sub_connect(uv_connect_t *req, int status) {
   client_subchannel *s = req->data;
   s->connect_status = status;
   s->connected = (status == 0);
 }
 
+/* Close callback used while abandoning a failed connect attempt in sub_connect. */
 static void on_sub_handle_closed(uv_handle_t *handle) {
   client_subchannel *s = handle->data;
   s->handle_close_done = true;
 }
 
+/* Timer callback: the connect + TLS handshake deadline (config.timeout_ms) elapsed. */
 static void on_sub_connect_deadline(uv_timer_t *timer) {
   client_subchannel *s = timer->data;
   s->connect_deadline_hit = true;
 }
 
+/* Timer callback: the active RPC's deadline elapsed. Marks it timed out with GRPC_ERR_TIMEOUT;
+ * grpc_client_stream_finish then cancels the HTTP/2 stream. */
 static void on_sub_timeout(uv_timer_t *timer) {
   client_subchannel *s = timer->data;
   if (s->active_stream != nullptr) {
@@ -601,6 +676,10 @@ static void on_sub_timeout(uv_timer_t *timer) {
 
 /* ---- Subchannel lifecycle --------------------------------------------------- */
 
+/* Tears down the connection: frees the nghttp2 session and SSL object, closes the handle and
+ * timer, runs the loop until all close callbacks (and any pending connect request) complete,
+ * and closes the loop. Keeps the target strings and buffers so sub_connect can reuse them. Safe
+ * to call on a never-connected or already disconnected subchannel. */
 static void sub_disconnect(client_subchannel *s) {
   s->closed = true;
   if (s->ngsession != nullptr) {
@@ -634,6 +713,12 @@ static void sub_disconnect(client_subchannel *s) {
   s->tls_obuf.len = 0;
 }
 
+/* Ensures the subchannel is connected, reconnecting from scratch if it was closed. Creates a
+ * fresh loop, connects to the Unix path or to each resolved address in turn (IP literals skip
+ * getaddrinfo, which otherwise blocks), performs the TLS handshake when configured, creates the
+ * nghttp2 session and queues SETTINGS. The whole sequence is bounded by config.timeout_ms when
+ * nonzero. Blocks the caller while it runs the private loop. Returns GRPC_OK, or GRPC_ERR_IO /
+ * GRPC_ERR_NOMEM / GRPC_ERR_PROTOCOL after disconnecting again. */
 static grpc_err sub_connect(client_subchannel *s) {
   if (s->connected && !s->closed && s->ngsession != nullptr)
     return GRPC_OK;
@@ -789,6 +874,10 @@ fail_io:
   return GRPC_ERR_IO;
 }
 
+/* Parses a target string: "unix:path" or "unix://path" sets *out_unix, otherwise "host:port" or
+ * "[ipv6]:port" sets *out_host and *out_port (1-65535; characters after the digits are ignored).
+ * Outputs are grpc_malloc strings owned by the caller. Returns false on malformed input or
+ * allocation failure, with nothing left allocated. */
 static bool parse_target(const char *target, char **out_host, uint16_t *out_port, char **out_unix) {
   *out_host = nullptr;
   *out_port = 0;
@@ -829,6 +918,9 @@ static bool parse_target(const char *target, char **out_host, uint16_t *out_port
   return true;
 }
 
+/* Fills in a zeroed subchannel's target (copying host or unix_path) and the :authority value
+ * ("localhost" for Unix sockets). Does not connect. Returns GRPC_ERR_NOMEM if a copy fails; the
+ * partially initialized subchannel is still released by grpc_client_free. */
 static grpc_err init_subchannel(client_subchannel *s, grpc_client *parent, const char *host,
                                 uint16_t port, const char *unix_path) {
   s->parent = parent;
@@ -850,6 +942,11 @@ static grpc_err init_subchannel(client_subchannel *s, grpc_client *parent, const
 
 /* ---- Public client lifecycle ------------------------------------------------ */
 
+/* Copies the config by value: host, unix_path and targets are duplicated or parsed here, but
+ * tls.server_name is read again on every reconnect and must outlive the client. Applies the
+ * defaults (4 MiB max message, 50 ms backoff), builds the SSL_CTX, then connects eagerly: a
+ * single target must connect, while a target list succeeds if any target connects (the others
+ * reconnect lazily). On failure, frees everything through grpc_client_free. */
 GRPC_API grpc_client *grpc_client_new(const grpc_client_config *config, grpc_err *out_err) {
   if (out_err != nullptr)
     *out_err = GRPC_OK;
@@ -936,6 +1033,9 @@ fail:
   return nullptr;
 }
 
+/* Disconnects every subchannel (running each loop until its handles close) and frees all
+ * buffers. Any grpc_client_stream still open on this client must be finished or cancelled
+ * first, since streams point into the subchannels. */
 GRPC_API void grpc_client_free(grpc_client *c) {
   if (c == nullptr)
     return;
@@ -957,6 +1057,7 @@ GRPC_API void grpc_client_free(grpc_client *c) {
   grpc_free(c);
 }
 
+/* Frees the status message, message and every metadata key/value, then zeroes *response. */
 GRPC_API void grpc_client_response_free(grpc_client_response *response) {
   if (response == nullptr)
     return;
@@ -977,11 +1078,15 @@ GRPC_API void grpc_client_response_free(grpc_client_response *response) {
 
 /* ---- Streaming & framing helpers -------------------------------------------- */
 
+/* Returns the next subchannel in round-robin order, regardless of its connection state. */
 static client_subchannel *pick_subchannel(grpc_client *c) {
   size_t idx = c->rr_next++ % c->nb_subs;
   return &c->subs[idx];
 }
 
+/* Appends one gRPC length-prefixed message to dst, compressing it with config.compression first
+ * (and setting the compressed flag) unless that is identity. Returns GRPC_OK, the compressor's
+ * error, or GRPC_ERR_NOMEM. */
 static grpc_err frame_message_into(grpc_client *c, grpc_buf *dst, const void *data, size_t len) {
   uint8_t cflag = 0;
   uint8_t *comp_buf = nullptr;
@@ -1005,6 +1110,8 @@ static grpc_err frame_message_into(grpc_client *c, grpc_buf *dst, const void *da
   return fail ? GRPC_ERR_NOMEM : GRPC_OK;
 }
 
+/* Frees a stream and everything it owns, stopping the deadline timer and detaching it from its
+ * subchannel. Does not send RST_STREAM (grpc_client_stream_cancel does that first). */
 static void stream_free_internal(grpc_client_stream *st) {
   if (st == nullptr)
     return;
@@ -1023,6 +1130,11 @@ static void stream_free_internal(grpc_client_stream *st) {
   grpc_free(st);
 }
 
+/* Opens an RPC on a specific subchannel: (re)connects, builds the request headers (:path,
+ * content-type, te, grpc-accept-encoding, grpc-encoding, grpc-timeout from timeout_ms or the
+ * config default, then user metadata), submits the request with client_data_read as the body
+ * source, makes it the subchannel's active stream and arms the deadline timer. Header values are
+ * copied by nghttp2 during submission. Returns the stream, or nullptr with *out_err set. */
 static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *method,
                                               const grpc_metadata *metadata, size_t nb_metadata,
                                               uint32_t timeout_ms, grpc_err *out_err) {
@@ -1126,6 +1238,7 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
   return st;
 }
 
+/* Validates arguments and opens the stream on the next round-robin subchannel. */
 GRPC_API grpc_client_stream *grpc_client_stream_open(grpc_client *client, const char *method,
                                                      const grpc_metadata *metadata,
                                                      size_t nb_metadata, uint32_t timeout_ms,
@@ -1142,6 +1255,9 @@ GRPC_API grpc_client_stream *grpc_client_stream_open(grpc_client *client, const 
                             out_err);
 }
 
+/* Frames (and maybe compresses) the message into send_buf, resumes the deferred data provider
+ * and flushes without waiting for the peer. Returns st->err, so an earlier asynchronous failure
+ * on the stream surfaces here. */
 GRPC_API grpc_err grpc_client_stream_send(grpc_client_stream *st, const void *data, size_t len) {
   if (st == nullptr || (data == nullptr && len > 0))
     return GRPC_ERR_INVALID;
@@ -1158,6 +1274,8 @@ GRPC_API grpc_err grpc_client_stream_send(grpc_client_stream *st, const void *da
   return st->err;
 }
 
+/* Marks the send side closed so client_data_read emits END_STREAM once send_buf drains.
+ * Idempotent; returns st->err. */
 GRPC_API grpc_err grpc_client_stream_close_send(grpc_client_stream *st) {
   if (st == nullptr)
     return GRPC_ERR_INVALID;
@@ -1171,6 +1289,8 @@ GRPC_API grpc_err grpc_client_stream_close_send(grpc_client_stream *st) {
   return st->err;
 }
 
+/* Runs the subchannel loop until a message is queued or the stream ends. Returns GRPC_OK with a
+ * message, or st->err with *out_msg nullptr at end of stream (GRPC_OK for a normal end). */
 GRPC_API grpc_err grpc_client_stream_recv(grpc_client_stream *st, grpc_message **out_msg) {
   if (st == nullptr || out_msg == nullptr)
     return GRPC_ERR_INVALID;
@@ -1183,6 +1303,10 @@ GRPC_API grpc_err grpc_client_stream_recv(grpc_client_stream *st, grpc_message *
   return st->err;
 }
 
+/* Half-closes, runs the loop until the stream ends, and cancels it with RST_STREAM if its
+ * deadline fired. Any still-queued messages are drained so that out->message holds the last
+ * one (earlier ones are freed). Moves the response into *out, frees the stream and returns the
+ * transport error (GRPC_OK if the RPC completed; check out->status for the gRPC status). */
 GRPC_API grpc_err grpc_client_stream_finish(grpc_client_stream *st, grpc_client_response *out) {
   if (st == nullptr || out == nullptr)
     return GRPC_ERR_INVALID;
@@ -1208,6 +1332,8 @@ GRPC_API grpc_err grpc_client_stream_finish(grpc_client_stream *st, grpc_client_
   return err;
 }
 
+/* Sends RST_STREAM(CANCEL) if the stream is still live and flushes it without waiting, then frees
+ * the stream. */
 GRPC_API void grpc_client_stream_cancel(grpc_client_stream *st) {
   if (st == nullptr)
     return;
@@ -1221,11 +1347,19 @@ GRPC_API void grpc_client_stream_cancel(grpc_client_stream *st) {
 
 /* ---- Unary & server-streaming with retries and round-robin ------------------ */
 
+/* Blocks the calling thread for ms milliseconds (no-op for 0). */
 static void sleep_ms(uint32_t ms) {
   if (ms > 0)
     uv_sleep(ms);
 }
 
+/* Shared body of unary and server-streaming calls: open a stream on the next subchannel, send
+ * the single request, half-close and finish. Retries up to config.max_retries times, each on the
+ * next subchannel after a backoff that starts at retry_backoff_ms and doubles while below 5 s,
+ * when the attempt fails with GRPC_ERR_IO / GRPC_ERR_CLOSED or completes with UNAVAILABLE. Other
+ * errors return immediately. *out is reset before each attempt and holds the last attempt's
+ * response. on_message, when set, sees messages from every attempt, so a retried
+ * server-streaming call can deliver duplicates. */
 static grpc_err execute_with_retries(grpc_client *c, const char *method, const void *req_data,
                                      size_t req_len, const grpc_metadata *metadata,
                                      size_t nb_metadata, uint32_t timeout_ms,
@@ -1276,6 +1410,7 @@ static grpc_err execute_with_retries(grpc_client *c, const char *method, const v
   return last_err;
 }
 
+/* Unary call: execute_with_retries without a callback, so the reply ends up in out->message. */
 GRPC_API grpc_err grpc_client_unary(grpc_client *client, const char *method, const void *req_data,
                                     size_t req_len, const grpc_metadata *metadata,
                                     size_t nb_metadata, uint32_t timeout_ms,
@@ -1284,6 +1419,7 @@ GRPC_API grpc_err grpc_client_unary(grpc_client *client, const char *method, con
                               nullptr, nullptr, out);
 }
 
+/* Server-streaming call: execute_with_retries delivering each response to on_message. */
 GRPC_API grpc_err grpc_client_server_stream(
     grpc_client *client, const char *method, const void *req_data, size_t req_len,
     const grpc_metadata *metadata, size_t nb_metadata, uint32_t timeout_ms,

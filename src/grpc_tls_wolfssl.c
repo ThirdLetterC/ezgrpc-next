@@ -1,6 +1,14 @@
-/* TLS backend for wolfSSL, using its native API (no OpenSSL compatibility
- * layer needed). The I/O callbacks move ciphertext through grpc_tls_io.
- * wolfSSL must be built with ALPN support (--enable-alpn). */
+/* grpc_tls_wolfssl.c - TLS backend for wolfSSL, using its native API.
+ *
+ * Implements the tls_backend_* contract of internal_tls.h without the OpenSSL compatibility
+ * layer. The WOLFSSL_CTX is used directly as the opaque grpc_tls_ctx; each session wraps a WOLFSSL
+ * object and its grpc_tls_io ciphertext queues.
+ *
+ * wolfSSL never touches the socket: custom I/O callbacks, installed on the context, move
+ * ciphertext through the grpc_tls_io queues that the libuv event loop fills (feed) and empties
+ * (drain). wolfSSL must be built with ALPN support (--enable-alpn), since HTTP/2 negotiates h2
+ * through ALPN.
+ */
 #include <limits.h>
 #include "internal/grpc_threads.h"
 #include <wolfssl/options.h>
@@ -12,38 +20,53 @@
 #error "wolfSSL is built without ALPN, which HTTP/2 requires. Rebuild it with --enable-alpn."
 #endif
 
+/* Per-connection state: the wolfSSL object and its ciphertext queues. */
 struct grpc_tls_session {
   WOLFSSL *ssl;
   grpc_tls_io io;
 };
 
+/* Converts the opaque context handle back to the WOLFSSL_CTX it is. */
 static inline WOLFSSL_CTX *wolfssl_ctx(grpc_tls_ctx *ctx) {
   return (WOLFSSL_CTX *)ctx;
 }
 
+/* Returns "wolfssl". */
 const char *tls_backend_name(void) {
   return "wolfssl";
 }
 
+/* Returns the run-time library version string. */
 const char *tls_backend_version(void) {
   return wolfSSL_lib_version();
 }
 
+/* Initializes the wolfSSL library; run once through pthread_once() by tls_backend_ctx_new(). */
 static void wolfssl_init_once(void) {
   (void)wolfSSL_Init();
 }
 
+/* I/O receive callback: copies up to `sz` buffered ciphertext bytes into `buf`. Returns the byte
+ * count, or WOLFSSL_CBIO_ERR_WANT_READ when nothing is buffered, so wolfSSL reports want-read
+ * instead of blocking or treating it as EOF. */
 static int io_recv([[maybe_unused]] WOLFSSL *ssl, char *buf, int sz, void *ctx) {
   grpc_tls_session *tls = ctx;
   size_t n = tls_io_pull(&tls->io, buf, (size_t)sz);
   return n == 0 ? WOLFSSL_CBIO_ERR_WANT_READ : (int)n;
 }
 
+/* I/O send callback: appends all of `buf` to the output queue. Returns `sz`, or
+ * WOLFSSL_CBIO_ERR_GENERAL if the queue cannot grow. */
 static int io_send([[maybe_unused]] WOLFSSL *ssl, char *buf, int sz, void *ctx) {
   grpc_tls_session *tls = ctx;
   return tls_io_push(&tls->io, buf, (size_t)sz) ? WOLFSSL_CBIO_ERR_GENERAL : sz;
 }
 
+/* Creates a server WOLFSSL_CTX from `cfg`: TLS 1.2 minimum, the certificate chain and key from PEM
+ * buffers (preferred when both are set) or from files, checked to match each other unless wolfSSL
+ * is built with NO_CHECK_PRIVATE_KEY. With a CA file or PEM, client certificates are verified, and
+ * required when cfg->require_client_cert is set. Installs the queue I/O callbacks. Returns nullptr
+ * on any error. */
 grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg) {
   if (cfg == nullptr)
     return nullptr;
@@ -103,14 +126,18 @@ grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg) {
   return (grpc_tls_ctx *)ctx;
 }
 
+/* Frees the WOLFSSL_CTX. */
 void tls_backend_ctx_free(grpc_tls_ctx *ctx) {
   wolfSSL_CTX_free(wolfssl_ctx(ctx));
 }
 
+/* Returns the WOLFSSL_CTX itself. */
 void *tls_backend_ctx_native(grpc_tls_ctx *ctx) {
   return wolfssl_ctx(ctx);
 }
 
+/* Creates a session: a WOLFSSL object whose I/O callbacks get the session as their context, and
+ * which offers h2 through ALPN. Returns nullptr on failure. */
 grpc_tls_session *tls_backend_session_new(grpc_tls_ctx *ctx) {
   grpc_tls_session *tls = grpc_calloc(1, sizeof(*tls));
   if (tls == nullptr) {
@@ -134,20 +161,27 @@ grpc_tls_session *tls_backend_session_new(grpc_tls_ctx *ctx) {
   return tls;
 }
 
+/* Frees the WOLFSSL object, its ciphertext queues and the wrapper. */
 void tls_backend_session_free(grpc_tls_session *tls) {
   wolfSSL_free(tls->ssl);
   tls_io_free(&tls->io);
   grpc_free(tls);
 }
 
+/* Appends received ciphertext to the input queue. Returns 0 on success, 1 on allocation
+ * failure. */
 int tls_backend_feed(grpc_tls_session *tls, const void *buf, size_t len) {
   return tls_io_feed(&tls->io, buf, len);
 }
 
+/* Moves the queued output ciphertext to the end of `out`. Returns 0 on success (also when nothing
+ * is queued), 1 on allocation failure. */
 int tls_backend_drain(grpc_tls_session *tls, grpc_buf *out) {
   return tls_io_drain(&tls->io, out);
 }
 
+/* Runs wolfSSL_accept() on the ciphertext fed so far. Returns 1 when complete, 0 when it needs
+ * more input (WANT_READ/WANT_WRITE), -1 on error. */
 int tls_backend_handshake(grpc_tls_session *tls) {
   int ret = wolfSSL_accept(tls->ssl);
   if (ret == WOLFSSL_SUCCESS) {
@@ -157,6 +191,8 @@ int tls_backend_handshake(grpc_tls_session *tls) {
   return err == WOLFSSL_ERROR_WANT_READ || err == WOLFSSL_ERROR_WANT_WRITE ? 0 : -1;
 }
 
+/* Decrypts up to `len` bytes (capped at INT_MAX) into `buf`. Returns the byte count, -2 on
+ * WANT_READ/WANT_WRITE (more ciphertext is needed), 0 on the peer's close_notify, -1 on error. */
 ssize_t tls_backend_read(grpc_tls_session *tls, void *buf, size_t len) {
   int ret = wolfSSL_read(tls->ssl, buf, len > INT_MAX ? INT_MAX : (int)len);
   if (ret > 0) {
@@ -173,6 +209,8 @@ ssize_t tls_backend_read(grpc_tls_session *tls, void *buf, size_t len) {
   }
 }
 
+/* Encrypts all of `buf` into the output queue, looping in chunks of at most INT_MAX bytes.
+ * Returns `len`, or -1 on error. */
 ssize_t tls_backend_write(grpc_tls_session *tls, const void *buf, size_t len) {
   /* io_send never blocks, so wolfSSL_write() only fails on errors */
   size_t written = 0;
@@ -187,10 +225,15 @@ ssize_t tls_backend_write(grpc_tls_session *tls, const void *buf, size_t len) {
   return (ssize_t)written;
 }
 
+/* Queues a close_notify alert with wolfSSL_shutdown(); the result is ignored (best effort). The
+ * caller drains the alert. */
 void tls_backend_close_notify(grpc_tls_session *tls) {
   (void)wolfSSL_shutdown(tls->ssl);
 }
 
+/* Writes the peer certificate's subject in one-line form into `buf` via
+ * wolfSSL_X509_NAME_oneline(). Returns 0 on success, -1 if there is no peer certificate or on
+ * error. */
 int tls_backend_peer_subject(grpc_tls_session *tls, char *buf, size_t len) {
   WOLFSSL_X509 *cert = wolfSSL_get_peer_certificate(tls->ssl);
   if (cert == nullptr)

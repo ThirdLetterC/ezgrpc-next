@@ -1,6 +1,11 @@
 #pragma once
 
-/* Private library helpers; public headers must not include this file. */
+/* common.h - private library helpers
+ *
+ * Private library helpers; public headers must not include this file. Provides the short integer
+ * typedefs (u8, u32, i64, ...) used throughout src/, grpc_align_up(), and compile-time limits
+ * such as CONFIG_STREAM_MAX_HEADERS. Included by core.h.
+ */
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -28,6 +33,7 @@ static inline size_t grpc_align_up(size_t size, size_t alignment) {
   return (size + alignment - 1) & ~(alignment - 1);
 }
 
+/* Maximum request headers kept per stream. Overridable at build time. */
 #ifndef CONFIG_STREAM_MAX_HEADERS
 #define CONFIG_STREAM_MAX_HEADERS 32
 #endif

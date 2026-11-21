@@ -1,5 +1,13 @@
 #pragma once
 
+/* grpc_flatcc.h - FlatBuffers (flatcc) integration
+ *
+ * Builds response messages with a flatcc builder backed by the grpc allocator and verifies and
+ * reads received messages zero-copy. Available when the library is built with
+ * ``GRPC_ENABLE_FLATCC``; grpc.h includes it automatically then. The flatcc headers must be on
+ * the include path.
+ */
+
 #include "grpc_defs.h"
 
 /* C23 provides alignas and alignof keywords. Mark them as defined so flatcc's
@@ -29,7 +37,8 @@
 /**
  * Initializes a flatcc builder whose working memory comes from the active
  * grpc allocator (libc, mimalloc, jemalloc, or custom).
- * Release it with ``flatcc_builder_clear()``.
+ * Release it with ``flatcc_builder_clear()``. Returns GRPC_ERR_INVALID for a
+ * nullptr ``builder`` and GRPC_ERR_NOMEM if initialization fails.
  */
 GRPC_API grpc_err grpc_fb_builder_init(flatcc_builder_t *builder);
 
@@ -39,7 +48,8 @@ GRPC_API grpc_err grpc_fb_builder_init(flatcc_builder_t *builder);
  *
  * @param fid The expected file identifier, or nullptr to accept any.
  * @return ``flatcc_verify_ok`` (0), or a flatcc error code; see
- *         ``flatcc_verify_error_string()``.
+ *         ``flatcc_verify_error_string()``. A nullptr ``message`` or
+ *         ``verifier`` gives ``flatcc_verify_error_buffer_header_too_small``.
  */
 GRPC_API int grpc_fb_verify(const grpc_message *message, const char *fid,
                             flatcc_table_verifier_f *verifier);
@@ -79,12 +89,14 @@ GRPC_API grpc_message *grpc_fb_pack(flatcc_builder_t *builder);
 
 /**
  * Sends the buffer finished in ``builder`` on ``call``, like
- * grpc_call_send(), and resets the builder.
+ * grpc_call_send(), and resets the builder. Returns GRPC_ERR_INVALID if no
+ * buffer was finished, GRPC_ERR_NOMEM if copying it failed, or the result of
+ * grpc_call_send().
  */
 GRPC_API grpc_err grpc_call_send_fb(grpc_call *call, flatcc_builder_t *builder);
 
 /**
  * Sends the buffer finished in ``builder``, resets the builder, and finishes
- * ``call`` with GRPC_STATUS_OK.
+ * ``call`` with GRPC_STATUS_OK. If sending fails the call is not finished.
  */
 GRPC_API grpc_err grpc_call_reply_fb(grpc_call *call, flatcc_builder_t *builder);

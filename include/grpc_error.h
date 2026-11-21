@@ -1,5 +1,12 @@
 #pragma once
 
+/* grpc_error.h - library error codes
+ *
+ * grpc_err is returned by library functions to report their own success or failure;
+ * grpc_strerror() describes a code. The status of an RPC is a separate grpc_status
+ * (grpc_status.h).
+ */
+
 #include "grpc_defs.h"
 
 /**
@@ -10,6 +17,7 @@
  * an :c:type:`grpc_status`.
  */
 typedef enum grpc_err {
+  /** Success. */
   GRPC_OK = 0,
   /** An argument is invalid, e.g. a null pointer or an out of range value. */
   GRPC_ERR_INVALID = -1,
@@ -40,6 +48,7 @@ typedef enum grpc_err {
 } grpc_err;
 
 /**
- * Returns a static description of an error code.
+ * Returns a static description of an error code, or ``"unknown error"`` for
+ * values outside the enum.
  */
 GRPC_API const char *grpc_strerror(grpc_err err);

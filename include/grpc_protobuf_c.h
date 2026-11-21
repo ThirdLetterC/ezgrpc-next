@@ -1,5 +1,13 @@
 #pragma once
 
+/* grpc_protobuf_c.h - protobuf-c integration
+ *
+ * Packs and unpacks protobuf-c messages to and from grpc_message, with all protobuf-c memory
+ * taken from the grpc allocator. Available when the library is built with
+ * ``GRPC_ENABLE_PROTOBUF_C``; grpc.h includes it automatically then. See
+ * docs/serialization-and-compression.md.
+ */
+
 #include <protobuf-c/protobuf-c.h>
 #include "grpc_call.h"
 #include "grpc_defs.h"
@@ -17,10 +25,12 @@ GRPC_API ProtobufCAllocator *grpc_pb_get_allocator(void);
 /**
  * Unpacks a serialized protobuf-c message from an grpc_message.
  *
- * @param descriptor Pointer to the message type descriptor (e.g. &helloworld__hello_request__descriptor).
+ * @param descriptor Pointer to the message type descriptor
+ *                   (e.g. &helloworld__hello_request__descriptor).
  * @param message The received gRPC message containing binary protobuf data.
  * @return A pointer to the unpacked ProtobufCMessage (cast to the appropriate struct type),
- *         or nullptr if unpacking failed or message was invalid.
+ *         or nullptr if unpacking failed or message was invalid. Free it with
+ *         grpc_pb_free_unpacked(), not with protobuf-c's default allocator.
  */
 GRPC_API ProtobufCMessage *grpc_pb_unpack(const ProtobufCMessageDescriptor *descriptor,
                                           const grpc_message *message);
@@ -35,14 +45,15 @@ GRPC_API ProtobufCMessage *grpc_pb_unpack(const ProtobufCMessageDescriptor *desc
 /**
  * Serializes a ProtobufCMessage into a newly allocated grpc_message.
  *
- * @return The message, or nullptr on failure.
+ * @return The message (free with grpc_message_free() unless handed to a send
+ *         function), or nullptr on failure.
  */
 GRPC_API grpc_message *grpc_pb_pack(const ProtobufCMessage *message);
 
 /**
  * Frees a message previously unpacked via grpc_pb_unpack.
  *
- * @param message The unpacked message to free.
+ * @param message The unpacked message to free. May be nullptr.
  */
 GRPC_API void grpc_pb_free_unpacked(ProtobufCMessage *message);
 
@@ -54,10 +65,13 @@ GRPC_API void grpc_pb_free_unpacked(ProtobufCMessage *message);
 
 /**
  * Serializes ``message`` and sends it on ``call``, like grpc_call_send().
+ * ``message`` stays owned by the caller. Returns GRPC_ERR_NOMEM if
+ * serialization fails.
  */
 GRPC_API grpc_err grpc_call_send_pb(grpc_call *call, const ProtobufCMessage *message);
 
 /**
  * Serializes ``message``, sends it on ``call``, and finishes the call with GRPC_STATUS_OK.
+ * If sending fails the call is not finished.
  */
 GRPC_API grpc_err grpc_call_reply_pb(grpc_call *call, const ProtobufCMessage *message);

@@ -1,9 +1,24 @@
+/* grpc_interceptor.c - call interceptors and the built-in bearer-auth and rate-limit ones
+ *
+ * The server keeps a copy of each interceptor added with grpc_server_add_interceptor() in an
+ * array, run in insertion order and filtered by path_prefix. The interceptors_run_* hooks are
+ * called by grpc_call.c on the server thread: on_call when a call is first dispatched, on_recv
+ * before each received message is delivered, on_send before each response is queued, and on_done
+ * once when the call ends. A non-OK status from the first three finishes the call with that
+ * status; the caller then stops processing it.
+ *
+ * The server owns each interceptor's userdata after a successful add and releases it with
+ * userdata_free in interceptors_free(). The rate limiter guards its bucket with a mutex.
+ */
+
 #include <stdlib.h>
 #include <string.h>
 #include "internal/grpc_platform.h"
 #include "core.h"
 #include "grpc_timeout.h"
 
+/* Returns true if the interceptor applies to the call: no path_prefix, or the call's method
+ * (grpc_call_method()) starts with it. */
 static bool interceptor_matches_call(const grpc_interceptor *inc, const grpc_call *call) {
   if (inc->path_prefix == nullptr)
     return true;
@@ -14,6 +29,9 @@ static bool interceptor_matches_call(const grpc_interceptor *inc, const grpc_cal
   return strncmp(method, inc->path_prefix, plen) == 0;
 }
 
+/* Grows the array first and keeps the grown block even if copying path_prefix then fails, so the
+ * server never points at a freed array. The copy's path_prefix is a grpc_strdup() owned by the
+ * server. Not synchronized: add interceptors before the server runs. */
 GRPC_API grpc_err grpc_server_add_interceptor(grpc_server *server,
                                               const grpc_interceptor *interceptor) {
   if (server == nullptr || interceptor == nullptr) {
@@ -41,6 +59,8 @@ GRPC_API grpc_err grpc_server_add_interceptor(grpc_server *server,
   return GRPC_OK;
 }
 
+/* Runs the matching on_call hooks. On the first non-OK status finishes the call with it and
+ * returns false; the remaining interceptors do not run. */
 bool interceptors_run_on_call(grpc_call *call) {
   grpc_server *server = call->server;
   for (size_t i = 0; i < server->nb_interceptors; i++) {
@@ -57,6 +77,8 @@ bool interceptors_run_on_call(grpc_call *call) {
   return true;
 }
 
+/* Runs the matching on_recv_message hooks before `message` is delivered. On the first non-OK
+ * status finishes the call and returns false; the caller still owns `message`. */
 bool interceptors_run_on_recv(grpc_call *call, const grpc_message *message) {
   grpc_server *server = call->server;
   for (size_t i = 0; i < server->nb_interceptors; i++) {
@@ -73,6 +95,8 @@ bool interceptors_run_on_recv(grpc_call *call, const grpc_message *message) {
   return true;
 }
 
+/* Runs the matching on_send_message hooks before `message` is queued. On the first non-OK
+ * status finishes the call and returns false; the caller still owns `message`. */
 bool interceptors_run_on_send(grpc_call *call, const grpc_message *message) {
   grpc_server *server = call->server;
   for (size_t i = 0; i < server->nb_interceptors; i++) {
@@ -89,6 +113,9 @@ bool interceptors_run_on_send(grpc_call *call, const grpc_message *message) {
   return true;
 }
 
+/* Runs the matching on_done hooks with the time since the request arrived. Called from both the
+ * finish and the cancel paths, so it guards itself to run once per call, and skips calls that
+ * never started (on_call never ran for them). */
 void interceptors_run_on_done(grpc_call *call, grpc_status status) {
   /* once, and only for calls that went through on_call */
   if (call->done_reported || !call->started)
@@ -104,6 +131,8 @@ void interceptors_run_on_done(grpc_call *call, grpc_status status) {
   }
 }
 
+/* Frees the interceptor array, the path_prefix copies and each userdata. Called when the server
+ * is freed. */
 void interceptors_free(grpc_server *server) {
   for (size_t i = 0; i < server->nb_interceptors; i++) {
     const grpc_interceptor *inc = &server->interceptors[i];
@@ -121,6 +150,10 @@ typedef struct bearer_auth_data {
   void *userdata;
 } bearer_auth_data;
 
+/* on_call hook of the bearer-auth interceptor: requires an "authorization: Bearer <token>"
+ * header (scheme matched case-insensitively, extra spaces before the token skipped) and passes
+ * the token to the validator. Returns UNAUTHENTICATED with a static message otherwise. A null
+ * state (allocation failed in grpc_interceptor_bearer_auth()) lets every call through. */
 static grpc_status bearer_auth_on_call(grpc_call *call, const char **message, void *userdata) {
   bearer_auth_data *auth = userdata;
   if (auth == nullptr || auth->validator == nullptr) {
@@ -149,6 +182,8 @@ static grpc_status bearer_auth_on_call(grpc_call *call, const char **message, vo
   return GRPC_STATUS_OK;
 }
 
+/* Allocates the validator state as userdata, released with grpc_free by interceptors_free(). If
+ * the allocation fails the interceptor is still returned, with null userdata. */
 GRPC_API grpc_interceptor grpc_interceptor_bearer_auth(grpc_token_validator_fn validator,
                                                        void *userdata) {
   bearer_auth_data *data = grpc_malloc(sizeof(*data));
@@ -173,6 +208,7 @@ typedef struct rate_limit_data {
   uint64_t last_ms;
 } rate_limit_data;
 
+/* userdata_free of the rate limiter: destroys its mutex and frees it. */
 static void rate_limit_free(void *userdata) {
   rate_limit_data *rl = userdata;
   if (rl == nullptr)
@@ -181,6 +217,9 @@ static void rate_limit_free(void *userdata) {
   grpc_free(rl);
 }
 
+/* on_call hook of the rate limiter: refills the token bucket for the elapsed time (capped at
+ * the burst size) and takes one token, or rejects the call with RESOURCE_EXHAUSTED. The bucket
+ * is updated under its mutex. A null state lets every call through. */
 static grpc_status rate_limit_on_call([[maybe_unused]] grpc_call *call, const char **message,
                                       void *userdata) {
   rate_limit_data *rl = userdata;
@@ -208,6 +247,8 @@ static grpc_status rate_limit_on_call([[maybe_unused]] grpc_call *call, const ch
   return GRPC_STATUS_OK;
 }
 
+/* Starts with a full bucket. A non-positive rate never refills it; a zero burst becomes 1. If
+ * the allocation fails the interceptor is still returned, with null userdata. */
 GRPC_API grpc_interceptor grpc_interceptor_rate_limit(double requests_per_sec, size_t burst) {
   rate_limit_data *rl = grpc_calloc(1, sizeof(*rl));
   if (rl != nullptr) {

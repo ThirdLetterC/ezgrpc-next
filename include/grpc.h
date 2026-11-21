@@ -1,5 +1,13 @@
-/* ezGRPC-next is a gRPC server library in C. */
 #pragma once
+
+/* grpc.h - umbrella header of ezGRPC-next, a gRPC server library in C
+ *
+ * Include this one header to get the whole public API: the server (grpc_server.h), calls
+ * (grpc_call.h), messages and metadata, interceptors, health checking, reflection, channelz,
+ * compression, TLS and the blocking client (grpc_client.h). The protobuf-c and flatcc helpers are
+ * included only when the library is built with GRPC_ENABLE_PROTOBUF_C / GRPC_ENABLE_FLATCC.
+ * See docs/getting-started.md.
+ */
 
 #include "grpc_defs.h"
 #include "grpc_version.h"

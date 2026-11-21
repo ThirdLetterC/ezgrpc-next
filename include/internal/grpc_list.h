@@ -1,4 +1,12 @@
 #pragma once
+
+/* grpc_list.h - doubly linked list of void pointers
+ *
+ * A generic FIFO/deque used for message queues and other small collections. Nodes are allocated
+ * with the grpc allocator; the stored values are never freed by the list. A stored nullptr is
+ * indistinguishable from "empty" for the pop/peek/find functions, so do not store nullptr. Lists
+ * are not thread-safe. The struct layout is in grpc_list_struct.h for embedding a list by value.
+ */
 #include <stdlib.h>
 #include "grpc_defs.h"
 
@@ -14,10 +22,12 @@ void grpc_list_free(grpc_list *list);
 /** Return the number of elements in the list. */
 size_t grpc_list_count(grpc_list *list);
 
-/** Add ``userdata`` to the back of ``list``; return 0 on success or nonzero on allocation failure. */
+/** Add ``userdata`` to the back of ``list``; return 0 on success or nonzero on allocation
+ * failure. */
 int grpc_list_push_back(grpc_list *list, void *userdata);
 
-/** Add ``userdata`` to the front of ``list``; return 0 on success or nonzero on allocation failure. */
+/** Add ``userdata`` to the front of ``list``; return 0 on success or nonzero on allocation
+ * failure. */
 int grpc_list_push_front(grpc_list *list, void *userdata);
 
 /** Remove and return the first value, or nullptr if the list is empty. */

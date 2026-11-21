@@ -1,6 +1,16 @@
-/* TLS backend for rustls, through its C API (rustls-ffi 0.15). Ciphertext is
- * moved with rustls_connection_read_tls() and rustls_connection_write_tls()
- * callbacks. rustls only speaks TLS 1.2 and 1.3. */
+/* grpc_tls_rustls.c - TLS backend for rustls, through its C API (rustls-ffi 0.15).
+ *
+ * Implements the tls_backend_* contract of internal_tls.h. The rustls_server_config is used
+ * directly as the opaque grpc_tls_ctx; each session wraps a rustls_connection and its grpc_tls_io
+ * ciphertext queues. rustls only speaks TLS 1.2 and 1.3.
+ *
+ * Unlike the other backends, rustls does not pull or push ciphertext on its own: this file moves
+ * it explicitly with rustls_connection_read_tls() (from the input queue, followed by
+ * rustls_connection_process_new_packets()) and rustls_connection_write_tls() (into the output
+ * queue), using callbacks over the grpc_tls_io queues that the libuv event loop fills and empties.
+ * This backend does not extract the peer certificate subject: tls_backend_peer_subject() always
+ * fails.
+ */
 #include <errno.h>
 #include "internal/grpc_threads.h"
 #include <stdio.h>
@@ -8,15 +18,18 @@
 #include "core.h"
 #include "internal_tls.h"
 
+/* Per-connection state: the rustls connection and its ciphertext queues. */
 struct grpc_tls_session {
   struct rustls_connection *conn;
   grpc_tls_io io;
 };
 
+/* Converts the opaque context handle back to the rustls_server_config it is. */
 static inline const struct rustls_server_config *rustls_config(grpc_tls_ctx *ctx) {
   return (const struct rustls_server_config *)ctx;
 }
 
+/* Returns "rustls". */
 const char *tls_backend_name(void) {
   return "rustls";
 }
@@ -24,17 +37,23 @@ const char *tls_backend_name(void) {
 /* rustls_version() is not NUL-terminated. */
 static char version[128];
 
+/* Copies rustls_version() into `version` as a NUL-terminated string (truncated to fit). */
 static void version_init(void) {
   struct rustls_str v = rustls_version();
   snprintf(version, sizeof(version), "%.*s", (int)v.len, v.data);
 }
 
+/* Returns the run-time library version string, built once (thread-safely) on first use. */
 const char *tls_backend_version(void) {
   static pthread_once_t once = PTHREAD_ONCE_INIT;
   pthread_once(&once, version_init);
   return version;
 }
 
+/* Appends the whole content of the file at `path` to `out`; the rustls-ffi calls used here take
+ * PEM data from memory, so files are read in first. Returns 0 on success, 1 if the file cannot be
+ * opened or read, or on allocation failure; `out` may then hold partial data, which the caller
+ * frees. */
 static int read_file(const char *path, grpc_buf *out) {
   FILE *fp = fopen(path, "rb");
   if (fp == nullptr)
@@ -56,6 +75,11 @@ static int read_file(const char *path, grpc_buf *out) {
   return res;
 }
 
+/* Creates a server config from `cfg`: a certified key from PEM buffers (preferred when both are
+ * set) or from files read into memory, and, with a CA file or PEM, a WebPKI client certificate
+ * verifier that also accepts clients without a certificate unless cfg->require_client_cert is
+ * set. Sets h2 as the only ALPN protocol. All error paths go through `out`, which frees the
+ * intermediate objects and wipes the key file buffer. Returns nullptr on any error. */
 grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg) {
   if (cfg == nullptr)
     return nullptr;
@@ -163,14 +187,17 @@ out:
   return (grpc_tls_ctx *)config;
 }
 
+/* Releases the config. Connections hold their own reference, so live sessions keep it alive. */
 void tls_backend_ctx_free(grpc_tls_ctx *ctx) {
   rustls_server_config_free(rustls_config(ctx));
 }
 
+/* Returns the rustls_server_config itself (const in rustls, cast away for the generic API). */
 void *tls_backend_ctx_native(grpc_tls_ctx *ctx) {
   return (void *)rustls_config(ctx);
 }
 
+/* Creates a session with a new server connection from the config. Returns nullptr on failure. */
 grpc_tls_session *tls_backend_session_new(grpc_tls_ctx *ctx) {
   grpc_tls_session *tls = grpc_calloc(1, sizeof(*tls));
   if (tls == nullptr) {
@@ -183,16 +210,21 @@ grpc_tls_session *tls_backend_session_new(grpc_tls_ctx *ctx) {
   return tls;
 }
 
+/* Frees the rustls connection, its ciphertext queues and the wrapper. */
 void tls_backend_session_free(grpc_tls_session *tls) {
   rustls_connection_free(tls->conn);
   tls_io_free(&tls->io);
   grpc_free(tls);
 }
 
+/* Appends received ciphertext to the input queue; rustls reads it later, in pump(). Returns 0 on
+ * success, 1 on allocation failure. */
 int tls_backend_feed(grpc_tls_session *tls, const void *buf, size_t len) {
   return tls_io_feed(&tls->io, buf, len);
 }
 
+/* Read callback for rustls_connection_read_tls(): copies up to `n` buffered ciphertext bytes
+ * into `buf`. Returns 0 with the count in `out_n`, or EAGAIN when nothing is buffered. */
 static rustls_io_result io_read(void *userdata, uint8_t *buf, size_t n, size_t *out_n) {
   grpc_tls_session *tls = userdata;
   *out_n = tls_io_pull(&tls->io, buf, n);
@@ -200,6 +232,8 @@ static rustls_io_result io_read(void *userdata, uint8_t *buf, size_t n, size_t *
   return *out_n == 0 ? EAGAIN : 0;
 }
 
+/* Write callback for rustls_connection_write_tls(): appends all of `buf` to the output queue.
+ * Returns 0 with `out_n` set to `n`, or ENOMEM if the queue cannot grow. */
 static rustls_io_result io_write(void *userdata, const uint8_t *buf, size_t n, size_t *out_n) {
   grpc_tls_session *tls = userdata;
   if (tls_io_push(&tls->io, buf, n))
@@ -208,7 +242,7 @@ static rustls_io_result io_write(void *userdata, const uint8_t *buf, size_t n, s
   return 0;
 }
 
-/* moves the ciphertext rustls has ready into io.out */
+/* moves the ciphertext rustls has ready into io.out. returns 0 on success, 1 on error */
 static int flush_tls(grpc_tls_session *tls) {
   while (rustls_connection_wants_write(tls->conn)) {
     size_t n = 0;
@@ -218,6 +252,9 @@ static int flush_tls(grpc_tls_session *tls) {
   return 0;
 }
 
+/* Flushes the ciphertext rustls has ready into the output queue, then moves the queue to the end
+ * of `out`. rustls keeps its ciphertext until rustls_connection_write_tls() is called, so the
+ * flush must come first. Returns 0 on success, 1 on error. */
 int tls_backend_drain(grpc_tls_session *tls, grpc_buf *out) {
   if (flush_tls(tls))
     return 1;
@@ -233,12 +270,14 @@ static int pump(grpc_tls_session *tls) {
   rustls_io_result res = rustls_connection_read_tls(tls->conn, io_read, tls, &n);
   if (res != 0 && res != EAGAIN)
     return -1;
-  /* also on errors, so that an alert reaches the peer */
+  /* on failure rustls may have queued an alert; a later drain still flushes it to the peer */
   if (rustls_connection_process_new_packets(tls->conn) != RUSTLS_RESULT_OK)
     return -1;
   return n > 0 ? 1 : 0;
 }
 
+/* Feeds buffered ciphertext to rustls until the handshake completes. Returns 1 when complete, 0
+ * when more input is needed, -1 on error. */
 int tls_backend_handshake(grpc_tls_session *tls) {
   /* stop once the handshake is done: what follows is application data
    * and is decrypted by tls_backend_read() as it is consumed */
@@ -252,6 +291,9 @@ int tls_backend_handshake(grpc_tls_session *tls) {
   return 1;
 }
 
+/* Reads up to `len` bytes of decrypted data into `buf`, pumping more buffered ciphertext into
+ * rustls whenever its plaintext buffer is empty. Returns the byte count, -2 when the input queue
+ * is exhausted (more ciphertext is needed), 0 on the peer's close_notify, -1 on error. */
 ssize_t tls_backend_read(grpc_tls_session *tls, void *buf, size_t len) {
   for (;;) {
     size_t n = 0;
@@ -271,6 +313,9 @@ ssize_t tls_backend_read(grpc_tls_session *tls, void *buf, size_t len) {
   }
 }
 
+/* Encrypts all of `buf`. When rustls' internal output buffer is full (it accepts 0 bytes), its
+ * pending ciphertext is flushed into the output queue to make room. Returns `len`, or -1 on
+ * error. */
 ssize_t tls_backend_write(grpc_tls_session *tls, const void *buf, size_t len) {
   size_t written = 0;
   while (written < len) {
@@ -289,10 +334,12 @@ ssize_t tls_backend_write(grpc_tls_session *tls, const void *buf, size_t len) {
   return (ssize_t)written;
 }
 
+/* Queues a close_notify alert inside rustls (best effort); the caller's next drain flushes it. */
 void tls_backend_close_notify(grpc_tls_session *tls) {
   rustls_connection_send_close_notify(tls->conn);
 }
 
+/* Not supported with rustls: always returns -1 and leaves `buf` untouched. */
 int tls_backend_peer_subject([[maybe_unused]] grpc_tls_session *tls, [[maybe_unused]] char *buf,
                              [[maybe_unused]] size_t len) {
   return -1;

@@ -1,5 +1,12 @@
 #pragma once
 
+/* grpc_tls.h - server TLS configuration
+ *
+ * The grpc_tls_config struct embedded in grpc_config.tls, hot reloading of server certificates,
+ * and queries about the TLS backend compiled into the library. Client TLS is configured
+ * separately in grpc_client_config (grpc_client.h). See docs/tls.md.
+ */
+
 #include "grpc_defs.h"
 #include "grpc_error.h"
 
@@ -10,15 +17,25 @@ typedef struct grpc_server grpc_server;
  * Optionally configure ca_file/ca_pem and require_client_cert for mTLS.
  */
 typedef struct grpc_tls_config {
+  /** Server certificate chain file (PEM). */
   const char *cert_file;
+  /** Server private key file (PEM). */
   const char *key_file;
+  /** Server certificate chain as PEM text. */
   const char *cert_pem;
+  /** Length of ``cert_pem`` (0 = NUL-terminated). */
   size_t cert_pem_len;
+  /** Server private key as PEM text. */
   const char *key_pem;
+  /** Length of ``key_pem`` (0 = NUL-terminated). */
   size_t key_pem_len;
+  /** CA file used to verify client certificates (mTLS). */
   const char *ca_file;
+  /** CA certificates as PEM text, used when ``ca_file`` is nullptr. */
   const char *ca_pem;
+  /** Length of ``ca_pem`` (0 = NUL-terminated). */
   size_t ca_pem_len;
+  /** Reject clients that do not present a valid certificate. */
   bool require_client_cert;
 } grpc_tls_config;
 
@@ -26,6 +43,10 @@ typedef struct grpc_tls_config {
  * Hot-reloads the server's TLS certificate/key/CA configuration without
  * dropping existing connections. New connections use the updated context.
  * On failure, the previous TLS configuration remains active.
+ * ``tls`` must name exactly one of the file pair or the PEM pair (else
+ * GRPC_ERR_INVALID) and is not kept after the call. Call it from the server
+ * thread. On a server started without TLS it enables TLS for new connections.
+ * Returns GRPC_ERR_UNSUPPORTED when built without TLS.
  */
 GRPC_API grpc_err grpc_server_reload_tls(grpc_server *server, const grpc_tls_config *tls);
 

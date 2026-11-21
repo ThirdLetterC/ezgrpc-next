@@ -1,3 +1,15 @@
+/* grpc_compression.c - message compression codecs: gzip, deflate, zstd and snappy
+ *
+ * Each codec is compiled in only when its library is enabled (GRPC_ENABLE_ZLIB, _ZSTD,
+ * _SNAPPY); otherwise the functions report GRPC_ERR_UNSUPPORTED (or failure) for it. All output
+ * buffers come from the grpc allocator and are released with grpc_free(), never libc free().
+ *
+ * Decompression is bounded: grpc_decompress_limited() grows its output step by step and stops
+ * with GRPC_ERR_LIMIT as soon as more than max_output bytes would be produced, so a small
+ * compressed request cannot expand into an unbounded allocation. The server uses it with
+ * max_message_size when parsing requests. Compression of messages writes straight into a
+ * grpc_message sized by the codec's worst-case bound, avoiding a copy.
+ */
 #include <stdlib.h>
 #include <string.h>
 #include "core.h"
@@ -14,6 +26,15 @@
 #include <snappy-c.h>
 #endif
 
+/* Compresses or decompresses with zlib, in gzip (RFC 1952) or zlib-wrapped deflate (RFC 1950)
+ * framing depending on gzip. Compression sizes the buffer with deflateBound() and finishes in
+ * one deflate(Z_FINISH) in practice. Decompression starts at twice the input (at least 256
+ * bytes), doubles as needed and caps the buffer at max_output + 1 so that exceeding max_output
+ * is detected and reported as GRPC_ERR_LIMIT. zlib counts sizes in uInt, so inputs and buffers
+ * over UINT_MAX are rejected. Returns GRPC_OK with *out (grpc_free()) and *out_len set,
+ * GRPC_ERR_INVALID (bad level or size), GRPC_ERR_NOMEM, GRPC_ERR_CODEC (corrupt or truncated
+ * data, or no progress), or GRPC_ERR_UNSUPPORTED without zlib. Leaves *out untouched on failure.
+ */
 static grpc_err zlib_codec(bool compress, bool gzip, int level, const uint8_t *in, size_t in_len,
                            uint8_t **out, size_t *out_len, size_t max_output) {
 #if defined(GRPC_ENABLE_ZLIB)
@@ -105,8 +126,11 @@ static grpc_err zlib_codec(bool compress, bool gzip, int level, const uint8_t *i
 #endif
 }
 
-/* Compress directly into caller-owned storage, used by grpc_message_compress
- * to avoid a temporary codec buffer followed by a payload copy. */
+/* Compresses in one shot into caller-owned storage of out_cap bytes, used by
+ * grpc_message_compress() to avoid a temporary codec buffer followed by a payload copy; out_cap
+ * should come from compression_bound(). Returns 0 with *out_len set on success, 1 for an invalid
+ * level or size, 2 if zlib cannot be initialized, 4 if the codec fails (including output that
+ * does not fit), and -1 for an unknown or compiled-out algorithm. */
 static int compress_into(grpc_compression_algorithm algorithm, int level, const uint8_t *in,
                          size_t in_len, uint8_t *out, size_t out_cap, size_t *out_len) {
   if (algorithm == GRPC_COMPRESS_GZIP || algorithm == GRPC_COMPRESS_DEFLATE) {
@@ -183,6 +207,9 @@ static int compress_into(grpc_compression_algorithm algorithm, int level, const 
   return -1;
 }
 
+/* Returns the worst-case compressed size of len bytes for algorithm and level, or 0 when the
+ * algorithm is unknown or compiled out, the level is invalid for it (snappy only accepts the
+ * default), or the bound does not fit zlib's uInt. */
 static size_t compression_bound(grpc_compression_algorithm algorithm, int level, size_t len) {
   switch (algorithm) {
   case GRPC_COMPRESS_GZIP:
@@ -225,6 +252,10 @@ static size_t compression_bound(grpc_compression_algorithm algorithm, int level,
   }
 }
 
+/* Rejects nullptr out pointers and a nullptr input with a nonzero length; a nullptr empty input
+ * is replaced by a dummy byte so the codecs get a valid pointer. zstd and snappy compress into a
+ * buffer of their worst-case bound; gzip and deflate go through zlib_codec(). The default level
+ * maps to each codec's own default; snappy accepts no other level. */
 GRPC_API grpc_err grpc_compress(grpc_compression_algorithm algorithm, int level, const uint8_t *in,
                                 size_t in_len, uint8_t **out, size_t *out_len) {
   if ((!in && in_len) || !out || !out_len)
@@ -288,6 +319,11 @@ GRPC_API grpc_err grpc_compress(grpc_compression_algorithm algorithm, int level,
   }
 }
 
+/* zlib codecs go through zlib_codec(). zstd decompresses as a stream into a buffer that starts at
+ * 4 KiB (or max_output + 1 if smaller) and doubles up to max_output + 1, so frames without a
+ * declared content size are handled and the limit is checked after every step; truncated input
+ * or a call that makes no progress is GRPC_ERR_CODEC. snappy reads the uncompressed length from
+ * the header and checks it against max_output before allocating. */
 GRPC_API grpc_err grpc_decompress_limited(grpc_compression_algorithm algorithm, const uint8_t *in,
                                           size_t in_len, uint8_t **out, size_t *out_len,
                                           size_t max_output) {
@@ -386,20 +422,27 @@ GRPC_API grpc_err grpc_decompress_limited(grpc_compression_algorithm algorithm, 
   return GRPC_ERR_UNSUPPORTED;
 }
 
+/* grpc_decompress_limited() without an output limit. */
 GRPC_API grpc_err grpc_decompress(grpc_compression_algorithm algorithm, const uint8_t *in,
                                   size_t in_len, uint8_t **out, size_t *out_len) {
   return grpc_decompress_limited(algorithm, in, in_len, out, out_len, SIZE_MAX);
 }
 
+/* gzip at the default level through grpc_compress(). */
 GRPC_API grpc_err grpc_compress_gzip(const uint8_t *in, size_t len, uint8_t **out,
                                      size_t *out_len) {
   return grpc_compress(GRPC_COMPRESS_GZIP, GRPC_COMPRESSION_LEVEL_DEFAULT, in, len, out, out_len);
 }
+/* Unbounded gzip decompression through grpc_decompress(). */
 GRPC_API grpc_err grpc_decompress_gzip(const uint8_t *in, size_t len, uint8_t **out,
                                        size_t *out_len) {
   return grpc_decompress(GRPC_COMPRESS_GZIP, in, len, out, out_len);
 }
 
+/* Allocates the result at the codec's worst-case bound and compresses straight into it with
+ * compress_into(), then shrinks len to the compressed size (the allocation keeps its size). The
+ * result has cflag 1 and records algorithm and level. Returns nullptr for an unsupported
+ * algorithm or level, a bound over UINT32_MAX, or any failure. */
 GRPC_API grpc_message *grpc_message_compress(const grpc_message *msg,
                                              grpc_compression_algorithm algorithm, int level) {
   if (!msg)
@@ -421,6 +464,8 @@ GRPC_API grpc_message *grpc_message_compress(const grpc_message *msg,
   result->compression_level = level;
   return result;
 }
+/* Copies an uncompressed message (cflag 0); otherwise decompresses without an output limit into
+ * a new message with cflag 0. Returns nullptr on failure. */
 GRPC_API grpc_message *grpc_message_decompress(const grpc_message *msg,
                                                grpc_compression_algorithm algorithm) {
   if (!msg)
@@ -435,9 +480,11 @@ GRPC_API grpc_message *grpc_message_decompress(const grpc_message *msg,
   grpc_free(data);
   return result;
 }
+/* grpc_message_compress() with gzip at the default level. */
 GRPC_API grpc_message *grpc_message_compress_gzip(const grpc_message *msg) {
   return grpc_message_compress(msg, GRPC_COMPRESS_GZIP, GRPC_COMPRESSION_LEVEL_DEFAULT);
 }
+/* grpc_message_decompress() with gzip. */
 GRPC_API grpc_message *grpc_message_decompress_gzip(const grpc_message *msg) {
   return grpc_message_decompress(msg, GRPC_COMPRESS_GZIP);
 }

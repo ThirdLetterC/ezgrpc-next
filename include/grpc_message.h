@@ -1,5 +1,13 @@
 #pragma once
 
+/* grpc_message.h - gRPC message buffers
+ *
+ * A grpc_message is one length-prefixed gRPC message payload in a single allocation, with its
+ * data aligned so serialized formats can be read in place. Messages created here are released
+ * with grpc_message_free(); functions that take a grpc_message * (not const) usually take
+ * ownership, as documented on each of them.
+ */
+
 #include "grpc_defs.h"
 
 #if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 202311L
@@ -8,6 +16,7 @@
 
 typedef struct grpc_message grpc_message;
 
+/** Message compression algorithms (the ``grpc-encoding`` values). */
 typedef enum {
   GRPC_COMPRESS_IDENTITY = 0,
   GRPC_COMPRESS_GZIP = 1,
@@ -34,18 +43,20 @@ struct grpc_message {
 };
 
 /**
- * Creates a message holding a copy of ``data``.
- * Returns nullptr when out of memory.
+ * Creates an uncompressed message holding a copy of ``len`` bytes of ``data``.
+ * ``data`` may be nullptr only when ``len`` is 0. Returns nullptr when out of
+ * memory, for an invalid argument, or when ``len`` exceeds UINT32_MAX.
  */
 GRPC_API GRPC_NODISCARD grpc_message *grpc_message_new(const void *data, size_t len);
 
 /**
  * Creates a message with ``len`` uninitialized bytes, for serializing in place.
- * Returns nullptr when out of memory.
+ * Returns nullptr when out of memory or when ``len`` exceeds UINT32_MAX.
  */
 GRPC_API GRPC_NODISCARD grpc_message *grpc_message_alloc(size_t len);
 
 /**
- * Frees a message. Accepts nullptr.
+ * Frees a message created by the library or by grpc_message_new() /
+ * grpc_message_alloc(). Accepts nullptr.
  */
 GRPC_API void grpc_message_free(grpc_message *message);

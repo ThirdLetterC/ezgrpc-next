@@ -1,7 +1,20 @@
+/* grpc_status_details.c - google.rpc.Status encoding for grpc-status-details-bin
+ *
+ * Implements the gRPC Rich Error Model: google.rpc.Status { int32 code = 1; string message = 2;
+ * repeated google.protobuf.Any details = 3; } is serialized by hand and base64-encoded into the
+ * grpc-status-details-bin trailer, and decoded from it. The decoders skip unknown fields and
+ * understand single-byte tags only. Every buffer they return is allocated with grpc_malloc() and
+ * must be released with grpc_free() (or grpc_status_details_free()), never with libc free().
+ *
+ * grpc_call_finish_with_details() runs on the server thread like grpc_call_finish(); the _async
+ * variant encodes on the caller's thread and posts the rest to the server thread.
+ */
+
 #include <stdlib.h>
 #include <string.h>
 #include "core.h"
 
+/* Returns the number of bytes `val` takes as a protobuf varint. */
 static size_t varint_size(uint64_t val) {
   size_t size = 0;
   do {
@@ -11,6 +24,8 @@ static size_t varint_size(uint64_t val) {
   return size;
 }
 
+/* Writes `val` as a protobuf varint to `buf`, which must have room for varint_size(val) bytes.
+ * Returns the number of bytes written. */
 static size_t write_varint(uint8_t *buf, uint64_t val) {
   size_t len = 0;
   do {
@@ -23,6 +38,8 @@ static size_t write_varint(uint8_t *buf, uint64_t val) {
   return len;
 }
 
+/* Reads a protobuf varint at *seek, advancing it, without reading past `len`. A truncated or
+ * overlong varint is not reported; the bits read so far are returned. */
 static uint64_t read_varint(const uint8_t *buf, size_t len, size_t *seek) {
   uint64_t val = 0;
   size_t shift = 0;
@@ -36,6 +53,10 @@ static uint64_t read_varint(const uint8_t *buf, size_t len, size_t *seek) {
   return val;
 }
 
+/* Sizes the message in a first pass, then writes it into one buffer and base64-encodes it. The
+ * code is always written; empty message, type_url and value fields are omitted. The code is
+ * encoded as its uint32 bit pattern, so a negative code takes 5 bytes instead of the 10 that
+ * protobuf uses for negative int32. Returns nullptr on allocation failure. */
 GRPC_API char *grpc_status_details_encode(int32_t code, const char *message,
                                           const grpc_status_detail_entry *details,
                                           size_t nb_details, size_t *out_len) {
@@ -125,6 +146,10 @@ GRPC_API char *grpc_status_details_encode(int32_t code, const char *message,
   return b64;
 }
 
+/* Lenient decoder: returns GRPC_ERR_INVALID only when the input is null or base64 decoding
+ * fails.
+ * Out-of-bounds fields are skipped and allocation failures leave the output null, both silently.
+ * If a field repeats, the last one wins and earlier allocations leak. */
 GRPC_API grpc_err grpc_status_details_decode(const char *base64_str, int32_t *out_code,
                                              char **out_message, char **out_type_url,
                                              uint8_t **out_detail_value, size_t *out_detail_len) {
@@ -223,6 +248,7 @@ GRPC_API grpc_err grpc_status_details_decode(const char *base64_str, int32_t *ou
   return GRPC_OK;
 }
 
+/* Frees the message and every detail's type_url and value, then zeroes *details. */
 GRPC_API void grpc_status_details_free(grpc_status_details *details) {
   if (details == nullptr)
     return;
@@ -235,6 +261,9 @@ GRPC_API void grpc_status_details_free(grpc_status_details *details) {
   *details = (grpc_status_details){};
 }
 
+/* Strict counterpart of grpc_status_details_decode() that keeps every Any entry. A message or
+ * Any that overruns the input fails with GRPC_ERR_INVALID; a malformed field inside an Any ends
+ * that Any but keeps what was parsed. On any error *out is freed and zeroed. */
 GRPC_API grpc_err grpc_status_details_decode_all(const char *base64_str, grpc_status_details *out) {
   if (base64_str == nullptr || out == nullptr)
     return GRPC_ERR_INVALID;
@@ -359,6 +388,8 @@ GRPC_API grpc_err grpc_status_details_decode_all(const char *base64_str, grpc_st
   return GRPC_OK;
 }
 
+/* Encodes the status as a grpc-status-details-bin trailer, adds it and finishes the call. The
+ * trailer is added even if the finish then fails. */
 GRPC_API grpc_err grpc_call_finish_with_details(grpc_call *call, grpc_status status,
                                                 const char *message,
                                                 const grpc_status_detail_entry *details,
@@ -393,6 +424,9 @@ typedef struct async_details_op {
   size_t b64_len;
 } async_details_op;
 
+/* Server-thread side of grpc_call_finish_with_details_async(): adds the pre-encoded trailer and,
+ * if that succeeds, finishes the call; then drops the reference and frees the op. Errors are
+ * ignored. */
 static void run_async_details_op(void *arg) {
   async_details_op *op = arg;
   grpc_metadata trailer = {
@@ -409,6 +443,8 @@ static void run_async_details_op(void *arg) {
   grpc_free(op);
 }
 
+/* Encodes the details and copies `message` on the caller's thread, so the caller's buffers may
+ * go away on return, then takes a call reference and posts the op to the server thread. */
 GRPC_API grpc_err grpc_call_finish_with_details_async(grpc_call *call, grpc_status status,
                                                       const char *message,
                                                       const grpc_status_detail_entry *details,

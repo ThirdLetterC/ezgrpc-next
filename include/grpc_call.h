@@ -1,5 +1,13 @@
 #pragma once
 
+/* grpc_call.h - server-side call API: read a request, answer it, finish it
+ *
+ * A grpc_call is one RPC on the server, handed to handlers registered with grpc_server_handle()
+ * and friends (grpc_server.h) or found in a grpc_event (grpc_event.h). This header covers reading
+ * the request and its metadata, per-call state, flow control, sending responses and finishing the
+ * call, plus thread-safe ``*_async`` variants for answering from worker threads.
+ */
+
 #include "grpc_defs.h"
 #include "grpc_error.h"
 #include "grpc_message.h"
@@ -19,8 +27,10 @@
  * with GRPC_ERR_CLOSED instead of crashing.
  *
  * Threads: every function here must be called from the thread running the
- * server, except grpc_call_ref(), grpc_call_unref(),
- * grpc_call_send_async() and grpc_call_finish_async().
+ * server, except grpc_call_ref(), grpc_call_unref() and the ``*_async``
+ * functions (grpc_call_send_metadata_async(), grpc_call_add_trailers_async(),
+ * grpc_call_send_async(), grpc_call_send_data_async(), grpc_call_reply_async()
+ * and grpc_call_finish_async()).
  */
 typedef struct grpc_call grpc_call;
 typedef struct grpc_server grpc_server;
@@ -33,15 +43,22 @@ typedef struct grpc_server grpc_server;
  */
 GRPC_API const grpc_message *grpc_call_request(const grpc_call *call);
 
-/** The method path, e.g. ``"/helloworld.Greeter/SayHello"``. */
+/**
+ * The method path, e.g. ``"/helloworld.Greeter/SayHello"``. Valid as long as
+ * the call; nullptr if ``call`` is nullptr.
+ */
 GRPC_API const char *grpc_call_method(const grpc_call *call);
 
-/** The client address, e.g. ``"127.0.0.1:51234"`` or ``"[::1]:51234"``. */
+/**
+ * The client address, e.g. ``"127.0.0.1:51234"`` or ``"[::1]:51234"``. Valid
+ * as long as the call.
+ */
 GRPC_API const char *grpc_call_peer(const grpc_call *call);
 
 /**
  * The verified TLS client certificate subject (e.g. ``"/CN=client"``), or
- * nullptr when TLS or client certificate authentication is not active.
+ * nullptr when TLS or client certificate authentication is not active. Always
+ * nullptr with the rustls backend, which does not expose the subject.
  */
 GRPC_API const char *grpc_call_peer_cert_subject(const grpc_call *call);
 
@@ -63,7 +80,11 @@ GRPC_API const char *grpc_call_metadata_next(const grpc_call *call, const char *
 /** The number of request headers, including pseudo-headers such as ``:path``. */
 GRPC_API size_t grpc_call_metadata_count(const grpc_call *call);
 
-/** Reads the request header at ``index``. Returns false if out of range. */
+/**
+ * Reads the request header at ``index`` into ``out``. The key and value point
+ * into the call and stay valid as long as it. Returns false if ``index`` is
+ * out of range or an argument is nullptr.
+ */
 GRPC_API bool grpc_call_metadata_at(const grpc_call *call, size_t index, grpc_metadata *out);
 
 /**
@@ -90,24 +111,31 @@ GRPC_API grpc_status grpc_call_cancel_reason(const grpc_call *call);
  * ``"00-<32-hex-trace-id>-<16-hex-span-id>-<2-hex-flags>"``).
  */
 typedef struct grpc_trace_context {
+  /** 32 lowercase hex digits, NUL-terminated. */
   char trace_id[33];
+  /** 16 lowercase hex digits, NUL-terminated. */
   char span_id[17];
+  /** The trace flags byte (bit 0 is "sampled"). */
   uint8_t trace_flags;
+  /** True when the fields hold a parsed or filled-in context. */
   bool valid;
 } grpc_trace_context;
 
 /**
  * Parses the ``traceparent`` request header into ``out``. Returns true if a
- * valid W3C traceparent header was present.
+ * valid W3C traceparent header (version ``00``, lowercase hex, non-zero trace
+ * and span ids) was present; otherwise ``out`` is zeroed and false is returned.
  */
 GRPC_API bool grpc_call_trace_context(const grpc_call *call, grpc_trace_context *out);
 
 /**
- * Formats a W3C ``traceparent`` header value into ``buf`` (needs at least 56 bytes).
+ * Formats a W3C ``traceparent`` header value into ``buf`` (needs at least 56
+ * bytes: 55 characters plus the NUL). Returns GRPC_ERR_INVALID if ``ctx`` is
+ * not ``valid``, its ids have the wrong length, or ``buf`` is too small.
  */
 GRPC_API grpc_err grpc_traceparent_format(const grpc_trace_context *ctx, char *buf, size_t buf_len);
 
-/** The server the call belongs to. */
+/** The server the call belongs to, or nullptr if ``call`` is nullptr. */
 GRPC_API grpc_server *grpc_call_server(const grpc_call *call);
 
 /* ---- per-call state ----------------------------------------------------- */
@@ -115,6 +143,8 @@ GRPC_API grpc_server *grpc_call_server(const grpc_call *call);
 /**
  * Attaches application data to the call, e.g. the state of a streaming call.
  * ``free_fn`` (may be nullptr) is called on it when the call is released.
+ * Replacing earlier data with a different pointer calls the previous
+ * ``free_fn`` on the previous data.
  */
 GRPC_API void grpc_call_set_userdata(grpc_call *call, void *data, void (*free_fn)(void *data));
 
@@ -122,8 +152,11 @@ GRPC_API void grpc_call_set_userdata(grpc_call *call, void *data, void (*free_fn
 GRPC_API void *grpc_call_userdata(const grpc_call *call);
 
 /**
- * Calls ``fn`` if the call is cancelled after this point (see
- * grpc_call_is_cancelled()). Useful for calls answered later.
+ * Calls ``fn`` on the server thread if the call is cancelled after this point
+ * (see grpc_call_is_cancelled()). Useful for calls answered later. A call has
+ * one cancel callback; this replaces any earlier one. For streaming methods
+ * the ``on_cancel`` handler from registration is installed when the call
+ * starts.
  */
 GRPC_API void grpc_call_on_cancel(grpc_call *call, void (*fn)(grpc_call *call, void *userdata),
                                   void *userdata);
@@ -136,13 +169,16 @@ GRPC_API size_t grpc_call_send_queue_bytes(const grpc_call *call);
 
 /**
  * Returns true if the call's send queue is below ``grpc_config.max_send_queue_bytes``
- * (or if no send queue limit is configured).
+ * (or if no send queue limit is configured). False once the call is finished or
+ * closed.
  */
 GRPC_API bool grpc_call_is_writable(const grpc_call *call);
 
 /**
- * Registers a callback invoked when the stream's send queue drains below
- * ``grpc_config.max_send_queue_bytes`` after experiencing backpressure.
+ * Registers a callback invoked on the server thread when the stream's send
+ * queue drains below ``grpc_config.max_send_queue_bytes`` after experiencing
+ * backpressure (e.g. after grpc_call_send() returned GRPC_ERR_LIMIT). Replaces
+ * any earlier callback.
  */
 GRPC_API void grpc_call_on_writable(grpc_call *call, void (*fn)(grpc_call *call, void *userdata),
                                     void *userdata);
@@ -153,13 +189,17 @@ GRPC_API void grpc_call_on_writable(grpc_call *call, void (*fn)(grpc_call *call,
  * Configures automatic compression for uncompressed response messages sent on
  * this call. Must be called before the first message is sent. Negotiates
  * against the client's ``grpc-accept-encoding`` header; if the client does not
- * advertise ``algorithm``, responses remain uncompressed.
+ * advertise ``algorithm``, responses remain uncompressed. ``level`` is passed
+ * to the codec. Returns GRPC_ERR_STATE once headers were sent and
+ * GRPC_ERR_UNSUPPORTED if the library was built without ``algorithm``.
  */
 GRPC_API grpc_err grpc_call_set_compression(grpc_call *call, grpc_compression_algorithm algorithm,
                                             int level);
 
 /**
  * Sends initial metadata (response headers). Only before the first message.
+ * The metadata is copied and sent with the first message, or with the status
+ * if no message is sent. Returns GRPC_ERR_STATE once headers went out.
  */
 GRPC_API grpc_err grpc_call_send_metadata(grpc_call *call, const grpc_metadata *metadata,
                                           size_t count);
@@ -167,17 +207,23 @@ GRPC_API grpc_err grpc_call_send_metadata(grpc_call *call, const grpc_metadata *
 /**
  * Sends a response message. Takes ownership of ``message``, also when it
  * fails. Call it several times to stream responses.
+ *
+ * Returns GRPC_ERR_LIMIT when ``grpc_config.max_send_queue_bytes`` would be
+ * exceeded (see grpc_call_on_writable()), and GRPC_ERR_STATE when a
+ * precompressed message uses a different encoding than the first message.
  */
 GRPC_API grpc_err grpc_call_send(grpc_call *call, grpc_message *message);
 
 /**
- * Sends a copy of ``len`` bytes of ``data`` as a response message.
+ * Sends a copy of ``len`` bytes of ``data`` as a response message. ``data``
+ * may be nullptr when ``len`` is 0.
  */
 GRPC_API grpc_err grpc_call_send_data(grpc_call *call, const void *data, size_t len);
 
 /**
  * Sends ``message`` and finishes the call with GRPC_STATUS_OK (unary shortcut).
- * Takes ownership of ``message``, also on failure.
+ * Takes ownership of ``message``, also on failure. If sending fails the call
+ * is not finished.
  */
 GRPC_API grpc_err grpc_call_reply(grpc_call *call, grpc_message *message);
 
@@ -187,7 +233,8 @@ GRPC_API grpc_err grpc_call_reply(grpc_call *call, grpc_message *message);
 GRPC_API grpc_err grpc_call_reply_data(grpc_call *call, const void *data, size_t len);
 
 /**
- * Adds trailing metadata, sent by grpc_call_finish().
+ * Adds trailing metadata, sent by grpc_call_finish(). The metadata is copied;
+ * may be called several times before finishing.
  */
 GRPC_API grpc_err grpc_call_add_trailers(grpc_call *call, const grpc_metadata *metadata,
                                          size_t count);
@@ -204,41 +251,52 @@ GRPC_API grpc_err grpc_call_finish(grpc_call *call, grpc_status status, const ch
 /** Takes a reference, keeping the call valid. Thread-safe. Returns ``call``. */
 GRPC_API grpc_call *grpc_call_ref(grpc_call *call);
 
-/** Drops a reference taken with grpc_call_ref(). Thread-safe. */
+/**
+ * Drops a reference taken with grpc_call_ref(); the last one frees the call.
+ * Thread-safe.
+ */
 GRPC_API void grpc_call_unref(grpc_call *call);
 
 /**
  * Thread-safe grpc_call_send_metadata(). Copies ``metadata`` and queues it on
- * the server thread. The caller must hold a reference to the call.
+ * the server thread. The caller must hold a reference to the call. The return
+ * value only reports whether the operation was queued; errors of the deferred
+ * operation itself are discarded.
  */
 GRPC_API grpc_err grpc_call_send_metadata_async(grpc_call *call, const grpc_metadata *metadata,
                                                 size_t count);
 
 /**
  * Thread-safe grpc_call_add_trailers(). Copies ``metadata`` and queues it on
- * the server thread. The caller must hold a reference to the call.
+ * the server thread. The caller must hold a reference to the call. The return
+ * value only reports whether the operation was queued; errors of the deferred
+ * operation itself are discarded.
  */
 GRPC_API grpc_err grpc_call_add_trailers_async(grpc_call *call, const grpc_metadata *metadata,
                                                size_t count);
 
 /**
  * Thread-safe grpc_call_send(): queues the message for the server thread
- * and wakes it up. The caller must hold a reference to the call.
+ * and wakes it up. Takes ownership of ``message``, also on failure. The caller
+ * must hold a reference to the call. The return value only reports whether the
+ * message was queued; a later failure of the send itself is not reported.
  */
 GRPC_API grpc_err grpc_call_send_async(grpc_call *call, grpc_message *message);
 
 /**
- * Thread-safe grpc_call_send_data(). The caller must hold a reference.
+ * Thread-safe grpc_call_send_data(): copies ``data`` and queues it like
+ * grpc_call_send_async(). The caller must hold a reference.
  */
 GRPC_API grpc_err grpc_call_send_data_async(grpc_call *call, const void *data, size_t len);
 
 /**
- * Thread-safe grpc_call_reply(). Takes ownership of ``message``. The caller must
- * hold a reference.
+ * Thread-safe grpc_call_reply(). Takes ownership of ``message``, also on
+ * failure. The caller must hold a reference. Only queueing errors are returned.
  */
 GRPC_API grpc_err grpc_call_reply_async(grpc_call *call, grpc_message *message);
 
 /**
- * Thread-safe grpc_call_finish(). The caller must hold a reference.
+ * Thread-safe grpc_call_finish(). ``message`` is copied. The caller must hold
+ * a reference. Only queueing errors are returned.
  */
 GRPC_API grpc_err grpc_call_finish_async(grpc_call *call, grpc_status status, const char *message);

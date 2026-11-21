@@ -1,5 +1,18 @@
 #pragma once
 
+/* core.h - the library's internal data model
+ *
+ * Defines the private structs behind the public handles (grpc_server, grpc_call) and the
+ * transport state under them: grpc_session (one connection) and grpc_stream (one HTTP/2 stream),
+ * plus routes, buffers and the internal functions shared between source files. Every source
+ * file in src/ includes it.
+ *
+ * Threading: everything is owned by the server loop thread, except the atomics (call refcount,
+ * stop flag, log level, statistics) and the grpc_server_post() queue guarded by post_mutex.
+ * Ownership: a stream owns one reference on its call until call_detach(); the application, the
+ * ready queue and events hold further references.
+ */
+
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -26,6 +39,8 @@
 #ifndef _MSC_VER
 [[gnu::format(printf, 3, 4)]]
 #endif
+/* Log a timestamped line for `server` if `level` passes its threshold; usually reached through
+ * the LOG_* macros. Does nothing for a nullptr server. Safe from any thread. */
 void server_log(grpc_server *server, grpc_log_level level, const char *fmt, ...);
 
 #define LOG_ERROR(server, fmt, ...) \
@@ -46,7 +61,8 @@ void server_log(grpc_server *server, grpc_log_level level, const char *fmt, ...)
 
 /* ---- buffers --------------------------------------------------------------- */
 
-/* A growable byte buffer. */
+/* A growable byte buffer from the grpc allocator; see buf_reserve()/buf_append()/buf_free() in
+ * internal_helpers.h. A zeroed grpc_buf is empty and valid. */
 typedef struct grpc_buf grpc_buf;
 struct grpc_buf {
   u8 *data;
@@ -89,6 +105,8 @@ struct nv_list {
   size_t cap;
 };
 
+/* One RPC as seen by the application (behind the public grpc_call handle). Reference-counted;
+ * outlives its stream, which is cleared when the HTTP/2 stream closes. */
 struct grpc_call {
   atomic_size_t refs;
   grpc_server *server;
@@ -162,6 +180,8 @@ struct grpc_call {
 /* Small request messages are buffered inside the stream. */
 enum { GRPC_STREAM_INLINE_RECV = 256 };
 
+/* Transport state of one HTTP/2 stream: request headers, receive buffer and outgoing message
+ * queue. Owned by its session and freed when nghttp2 closes the stream. */
 struct grpc_stream {
   i32 stream_id;
 
@@ -225,6 +245,8 @@ struct grpc_stream {
   size_t nb_pending_trailers;
 };
 
+/* One client connection: socket handle, optional TLS session, nghttp2 session and its streams.
+ * Lives in a slot of grpc_server.sessions that is reused after the connection closes. */
 struct grpc_session {
   nghttp2_session *ngsession;
   /* Index in grpc_server.sessions. */
@@ -281,6 +303,7 @@ struct grpc_session {
 
 /* ---- the server ------------------------------------------------------------ */
 
+/* A task queued by grpc_server_post(), run on the loop thread. */
 typedef struct post_task post_task;
 struct post_task {
   void (*fn)(void *);
@@ -291,6 +314,8 @@ struct post_task {
 struct health_state;
 struct reflection_state;
 
+/* The server behind the public grpc_server handle: configuration, libuv loop and listeners,
+ * session slots, routes, interceptors, events and statistics. */
 struct grpc_server {
   /* Configuration with defaults applied. */
   grpc_config config;
@@ -402,6 +427,8 @@ struct grpc_server {
 /* ---- internal functions ------------------------------------------------------ */
 
 /* grpc_call.c */
+/* Create the call for a stream whose request headers were accepted. The returned reference is
+ * owned by the stream and dropped by call_detach(). nullptr when out of memory. */
 grpc_call *call_new(grpc_session *session, grpc_stream *stream);
 /* Detach the stream and cancel the call unless it already finished. */
 void call_detach(grpc_call *call, grpc_status reason);
@@ -417,7 +444,12 @@ void server_clear_events(grpc_server *server);
 void server_drop_ready(grpc_server *server);
 
 /* grpc_server.c */
+/* Return the route whose path equals the `len` bytes at `path` (enabled or disabled), or
+ * nullptr. */
 grpc_route *server_find_route(grpc_server *server, const char *path, size_t len);
+/* Register `path` (copied; must start with '/') as a route of `kind`, or re-enable a disabled
+ * route with the same path. Copies *stream. Returns GRPC_OK, GRPC_ERR_EXISTS, GRPC_ERR_INVALID
+ * or GRPC_ERR_NOMEM. Loop thread only. */
 grpc_err server_add_route(grpc_server *server, const char *path, route_kind kind,
                           grpc_handler_fn handler, const grpc_stream_handler *stream,
                           void *userdata);
@@ -425,18 +457,30 @@ grpc_err server_add_route(grpc_server *server, const char *path, route_kind kind
 /* grpc_interceptor.c */
 /* Run on_call interceptors; return false if one ends the call. */
 bool interceptors_run_on_call(grpc_call *call);
+/* Run on_recv_message interceptors; return false if one finished the call (drop the message). */
 bool interceptors_run_on_recv(grpc_call *call, const grpc_message *message);
+/* Run on_send_message interceptors; return false if one finished the call (drop the message). */
 bool interceptors_run_on_send(grpc_call *call, const grpc_message *message);
+/* Run on_done interceptors once per call, only for calls that went through on_call. */
 void interceptors_run_on_done(grpc_call *call, grpc_status status);
+/* Free the interceptor list, calling each userdata_free. */
 void interceptors_free(grpc_server *server);
 
 /* grpc_health.c, grpc_reflection.c */
+/* Free the health / reflection state of a server being destroyed (no-op if never created). */
 void health_free(grpc_server *server);
 void reflection_free(grpc_server *server);
 
 /* grpc_tls.c */
+/* Build a TLS context from `cfg` (PEM lengths already filled in) and make it the active one; the
+ * previous context is retired, not freed. GRPC_ERR_INVALID if the context cannot be built,
+ * GRPC_ERR_UNSUPPORTED without TLS. */
 grpc_err tls_enable(grpc_server *server, const grpc_tls_config *cfg);
+/* Free the active and retired TLS contexts. */
 void tls_free(grpc_server *server);
 
 /* grpc_message.c: a message with a compressed flag */
+/* Allocate a message with `len` payload bytes and the given compressed-flag byte, copying `data`
+ * if it is non-null. nullptr when out of memory or `len` exceeds UINT32_MAX. Free with
+ * grpc_message_free(). */
 grpc_message *message_create(u8 cflag, const void *data, size_t len);

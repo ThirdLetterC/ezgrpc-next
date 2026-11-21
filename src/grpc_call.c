@@ -1,5 +1,22 @@
 /* grpc_call.c - calls: their lifetime, dispatch and the call API
  *
+ * A grpc_call is the server-side state of one RPC: the request headers retained from nghttp2,
+ * the received messages not yet delivered, the response headers and trailers being built, and
+ * the application's userdata. Calls are refcounted. The HTTP/2 stream owns the first reference
+ * and drops it in call_detach() when the stream goes away; the ready queue, each grpc_event and
+ * each posted async op hold their own. A call can therefore outlive its stream: once detached
+ * (call->stream == nullptr) the response functions fail with GRPC_ERR_CLOSED.
+ *
+ * Everything here runs on the server (event loop) thread, except grpc_call_ref(),
+ * grpc_call_unref() and the *_async functions. Those copy their arguments and post a task with
+ * grpc_server_post() that replays the synchronous function on the server thread.
+ *
+ * Dispatch: the nghttp2 callbacks append received messages to call->pending and put the call on
+ * the server's ready queue with call_queue(); cancellation does the same. server_dispatch() then
+ * delivers each ready call to its route (unary handler, stream handler or grpc_event entries),
+ * running the interceptors on the way. Responses are queued on the stream and written by the
+ * nghttp2 data provider (data_source_read_callback2) when the session is flushed.
+ *
  * Copyright (c) 2023-2025 M. N. Yoshie & Al-buharie Amjari
  *
  * Redistribution and use in source and binary forms, with or without
@@ -37,6 +54,8 @@
 
 /* ---- header lists ------------------------------------------------------------ */
 
+/* Appends one header to `list`, growing it as needed. The name and value are copied into one
+ * grpc_malloc() block, each NUL-terminated. Returns GRPC_ERR_NOMEM on allocation failure. */
 static grpc_err nv_list_add(nv_list *list, const char *name, size_t namelen, const char *value,
                             size_t valuelen) {
   if (list->len == list->cap) {
@@ -65,6 +84,7 @@ static grpc_err nv_list_add(nv_list *list, const char *name, size_t namelen, con
   return GRPC_OK;
 }
 
+/* Frees every header of `list` and the array, and resets it to empty so it can be reused. */
 static void nv_list_free(nv_list *list) {
   for (size_t i = 0; i < list->len; i++)
     grpc_free(list->nva[i].name);
@@ -72,6 +92,9 @@ static void nv_list_free(nv_list *list) {
   *list = (nv_list){};
 }
 
+/* Appends application metadata to `list`. A zero key_len or value_len means the string is
+ * NUL-terminated. Rejects null keys or values, empty keys and pseudo-headers (":...") with
+ * GRPC_ERR_INVALID. On error the entries already appended stay in the list. */
 static grpc_err nv_list_add_metadata(nv_list *list, const grpc_metadata *metadata, size_t count) {
   if (metadata == nullptr && count > 0)
     return GRPC_ERR_INVALID;
@@ -91,7 +114,9 @@ static grpc_err nv_list_add_metadata(nv_list *list, const grpc_metadata *metadat
   return GRPC_OK;
 }
 
-/* copies nva into a single allocation */
+/* Copies `nva` (the array and every name and value) into a single grpc_malloc() block, so one
+ * grpc_free() releases it. Names and values are not NUL-terminated in the copy. Returns nullptr
+ * on allocation failure. */
 static nghttp2_nv *nva_dup(const nghttp2_nv *nva, size_t nvlen) {
   size_t size = nvlen * sizeof(*nva);
   for (size_t i = 0; i < nvlen; i++)
@@ -114,12 +139,15 @@ static nghttp2_nv *nva_dup(const nghttp2_nv *nva, size_t nvlen) {
 
 /* ---- lifetime ------------------------------------------------------------------ */
 
+/* Frees the received messages that were not delivered to the application. */
 static void drop_pending(grpc_call *call) {
   grpc_message *msg;
   while ((msg = grpc_list_pop_front(&call->pending)) != nullptr)
     grpc_message_free(msg);
 }
 
+/* Releases everything the call owns, runs the userdata destructor and frees the call. Called
+ * only by grpc_call_unref() when the last reference goes away. */
 static void call_free(grpc_call *call) {
   drop_pending(call);
   grpc_message_free(call->request);
@@ -135,7 +163,9 @@ static void call_free(grpc_call *call) {
   grpc_free(call);
 }
 
-/* Retain nghttp2's header storage instead of copying every name and value. */
+/* Copies the stream's header table into the call and takes a reference on each nghttp2 rcbuf,
+ * so the names and values stay valid after the stream is freed without copying them. The
+ * references are dropped in call_free(). */
 static void retain_request_headers(grpc_call *call, const grpc_stream *stream) {
   for (size_t i = 0; i < stream->nb_headers; i++) {
     call->req_headers[i] = stream->headers[i];
@@ -147,6 +177,7 @@ static void retain_request_headers(grpc_call *call, const grpc_stream *stream) {
   call->nb_req_headers = stream->nb_headers;
 }
 
+/* Returns true if `alg` is identity or a codec compiled into this build. */
 static bool codec_is_supported(grpc_compression_algorithm alg) {
   switch (alg) {
   case GRPC_COMPRESS_IDENTITY:
@@ -175,6 +206,7 @@ static bool codec_is_supported(grpc_compression_algorithm alg) {
   }
 }
 
+/* Returns the grpc-encoding token of `alg`; unknown values map to "identity". */
 static const char *codec_token(grpc_compression_algorithm alg) {
   switch (alg) {
   case GRPC_COMPRESS_GZIP:
@@ -217,6 +249,10 @@ static bool client_accepts_encoding(const grpc_call *call, grpc_compression_algo
   return false;
 }
 
+/* Creates the call for a stream whose request HEADERS were accepted. Runs on the server thread
+ * from the nghttp2 headers callback. The returned call holds one reference, owned by the stream
+ * and dropped by call_detach(). Applies the server's default compression if the client accepts
+ * it. Returns nullptr on allocation failure. */
 grpc_call *call_new(grpc_session *session, grpc_stream *stream) {
   grpc_call *call = grpc_calloc(1, sizeof(*call));
   if (call == nullptr)
@@ -249,17 +285,24 @@ grpc_call *call_new(grpc_session *session, grpc_stream *stream) {
   return call;
 }
 
+/* Relaxed ordering suffices: the caller already holds a reference, so the count cannot reach
+ * zero concurrently. */
 GRPC_API grpc_call *grpc_call_ref(grpc_call *call) {
   if (call != nullptr)
     atomic_fetch_add_explicit(&call->refs, 1, memory_order_relaxed);
   return call;
 }
 
+/* acq_rel makes all writes made under other references visible to the thread that frees the
+ * call. */
 GRPC_API void grpc_call_unref(grpc_call *call) {
   if (call != nullptr && atomic_fetch_sub_explicit(&call->refs, 1, memory_order_acq_rel) == 1)
     call_free(call);
 }
 
+/* Appends the call to the server's ready queue, unless it is already queued, so that the next
+ * server_dispatch() delivers what is new. The queue holds a reference, dropped after dispatch.
+ * Server thread only. */
 void call_queue(grpc_call *call) {
   if (call->queued)
     return;
@@ -274,6 +317,7 @@ void call_queue(grpc_call *call) {
   server->ready_tail = call;
 }
 
+/* Counts the call once in the server's ok/error statistics. */
 static void call_record_done_stat(grpc_call *call, grpc_status status) {
   if (call->stats_done)
     return;
@@ -284,6 +328,8 @@ static void call_record_done_stat(grpc_call *call, grpc_status status) {
     atomic_fetch_add(&call->server->stat_calls_error, 1);
 }
 
+/* Marks the call cancelled (once), records the statistics, runs the on_done interceptors and
+ * queues the call so that dispatch delivers the cancellation to the application. */
 static void call_cancel(grpc_call *call, grpc_status reason) {
   if (call->cancelled)
     return;
@@ -294,6 +340,9 @@ static void call_cancel(grpc_call *call, grpc_status reason) {
   call_queue(call);
 }
 
+/* Detaches the call from its stream, which is going away (stream closed or connection lost).
+ * An unfinished call is cancelled with `reason`. Drops the stream's reference, so the call may be
+ * freed here unless the application or the ready queue still holds one. Idempotent. */
 void call_detach(grpc_call *call, grpc_status reason) {
   if (call->closed)
     return;
@@ -307,7 +356,9 @@ void call_detach(grpc_call *call, grpc_status reason) {
 
 /* ---- responses ---------------------------------------------------------------- */
 
-/* percent-encodes a grpc-message, as the gRPC HTTP/2 protocol requires */
+/* Percent-encodes a grpc-message, as the gRPC HTTP/2 protocol requires: bytes outside
+ * 0x20..0x7e and '%' itself become %XX. Returns a grpc_malloc()'d NUL-terminated string and
+ * stores its length in *len, or nullptr on allocation failure. */
 static char *encode_grpc_message(const char *message, size_t *len) {
   size_t n = 0;
   for (const u8 *p = (const u8 *)message; *p; p++)
@@ -331,13 +382,17 @@ static char *encode_grpc_message(const char *message, size_t *len) {
   return out;
 }
 
-/* submits the response HEADERS: the fixed headers, the application's
- * metadata and `extra` (the trailers of a Trailers-Only response) */
-/* String literals keep the nghttp2 name and value lengths at compile time. */
+/* Builds an nghttp2_nv from two string literals, so sizeof() gives their lengths at compile
+ * time. */
 #define NGHTTP2_NV(name, value)                                                             \
   ((nghttp2_nv){(uint8_t *)(name), (uint8_t *)(value), sizeof(name) - 1, sizeof(value) - 1, \
                 NGHTTP2_NV_FLAG_NONE})
 
+/* Submits the response HEADERS: :status, content-type (grpc, grpc-web or grpc-web-text),
+ * grpc-accept-encoding with the codecs compiled in, grpc-encoding unless call->compression is
+ * identity, the CORS headers for gRPC-Web, the application's metadata and `extra` (the trailers of
+ * a Trailers-Only response, sent with NGHTTP2_FLAG_END_STREAM in `flags`). On success marks the
+ * headers as sent and frees call->headers. Requires a live stream. */
 static grpc_err submit_response_headers(grpc_call *call, uint8_t flags, const nghttp2_nv *extra,
                                         size_t nb_extra) {
 #if defined(GRPC_ENABLE_ZLIB)
@@ -417,6 +472,16 @@ static grpc_err submit_response_headers(grpc_call *call, uint8_t flags, const ng
 
 #undef NGHTTP2_NV
 
+/* Ends the call: sends grpc-status, grpc-message (defaulting to the status name when `message`
+ * is null and the status is not OK) and the application's trailers. Depending on what was sent:
+ *  - gRPC-Web: the trailers go in a final DATA frame flagged 0x80 (base64 for grpc-web-text);
+ *  - no headers yet: one Trailers-Only HEADERS frame;
+ *  - DATA still queued: the trailers are stored on the stream for the data provider to submit
+ *    after the last message, so they cannot overtake it;
+ *  - otherwise: a trailing HEADERS frame right away.
+ * On success marks the call finished, disarms the deadline, schedules a flush and runs the
+ * on_done interceptors. Does not check `finished`; callers do. Returns GRPC_ERR_CLOSED if the
+ * stream is gone. */
 static grpc_err call_finish_internal(grpc_call *call, grpc_status status, const char *message) {
   if (call->stream == nullptr)
     return GRPC_ERR_CLOSED;
@@ -542,6 +607,9 @@ static grpc_err call_finish_internal(grpc_call *call, grpc_status status, const 
   return GRPC_OK;
 }
 
+/* Ends the call from inside the library (e.g. deadline exceeded, malformed request) with
+ * `status`, then cancels it so the application learns the call is over. No-op if the call is
+ * already finished or closed. */
 void call_abort(grpc_call *call, grpc_status status, const char *message) {
   if (call->finished || call->closed)
     return;
@@ -549,6 +617,8 @@ void call_abort(grpc_call *call, grpc_status status, const char *message) {
   call_cancel(call, status);
 }
 
+/* Returns GRPC_OK if the application may still respond on the call, or the error explaining
+ * why not. */
 static grpc_err call_check(const grpc_call *call) {
   if (call == nullptr)
     return GRPC_ERR_INVALID;
@@ -559,6 +629,9 @@ static grpc_err call_check(const grpc_call *call) {
   return GRPC_OK;
 }
 
+/* Only records the codec in auto_compression; grpc_call_send() applies it to each uncompressed
+ * message. Silently falls back to identity when the client did not list the codec in
+ * grpc-accept-encoding. */
 GRPC_API grpc_err grpc_call_set_compression(grpc_call *call, grpc_compression_algorithm algorithm,
                                             int level) {
   grpc_err err = call_check(call);
@@ -578,6 +651,8 @@ GRPC_API grpc_err grpc_call_set_compression(grpc_call *call, grpc_compression_al
   return GRPC_OK;
 }
 
+/* Buffers the metadata in call->headers; it goes out with the response HEADERS, sent by the first
+ * message or by the status. Fails with GRPC_ERR_STATE once the headers are sent. */
 GRPC_API grpc_err grpc_call_send_metadata(grpc_call *call, const grpc_metadata *metadata,
                                           size_t count) {
   grpc_err err = call_check(call);
@@ -589,6 +664,7 @@ GRPC_API grpc_err grpc_call_send_metadata(grpc_call *call, const grpc_metadata *
   return nv_list_add_metadata(&call->headers, metadata, count);
 }
 
+/* Buffers the trailers in call->trailers until call_finish_internal() sends them. */
 GRPC_API grpc_err grpc_call_add_trailers(grpc_call *call, const grpc_metadata *metadata,
                                          size_t count) {
   grpc_err err = call_check(call);
@@ -597,6 +673,13 @@ GRPC_API grpc_err grpc_call_add_trailers(grpc_call *call, const grpc_metadata *m
   return nv_list_add_metadata(&call->trailers, metadata, count);
 }
 
+/* Takes ownership of `message` and frees it on every error path. In order: enforces
+ * max_send_queue_bytes (rejecting only when something is already queued, so one oversized
+ * message can still go out), runs the on_send interceptors, applies auto compression, sends the
+ * response HEADERS with the first message (fixing grpc-encoding for the rest of the call), wraps
+ * the frame in base64 for grpc-web-text, then queues the message on the stream and starts the
+ * nghttp2 data provider if it is idle. Sets was_backpressured so that the writable callback fires
+ * once the queue drains. */
 GRPC_API grpc_err grpc_call_send(grpc_call *call, grpc_message *message) {
   grpc_err err = message != nullptr ? call_check(call) : GRPC_ERR_INVALID;
   if (err != GRPC_OK) {
@@ -689,6 +772,7 @@ GRPC_API grpc_err grpc_call_send(grpc_call *call, grpc_message *message) {
   return GRPC_OK;
 }
 
+/* Copies `data` into a new message and sends it with grpc_call_send(). */
 GRPC_API grpc_err grpc_call_send_data(grpc_call *call, const void *data, size_t len) {
   if (call == nullptr || (data == nullptr && len > 0))
     return GRPC_ERR_INVALID;
@@ -698,6 +782,7 @@ GRPC_API grpc_err grpc_call_send_data(grpc_call *call, const void *data, size_t 
   return grpc_call_send(call, message);
 }
 
+/* grpc_call_send() followed by an OK grpc_call_finish(). */
 GRPC_API grpc_err grpc_call_reply(grpc_call *call, grpc_message *message) {
   grpc_err err = grpc_call_send(call, message);
   if (err != GRPC_OK)
@@ -705,6 +790,7 @@ GRPC_API grpc_err grpc_call_reply(grpc_call *call, grpc_message *message) {
   return grpc_call_finish(call, GRPC_STATUS_OK, nullptr);
 }
 
+/* grpc_call_send_data() followed by an OK grpc_call_finish(). */
 GRPC_API grpc_err grpc_call_reply_data(grpc_call *call, const void *data, size_t len) {
   grpc_err err = grpc_call_send_data(call, data, len);
   if (err != GRPC_OK)
@@ -712,6 +798,7 @@ GRPC_API grpc_err grpc_call_reply_data(grpc_call *call, const void *data, size_t
   return grpc_call_finish(call, GRPC_STATUS_OK, nullptr);
 }
 
+/* Checks that the call can still respond, then ends it with call_finish_internal(). */
 GRPC_API grpc_err grpc_call_finish(grpc_call *call, grpc_status status, const char *message) {
   grpc_err err = call_check(call);
   if (err != GRPC_OK)
@@ -721,24 +808,31 @@ GRPC_API grpc_err grpc_call_finish(grpc_call *call, grpc_status status, const ch
 
 /* ---- accessors ---------------------------------------------------------------- */
 
+/* Returns the unary request; nullptr for streaming calls or before it was delivered. */
 GRPC_API const grpc_message *grpc_call_request(const grpc_call *call) {
   return call != nullptr ? call->request : nullptr;
 }
 
+/* Returns the request :path for calls routed to the fallback handler, else the route's path. */
 GRPC_API const char *grpc_call_method(const grpc_call *call) {
   if (call == nullptr)
     return nullptr;
   return call->method_override != nullptr ? call->method_override : call->route->path;
 }
 
+/* Returns the peer address copied from the session when the call was created. */
 GRPC_API const char *grpc_call_peer(const grpc_call *call) {
   return call != nullptr ? call->peer : nullptr;
 }
 
+/* Returns the TLS client certificate subject, or nullptr when there is none. */
 GRPC_API const char *grpc_call_peer_cert_subject(const grpc_call *call) {
   return call != nullptr && call->peer_cert_subject[0] != '\0' ? call->peer_cert_subject : nullptr;
 }
 
+/* Linear, case-insensitive search of the request headers from *index. On a match sets *index
+ * past it; otherwise sets *index to the end so further calls return nullptr. The returned value
+ * is backed by an nghttp2 rcbuf and lives as long as the call. */
 GRPC_API const char *grpc_call_metadata_next(const grpc_call *call, const char *key, size_t *index,
                                              size_t *len) {
   if (call == nullptr || key == nullptr || index == nullptr)
@@ -757,15 +851,18 @@ GRPC_API const char *grpc_call_metadata_next(const grpc_call *call, const char *
   return nullptr;
 }
 
+/* Returns the first request header named `key`. */
 GRPC_API const char *grpc_call_metadata(const grpc_call *call, const char *key, size_t *len) {
   size_t idx = 0;
   return grpc_call_metadata_next(call, key, &idx, len);
 }
 
+/* Returns the number of retained request headers, pseudo-headers included. */
 GRPC_API size_t grpc_call_metadata_count(const grpc_call *call) {
   return call != nullptr ? call->nb_req_headers : 0;
 }
 
+/* Fills *out with the request header at `index`, borrowing the call's storage. */
 GRPC_API bool grpc_call_metadata_at(const grpc_call *call, size_t index, grpc_metadata *out) {
   if (call == nullptr || out == nullptr || index >= call->nb_req_headers)
     return false;
@@ -779,6 +876,8 @@ GRPC_API bool grpc_call_metadata_at(const grpc_call *call, size_t index, grpc_me
   return true;
 }
 
+/* Returns the milliseconds left before the grpc-timeout deadline, 0 once it passed, or -1 when
+ * the client set none. */
 GRPC_API int64_t grpc_call_deadline(const grpc_call *call) {
   if (call == nullptr || call->deadline_ms == 0)
     return -1;
@@ -786,18 +885,23 @@ GRPC_API int64_t grpc_call_deadline(const grpc_call *call) {
   return now >= call->deadline_ms ? 0 : (int64_t)(call->deadline_ms - now);
 }
 
+/* Returns the cancelled flag set by call_cancel(). */
 GRPC_API bool grpc_call_is_cancelled(const grpc_call *call) {
   return call != nullptr && call->cancelled;
 }
 
+/* Returns the cancellation status, or GRPC_STATUS_OK if the call is not cancelled. */
 GRPC_API grpc_status grpc_call_cancel_reason(const grpc_call *call) {
   return call != nullptr && call->cancelled ? call->cancel_reason : GRPC_STATUS_OK;
 }
 
+/* Returns the server the call belongs to. */
 GRPC_API grpc_server *grpc_call_server(const grpc_call *call) {
   return call != nullptr ? call->server : nullptr;
 }
 
+/* Replaces the userdata, running the previous destructor unless the same pointer is set
+ * again. The last destructor runs in call_free(). */
 GRPC_API void grpc_call_set_userdata(grpc_call *call, void *data, void (*free_fn)(void *data)) {
   if (call == nullptr)
     return;
@@ -807,10 +911,13 @@ GRPC_API void grpc_call_set_userdata(grpc_call *call, void *data, void (*free_fn
   call->userdata_free = free_fn;
 }
 
+/* Returns the userdata set with grpc_call_set_userdata(). */
 GRPC_API void *grpc_call_userdata(const grpc_call *call) {
   return call != nullptr ? call->userdata : nullptr;
 }
 
+/* Registers the cancel callback, replacing any previous one (including a stream route's
+ * on_cancel, installed when dispatch starts the call). */
 GRPC_API void grpc_call_on_cancel(grpc_call *call, void (*fn)(grpc_call *call, void *userdata),
                                   void *userdata) {
   if (call == nullptr)
@@ -819,10 +926,13 @@ GRPC_API void grpc_call_on_cancel(grpc_call *call, void (*fn)(grpc_call *call, v
   call->cancel_userdata = userdata;
 }
 
+/* Returns the bytes queued on the stream and not yet handed to nghttp2; 0 once detached. */
 GRPC_API size_t grpc_call_send_queue_bytes(const grpc_call *call) {
   return call != nullptr && call->stream != nullptr ? call->stream->queued_send_bytes : 0;
 }
 
+/* Returns true while the call can respond and its send queue is below max_send_queue_bytes
+ * (always, when the limit is 0). */
 GRPC_API bool grpc_call_is_writable(const grpc_call *call) {
   if (call == nullptr || call->stream == nullptr || call->finished || call->closed)
     return false;
@@ -830,6 +940,8 @@ GRPC_API bool grpc_call_is_writable(const grpc_call *call) {
   return max_q == 0 || call->stream->queued_send_bytes < max_q;
 }
 
+/* Registers the callback the data provider runs when a backpressured send queue drains below
+ * the limit. */
 GRPC_API void grpc_call_on_writable(grpc_call *call, void (*fn)(grpc_call *call, void *userdata),
                                     void *userdata) {
   if (call == nullptr)
@@ -838,10 +950,12 @@ GRPC_API void grpc_call_on_writable(grpc_call *call, void (*fn)(grpc_call *call,
   call->writable_userdata = userdata;
 }
 
+/* Returns true for the characters W3C traceparent allows in hex fields: 0-9 and a-f. */
 static bool is_hex_lower_or_digit(char c) {
   return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
 }
 
+/* Returns the value of a lowercase hex digit, or -1. */
 static int hex_val(char c) {
   if (c >= '0' && c <= '9')
     return c - '0';
@@ -850,6 +964,9 @@ static int hex_val(char c) {
   return -1;
 }
 
+/* Parses a version-00 W3C traceparent header, rejecting uppercase hex and all-zero trace or span
+ * ids. *out is zeroed up front and again on the final validity check, but a non-hex character
+ * returns early and leaves the digits copied so far in *out (valid stays false). */
 GRPC_API bool grpc_call_trace_context(const grpc_call *call, grpc_trace_context *out) {
   if (out != nullptr)
     memset(out, 0, sizeof(*out));
@@ -890,6 +1007,7 @@ GRPC_API bool grpc_call_trace_context(const grpc_call *call, grpc_trace_context 
   return true;
 }
 
+/* Formats a version-00 traceparent; `buf` needs room for 55 characters and the NUL. */
 GRPC_API grpc_err grpc_traceparent_format(const grpc_trace_context *ctx, char *buf,
                                           size_t buf_len) {
   if (ctx == nullptr || buf == nullptr || buf_len < 56 || !ctx->valid)
@@ -921,6 +1039,8 @@ struct async_op {
   size_t metadata_count;
 };
 
+/* Frees an op and the copies it owns (metadata strings, finish message). The message is not
+ * freed here: run_async_op() hands it to the call, post_async_op() frees it on failure. */
 static void async_op_free(async_op *op) {
   if (op == nullptr)
     return;
@@ -933,6 +1053,9 @@ static void async_op_free(async_op *op) {
   grpc_free(op);
 }
 
+/* Server-thread side of the *_async functions: replays the synchronous call function, which
+ * takes ownership of op->message, then drops the reference taken by post_async_op(). Errors
+ * are ignored; there is no one to report them to. */
 static void run_async_op(void *arg) {
   async_op *op = arg;
   switch (op->kind) {
@@ -956,6 +1079,8 @@ static void run_async_op(void *arg) {
   async_op_free(op);
 }
 
+/* Takes a reference on the call for the op and posts it to the server thread. On failure
+ * releases the reference, the message and the op, so the caller owns nothing afterwards. */
 static grpc_err post_async_op(async_op *op) {
   /* the caller holds a reference, so the call is alive to take another */
   grpc_call_ref(op->call);
@@ -968,6 +1093,9 @@ static grpc_err post_async_op(async_op *op) {
   return err;
 }
 
+/* Validates and deep-copies `metadata` (the caller's strings may go away once this returns),
+ * then posts a send-metadata or add-trailers op. Validation matches nv_list_add_metadata() so
+ * that bad input is reported to the caller instead of being dropped on the server thread. */
 static grpc_err post_async_metadata(grpc_call *call, async_op_kind kind,
                                     const grpc_metadata *metadata, size_t count) {
   if (call == nullptr || (metadata == nullptr && count > 0))
@@ -1012,16 +1140,19 @@ static grpc_err post_async_metadata(grpc_call *call, async_op_kind kind,
   return post_async_op(op);
 }
 
+/* Posts grpc_call_send_metadata() with a copy of `metadata`. */
 GRPC_API grpc_err grpc_call_send_metadata_async(grpc_call *call, const grpc_metadata *metadata,
                                                 size_t count) {
   return post_async_metadata(call, ASYNC_OP_METADATA, metadata, count);
 }
 
+/* Posts grpc_call_add_trailers() with a copy of `metadata`. */
 GRPC_API grpc_err grpc_call_add_trailers_async(grpc_call *call, const grpc_metadata *metadata,
                                                size_t count) {
   return post_async_metadata(call, ASYNC_OP_TRAILERS, metadata, count);
 }
 
+/* Posts grpc_call_send(). Takes ownership of `message`, freeing it on every error. */
 GRPC_API grpc_err grpc_call_send_async(grpc_call *call, grpc_message *message) {
   if (call == nullptr || message == nullptr) {
     grpc_message_free(message);
@@ -1038,6 +1169,7 @@ GRPC_API grpc_err grpc_call_send_async(grpc_call *call, grpc_message *message) {
   return post_async_op(op);
 }
 
+/* Copies `data` into a message and posts it with grpc_call_send_async(). */
 GRPC_API grpc_err grpc_call_send_data_async(grpc_call *call, const void *data, size_t len) {
   if (call == nullptr || (data == nullptr && len > 0))
     return GRPC_ERR_INVALID;
@@ -1047,6 +1179,7 @@ GRPC_API grpc_err grpc_call_send_data_async(grpc_call *call, const void *data, s
   return grpc_call_send_async(call, message);
 }
 
+/* Posts grpc_call_reply(). Takes ownership of `message`, freeing it on every error. */
 GRPC_API grpc_err grpc_call_reply_async(grpc_call *call, grpc_message *message) {
   if (call == nullptr || message == nullptr) {
     grpc_message_free(message);
@@ -1063,6 +1196,7 @@ GRPC_API grpc_err grpc_call_reply_async(grpc_call *call, grpc_message *message) 
   return post_async_op(op);
 }
 
+/* Posts grpc_call_finish() with a copy of `message`. */
 GRPC_API grpc_err grpc_call_finish_async(grpc_call *call, grpc_status status, const char *message) {
   if (call == nullptr)
     return GRPC_ERR_INVALID;
@@ -1081,6 +1215,8 @@ GRPC_API grpc_err grpc_call_finish_async(grpc_call *call, grpc_status status, co
 
 /* ---- dispatch ------------------------------------------------------------------ */
 
+/* Appends an event for grpc_server_events(), taking a reference on the call and ownership of
+ * `message`. If the array cannot grow, logs and drops the event (freeing the message). */
 static void push_event(grpc_server *server, grpc_event_type type, grpc_call *call,
                        grpc_message *message) {
   if (server->nb_events == server->cap_events) {
@@ -1102,6 +1238,8 @@ static void push_event(grpc_server *server, grpc_event_type type, grpc_call *cal
   };
 }
 
+/* Releases the events returned by the previous poll: frees their messages and drops their call
+ * references. Called at the start of each grpc_server_poll() and on server shutdown. */
 void server_clear_events(grpc_server *server) {
   for (size_t i = 0; i < server->nb_events; i++) {
     grpc_message_free((grpc_message *)server->events[i].message);
@@ -1110,6 +1248,9 @@ void server_clear_events(grpc_server *server) {
   server->nb_events = 0;
 }
 
+/* Delivers a unary call once the client half-closed: exactly one request message is required,
+ * otherwise the call ends with INTERNAL. The request stays owned by the call (call->request), so
+ * the handler may keep using it while it holds a reference. */
 static void dispatch_unary(grpc_call *call) {
   if (call->finished || call->closed) {
     drop_pending(call);
@@ -1134,6 +1275,9 @@ static void dispatch_unary(grpc_call *call) {
   call->route->handler(call, call->request, call->route->userdata);
 }
 
+/* Delivers the pending messages of a streaming call to on_message (each freed after the
+ * callback returns), then on_end once the client half-closed. Stops as soon as the call is
+ * finished, discarding the rest. */
 static void dispatch_stream(grpc_call *call) {
   const grpc_stream_handler *handler = &call->route->stream;
   grpc_message *msg;
@@ -1155,6 +1299,9 @@ static void dispatch_stream(grpc_call *call) {
   }
 }
 
+/* Event-route counterpart of dispatch_stream(): turns pending messages, half-close and
+ * cancellation into grpc_event entries (the events own the messages) and runs the cancel
+ * callback once. */
 static void dispatch_events(grpc_call *call) {
   grpc_server *server = call->server;
   grpc_message *msg;
@@ -1178,6 +1325,11 @@ static void dispatch_events(grpc_call *call) {
   }
 }
 
+/* Delivers what is new on one call. On first dispatch starts it: installs the stream route's
+ * on_cancel, runs the on_call interceptors (a rejection finishes the call and discards all
+ * further input) and runs on_start. Calls cancelled before starting are dropped without the
+ * application ever seeing them. Finally runs the cancel callback once the application has seen
+ * the call (event routes do this in dispatch_events()). */
 static void dispatch_call(grpc_call *call) {
   if (!call->started) {
     /* cancelled before the application saw it */
@@ -1223,6 +1375,9 @@ static void dispatch_call(grpc_call *call) {
   }
 }
 
+/* Dispatches every call on the ready queue and drops the queue's reference on each. Server thread
+ * only; handlers may queue calls again while this runs, and those are dispatched in the same
+ * pass. */
 void server_dispatch(grpc_server *server) {
   grpc_call *call;
   while ((call = server->ready_head) != nullptr) {
@@ -1236,6 +1391,7 @@ void server_dispatch(grpc_server *server) {
   }
 }
 
+/* Empties the ready queue without dispatching, dropping its references. Used on shutdown. */
 void server_drop_ready(grpc_server *server) {
   grpc_call *call;
   while ((call = server->ready_head) != nullptr) {

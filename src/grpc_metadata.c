@@ -1,3 +1,11 @@
+/* grpc_metadata.c - Base64 codec for binary ("-bin") metadata values
+ *
+ * gRPC carries binary metadata values Base64-encoded in HTTP/2 headers whose key ends in "-bin".
+ * The encoder always emits padded standard Base64; the decoder is lenient and accepts padded or
+ * unpadded input. Both return buffers from grpc_malloc that the caller must release with
+ * grpc_free (not libc free: on MSVC the default allocator uses _aligned_malloc/_aligned_free).
+ */
+
 #include <stdlib.h>
 #include <string.h>
 #include "internal/grpc_platform.h"
@@ -5,8 +13,12 @@
 #include "grpc_mem.h"
 #include "core.h"
 
+/* standard Base64 alphabet (RFC 4648 section 4), not the URL-safe variant */
 static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+/* Encodes in_len bytes as padded standard Base64 into a NUL-terminated grpc_malloc buffer and
+ * stores the encoded length (without the NUL) in *out_len when out_len is non-null. Returns
+ * nullptr if data is null or allocation fails. */
 GRPC_API char *grpc_metadata_encode_bin(const uint8_t *data, size_t in_len, size_t *out_len) {
   if (data == nullptr) {
     return nullptr;
@@ -39,6 +51,7 @@ GRPC_API char *grpc_metadata_encode_bin(const uint8_t *data, size_t in_len, size
   return out;
 }
 
+/* Maps a Base64 alphabet character to its 6-bit value, or returns -1 for any other byte. */
 static inline int b64_char_val(char c) {
   if (c >= 'A' && c <= 'Z')
     return c - 'A';
@@ -53,6 +66,12 @@ static inline int b64_char_val(char c) {
   return -1;
 }
 
+/* Decodes Base64 text into a grpc_malloc buffer and stores the decoded length in *out_len when
+ * out_len is non-null. Trailing '=', space and newline characters are stripped, and any other
+ * non-alphabet byte is skipped rather than rejected, so malformed input decodes to whatever
+ * valid characters it contains; leftover bits of an incomplete final group are dropped. Empty
+ * input yields a 1-byte allocation with *out_len set to 0. Returns nullptr only if base64_str is
+ * null or allocation fails. */
 GRPC_API uint8_t *grpc_metadata_decode_bin(const char *base64_str, size_t in_len, size_t *out_len) {
   if (base64_str == nullptr) {
     return nullptr;

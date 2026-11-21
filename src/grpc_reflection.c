@@ -1,3 +1,18 @@
+/* grpc_reflection.c - the gRPC server reflection service (v1 and v1alpha)
+ *
+ * Serves ServerReflectionInfo on both the v1 and v1alpha paths with the same stream handler.
+ * Each request message gets one response: list_services answers with the services of the
+ * enabled routes (plus the v1alpha reflection service itself), file_by_filename and
+ * file_containing_symbol answer with a FileDescriptorProto registered through
+ * grpc_reflection_add_file_descriptor(), or a NOT_FOUND error_response. Other request kinds are
+ * not supported. The stream is finished when the client half-closes.
+ *
+ * Protobuf is parsed and built by hand with single-byte tags. Descriptors are copied into a
+ * per-server reflection_state owned by the server and freed with it; the state is not
+ * synchronized, so register descriptors before the server runs. Symbols and service names are
+ * limited to MAX_SYMBOL_LEN - 1 bytes.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +33,7 @@ struct reflection_state {
   size_t nb_entries;
 };
 
+/* Returns the number of bytes `val` takes as a protobuf varint. */
 static size_t varint_size(uint64_t val) {
   size_t size = 0;
   do {
@@ -27,6 +43,8 @@ static size_t varint_size(uint64_t val) {
   return size;
 }
 
+/* Writes `val` as a protobuf varint to `buf`, which must have room for varint_size(val) bytes.
+ * Returns the number of bytes written. */
 static size_t write_varint(uint8_t *buf, uint64_t val) {
   size_t len = 0;
   do {
@@ -39,6 +57,8 @@ static size_t write_varint(uint8_t *buf, uint64_t val) {
   return len;
 }
 
+/* Reads a protobuf varint at *seek, advancing it, without reading past `len`. A truncated or
+ * overlong varint is not reported; the bits read so far are returned. */
 static uint64_t read_varint(const uint8_t *buf, size_t len, size_t *seek) {
   uint64_t val = 0;
   size_t shift = 0;
@@ -52,12 +72,14 @@ static uint64_t read_varint(const uint8_t *buf, size_t len, size_t *seek) {
   return val;
 }
 
+/* Returns the server's reflection state, creating it on first use; nullptr if out of memory. */
 static struct reflection_state *reflection_state_get(grpc_server *server) {
   if (server->reflection == nullptr)
     server->reflection = grpc_calloc(1, sizeof(*server->reflection));
   return server->reflection;
 }
 
+/* Frees the reflection state and its descriptor copies when the server is freed. */
 void reflection_free(grpc_server *server) {
   struct reflection_state *state = server->reflection;
   if (state == nullptr)
@@ -69,6 +91,8 @@ void reflection_free(grpc_server *server) {
   server->reflection = nullptr;
 }
 
+/* Copies `descriptor`; the key is truncated to MAX_SYMBOL_LEN - 1 bytes. Does not require
+ * grpc_reflection_enable() first, and duplicate keys are kept (the first match wins). */
 GRPC_API grpc_err grpc_reflection_add_file_descriptor(grpc_server *server,
                                                       const char *symbol_or_filename,
                                                       const uint8_t *descriptor, size_t len) {
@@ -98,6 +122,9 @@ GRPC_API grpc_err grpc_reflection_add_file_descriptor(grpc_server *server,
   return GRPC_OK;
 }
 
+/* Fills `services` with the distinct service names ("pkg.Service" of "/pkg.Service/Method") of
+ * the enabled routes, skipping names of MAX_SYMBOL_LEN bytes or more, and adds the v1alpha
+ * reflection service if missing. Stops at `max_services`. Returns the count. */
 static size_t collect_services(grpc_server *server, char services[][MAX_SYMBOL_LEN],
                                size_t max_services) {
   size_t count = 0;
@@ -151,6 +178,9 @@ static size_t collect_services(grpc_server *server, char services[][MAX_SYMBOL_L
   return count;
 }
 
+/* Serializes a ServerReflectionResponse with original_request (field 2, when non-empty) and
+ * list_services_response (field 6) naming `services`. Returns a grpc_malloc()'d buffer and its
+ * length in *out_resp_len, or nullptr on allocation failure. */
 static uint8_t *build_list_services_response(const char services[][MAX_SYMBOL_LEN],
                                              size_t nb_services, const uint8_t *orig_req,
                                              size_t orig_req_len, size_t *out_resp_len) {
@@ -206,7 +236,12 @@ static uint8_t *build_list_services_response(const char services[][MAX_SYMBOL_LE
   return buf;
 }
 
-/* one ServerReflectionRequest of the stream: answer it */
+/* on_message handler: answers one ServerReflectionRequest. Scans the request for
+ * list_services (field 7) and file_by_filename / file_containing_symbol (fields 3 and 4); a
+ * request of at most two bytes with no file query is treated as list_services. A file query is
+ * matched against the registered keys by substring in either direction, so the first key that
+ * contains the query, or is contained in it, wins. Requests matching nothing get no response.
+ * Every response echoes the request as original_request. `userdata` is the server. */
 static void reflection_on_message(grpc_call *call, const grpc_message *in_msg, void *userdata) {
   grpc_server *server = userdata;
   struct reflection_state *state = server->reflection;
@@ -330,11 +365,13 @@ static void reflection_on_message(grpc_call *call, const grpc_message *in_msg, v
   }
 }
 
-/* the client closed its side of the stream */
+/* on_end handler: the client closed its side of the stream, so end the call with OK. */
 static void reflection_on_end(grpc_call *call, [[maybe_unused]] void *userdata) {
   (void)grpc_call_finish(call, GRPC_STATUS_OK, nullptr);
 }
 
+/* Creates the reflection state and registers the stream handler on the v1alpha and v1 paths,
+ * with the server as userdata. If the v1 registration fails, the v1alpha one stays. */
 GRPC_API grpc_err grpc_reflection_enable(grpc_server *server) {
   if (server == nullptr)
     return GRPC_ERR_INVALID;

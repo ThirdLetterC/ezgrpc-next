@@ -1,5 +1,12 @@
 #pragma once
 
+/* grpc_defs.h - portability definitions shared by every public header
+ *
+ * Provides GRPC_API (symbol export), GRPC_NODISCARD, grpc_max_align_t, and C23 spellings
+ * (nullptr, alignas, alignof, static_assert) for compilers that lack them. Included by all other
+ * headers; applications rarely need it directly.
+ */
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -21,6 +28,7 @@ typedef max_align_t grpc_max_align_t;
 #endif
 #endif
 
+/* Marks exported library functions. May be predefined by the build. */
 #ifndef GRPC_API
 #ifdef _WIN32
 #define GRPC_API
@@ -29,6 +37,7 @@ typedef max_align_t grpc_max_align_t;
 #endif
 #endif
 
+/* Warns when the result of a function (typically an allocation) is ignored. */
 #ifndef GRPC_NODISCARD
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
 #define GRPC_NODISCARD [[nodiscard]]

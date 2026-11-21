@@ -1,3 +1,16 @@
+/* grpc_health.c - the grpc.health.v1.Health service (Check and Watch)
+ *
+ * Each server has a lazily created health_state: the overall status (the "" service) and a list
+ * of per-service statuses. Services not in the list report SERVING. Statuses can be set from any
+ * thread, so they are guarded by a mutex; the list of Watch streams is touched only on the
+ * server thread. A status change posts notify_watchers_on_loop() to the server thread, which
+ * sends the new status to every watcher whose service status changed.
+ *
+ * Requests and responses are encoded by hand: HealthCheckRequest is parsed for field 1
+ * (service), and HealthCheckResponse is the two bytes {0x08, status}. Service names are
+ * truncated to MAX_SERVICE_NAME_LEN - 1 bytes.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +41,9 @@ struct health_state {
   health_watcher *watchers;
 };
 
+/* Returns the server's health state, creating it (overall SERVING) on first use. The creation
+ * itself is not synchronized, so the first call must happen before other threads use the
+ * server. Returns nullptr on allocation failure. */
 static struct health_state *health_state_get(grpc_server *server) {
   if (server->health == nullptr) {
     struct health_state *health = grpc_calloc(1, sizeof(*health));
@@ -40,6 +56,8 @@ static struct health_state *health_state_get(grpc_server *server) {
   return server->health;
 }
 
+/* Frees the health state when the server is freed, dropping the reference each watcher holds on
+ * its call. */
 void health_free(grpc_server *server) {
   struct health_state *health = server->health;
   if (health == nullptr)
@@ -59,6 +77,9 @@ void health_free(grpc_server *server) {
   server->health = nullptr;
 }
 
+/* Posted to the server thread on a status change. Removes watchers whose call was cancelled
+ * (dropping their reference) and sends the current status to every other watcher whose service
+ * status differs from the last one it was sent. */
 static void notify_watchers_on_loop(void *arg) {
   grpc_server *server = arg;
   struct health_state *health = server->health;
@@ -83,6 +104,9 @@ static void notify_watchers_on_loop(void *arg) {
   }
 }
 
+/* An empty or null service sets the overall status. New names are added to the list (truncated
+ * to MAX_SERVICE_NAME_LEN - 1 bytes). Watchers are notified through grpc_server_post() only when
+ * the status actually changed and the server's async handle is up. */
 GRPC_API grpc_err grpc_health_set_status(grpc_server *server, const char *service,
                                          grpc_health_status status) {
   if (server == nullptr)
@@ -126,6 +150,9 @@ out:
   return err;
 }
 
+/* Returns UNKNOWN when health was never set up on the server, the overall status for an empty
+ * or null service, the registered status, or SERVING for an unregistered service. Takes the
+ * lock, so it is safe from any thread. */
 GRPC_API grpc_health_status grpc_health_get_status(grpc_server *server, const char *service) {
   if (server == nullptr || server->health == nullptr)
     return GRPC_HEALTH_UNKNOWN;
@@ -148,6 +175,9 @@ GRPC_API grpc_health_status grpc_health_get_status(grpc_server *server, const ch
   return res;
 }
 
+/* Extracts HealthCheckRequest.service (field 1) from the serialized request into `out_service`
+ * (truncated to max_len - 1 bytes, empty if absent or malformed). Skips varint and
+ * length-delimited fields; stops at any other wire type. Only single-byte tags are understood. */
 static void parse_health_request_service(const uint8_t *data, size_t len, char *out_service,
                                          size_t max_len) {
   out_service[0] = '\0';
@@ -202,6 +232,8 @@ static void parse_health_request_service(const uint8_t *data, size_t len, char *
 }
 
 /* /grpc.health.v1.Health/Check */
+/* Unary handler for /grpc.health.v1.Health/Check: replies with the service's status and OK.
+ * `userdata` is the server. */
 static void health_check(grpc_call *call, const grpc_message *request, void *userdata) {
   grpc_server *server = userdata;
   char service_name[MAX_SERVICE_NAME_LEN] = {};
@@ -218,6 +250,10 @@ static void health_check(grpc_call *call, const grpc_message *request, void *use
 }
 
 /* /grpc.health.v1.Health/Watch */
+/* on_message handler for /grpc.health.v1.Health/Watch: sends the current status of the
+ * requested service, then registers a watcher holding a call reference so later changes are
+ * streamed. The stream is never finished by the server; it ends when the client cancels.
+ * `userdata` is the server. */
 static void health_watch_message(grpc_call *call, const grpc_message *request, void *userdata) {
   grpc_server *server = userdata;
   struct health_state *health = server->health;
@@ -242,6 +278,9 @@ static void health_watch_message(grpc_call *call, const grpc_message *request, v
   health->watchers = w;
 }
 
+/* on_cancel handler for Watch: removes the call's first watcher and drops its reference. Any
+ * further watchers of the same call (one per request message) are pruned by
+ * notify_watchers_on_loop() or health_free(). */
 static void health_watch_cancel(grpc_call *call, void *userdata) {
   grpc_server *server = userdata;
   struct health_state *health = server->health;
@@ -260,6 +299,8 @@ static void health_watch_cancel(grpc_call *call, void *userdata) {
   }
 }
 
+/* Creates the health state and registers the Check (unary) and Watch (stream) handlers with
+ * the server as userdata. If registering Watch fails, Check is unregistered again. */
 GRPC_API grpc_err grpc_health_enable(grpc_server *server) {
   if (server == nullptr)
     return GRPC_ERR_INVALID;

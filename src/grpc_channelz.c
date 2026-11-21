@@ -1,6 +1,17 @@
+/* grpc_channelz.c - minimal grpc.channelz.v1 introspection service
+ *
+ * Implements GetServers and GetServerSockets as ordinary unary routes registered with
+ * grpc_server_handle, so they run on the thread polling the server and may read server state
+ * (sessions, stats) without locking. Responses are hand-encoded protobuf: only the few fields
+ * below are written, using varint and length-delimited wire types, so no protobuf runtime is
+ * needed. Request messages are ignored (no pagination or filtering): every response reports the
+ * single server and sets end = true.
+ */
+
 #include <string.h>
 #include "core.h"
 
+/* Returns the number of bytes v takes as a protobuf base-128 varint (1 to 10). */
 static size_t pb_varint_len(uint64_t v) {
   size_t n = 1;
   while (v >= 0x80) {
@@ -10,6 +21,8 @@ static size_t pb_varint_len(uint64_t v) {
   return n;
 }
 
+/* Writes v as a protobuf varint at buf (which must have room for 10 bytes) and returns the number
+ * of bytes written. */
 static size_t pb_write_varint(uint8_t *buf, uint64_t v) {
   size_t n = 0;
   while (v >= 0x80) {
@@ -20,11 +33,16 @@ static size_t pb_write_varint(uint8_t *buf, uint64_t v) {
   return n;
 }
 
-/* Encodes grpc.channelz.v1.GetServersResponse:
+/* Unary handler for GetServers; userdata is the grpc_server. Replies with one Server whose id is
+ * always 1 and whose counters come from grpc_server_get_stats (zero counters are omitted, as
+ * proto3 does). The nested messages are built in fixed stack buffers sized for the worst case.
+ *
+ * Encodes grpc.channelz.v1.GetServersResponse:
  *   repeated Server server = 1;
  *   bool end = 2;
  * Server { ServerRef ref = 1 { int64 server_id = 1; string name = 2; };
- *          ServerData data = 2 { int64 calls_started = 2; int64 calls_succeeded = 3; int64 calls_failed = 4; }; }
+ *          ServerData data = 2 { int64 calls_started = 2; int64 calls_succeeded = 3;
+ *                                int64 calls_failed = 4; }; }
  */
 static void channelz_get_servers(grpc_call *call, [[maybe_unused]] const grpc_message *request,
                                  void *userdata) {
@@ -87,7 +105,12 @@ static void channelz_get_servers(grpc_call *call, [[maybe_unused]] const grpc_me
   (void)grpc_call_reply_data(call, resp, resp_len);
 }
 
-/* Encodes grpc.channelz.v1.GetServerSocketsResponse:
+/* Unary handler for GetServerSockets; userdata is the grpc_server. Lists one SocketRef per active,
+ * non-closing session, using the session slot index + 1 as socket_id (so ids are reused after a
+ * connection closes) and the peer address as name. Sizes the response in a first pass, then
+ * encodes it into a grpc_malloc buffer; replies RESOURCE_EXHAUSTED if that allocation fails.
+ *
+ * Encodes grpc.channelz.v1.GetServerSocketsResponse:
  *   repeated SocketRef socket_ref = 1 { int64 socket_id = 1; string name = 2; };
  *   bool end = 2;
  */
@@ -134,6 +157,8 @@ static void channelz_get_server_sockets(grpc_call *call,
   grpc_free(resp);
 }
 
+/* Registers both Channelz routes with the server as userdata. If the second registration fails,
+ * the first is unregistered so the call is all-or-nothing. */
 GRPC_API grpc_err grpc_channelz_enable(grpc_server *server) {
   if (server == nullptr)
     return GRPC_ERR_INVALID;

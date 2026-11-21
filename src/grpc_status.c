@@ -1,7 +1,15 @@
+/* grpc_status.c - human-readable names for status and error codes
+ *
+ * Maps grpc_status (the gRPC status sent to peers in grpc-status) and grpc_err (the library's
+ * own API result codes) to static, lowercase English strings for logging. The strings have
+ * static storage duration and must not be freed.
+ */
+
 #include "core.h"
 #include "grpc_error.h"
 #include "grpc_status.h"
 
+/* Returns a static name for a gRPC status code, or "(null)" for values outside the enum. */
 GRPC_API const char *grpc_status_str(grpc_status status) {
   switch (status) {
   case GRPC_STATUS_OK:
@@ -43,6 +51,9 @@ GRPC_API const char *grpc_status_str(grpc_status status) {
   }
 }
 
+/* Returns a static description of a library error code, or "unknown error" for values outside
+ * the enum. The switch has no default case so the compiler can warn when a grpc_err value is
+ * added without a message here. */
 GRPC_API const char *grpc_strerror(grpc_err err) {
   switch (err) {
   case GRPC_OK:

@@ -1,3 +1,21 @@
+/* internal_nghttp2_callbacks.c - nghttp2 server callbacks: from HTTP/2 frames to gRPC calls
+ *
+ * nghttp2 runs these callbacks synchronously from nghttp2_session_mem_recv() and
+ * nghttp2_session_mem_send(), i.e. on the loop thread while internal_helpers.c feeds it received
+ * bytes or serializes output. A grpc_stream is created when a request's HEADERS begins, kept as
+ * nghttp2 stream user data and in the session's stream list, and freed when nghttp2 closes the
+ * stream. Request headers are not copied: the stream keeps references on nghttp2's rcbufs.
+ *
+ * Once the headers are complete the request is validated (content-type, :method, :scheme, te,
+ * route) and either answered directly (CORS preflight, 415, RST_STREAM, UNIMPLEMENTED) and then
+ * discarded, or turned into a grpc_call. DATA payload is buffered per stream, split into
+ * length-prefixed gRPC messages (decompressed per grpc-encoding, within max_message_size) and
+ * queued on the call; server_dispatch() delivers them after the loop iteration. Callbacks never
+ * write to the socket; they only submit frames, which the next flush sends.
+ *
+ * Return values follow nghttp2: 0 continues, NGHTTP2_ERR_CALLBACK_FAILURE (or any other nonzero
+ * value) aborts nghttp2_session_mem_recv()/mem_send(), and the connection is then closed.
+ */
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
@@ -12,6 +30,14 @@
 #include "internal_helpers.h"
 #include "internal_nghttp2_callbacks.h"
 
+/* Splits len bytes of the gRPC wire format (1-byte compressed flag, 4-byte big-endian length,
+ * payload) into messages. Stops at the first incomplete message and returns the number of bytes
+ * consumed by complete ones; the caller keeps the rest for the next DATA frame. *messages is
+ * allocated on the first complete message and stays nullptr otherwise; the caller owns it.
+ * Compressed messages (flag 1) are decompressed with encoding, limited to max_output bytes:
+ * exceeding it sets *too_large and returns 0 (the caller frees any messages already parsed),
+ * while any other decompression failure keeps the message as received, still flagged
+ * compressed. */
 static size_t parse_grpc_message(void *data, size_t len, grpc_compression_algorithm encoding,
                                  grpc_messages **messages, size_t max_output, bool *too_large) {
   i8 *wire = data;
@@ -69,6 +95,16 @@ static size_t parse_grpc_message(void *data, size_t len, grpc_compression_algori
 
 /* ----------- BEGIN NGHTTP2 CALLBACKS ------------------*/
 
+/* nghttp2 data source read callback, installed by grpc_call.c when it submits a response body.
+ * nghttp2 calls it from nghttp2_session_mem_send() whenever the stream may send a DATA frame,
+ * and it copies up to buf_len bytes of the stream's outgoing message queue into buf. Each
+ * message is written as its 5-byte prefix and payload, except cflag 0xFE messages (grpc-web-text
+ * output, already framed and base64 encoded) which are copied as is. Finished messages are
+ * freed, and a backpressured call gets its writable callback here, inside the flush. When the
+ * queue runs empty the data source ends: with send_eof_on_empty (trailers already sent in the
+ * body, as for grpc-web) the stream ends with the data; otherwise the stream stays open and any
+ * pending trailers are submitted as the final HEADERS. Returns the bytes written to buf, or
+ * NGHTTP2_ERR_CALLBACK_FAILURE if the trailers cannot be submitted. */
 ssize_t data_source_read_callback2(nghttp2_session *ngsession, i32 stream_id, u8 *buf,
                                    size_t buf_len, u32 *data_flags, nghttp2_data_source *source,
                                    [[maybe_unused]] void *user_data) {
@@ -144,7 +180,10 @@ ssize_t data_source_read_callback2(nghttp2_session *ngsession, i32 stream_id, u8
   return (ssize_t)buf_seek;
 }
 
-/* we're beginning to receive a header; open up memory for the new stream */
+/* nghttp2 begin-headers callback, invoked when a HEADERS frame opening a new stream arrives and
+ * before its header fields. Allocates the grpc_stream, links it into the session and attaches it
+ * as nghttp2 stream user data. Returns 0, or NGHTTP2_ERR_CALLBACK_FAILURE when out of memory
+ * (fatal to the connection). */
 static int on_begin_headers_callback(nghttp2_session *session, const nghttp2_frame *frame,
                                      void *user_data) {
   grpc_session *ezsession = user_data;
@@ -159,16 +198,25 @@ static int on_begin_headers_callback(nghttp2_session *session, const nghttp2_fra
   return 0;
 }
 
+/* Returns true if the value_len bytes at value equal the NUL-terminated expected, exactly. */
 static bool header_matches(const u8 *value, size_t value_len, const char *expected) {
   size_t expected_len = strlen(expected);
   return value_len == expected_len && memcmp(value, expected, expected_len) == 0;
 }
 
+/* Returns true if the value_len bytes at value start with the NUL-terminated prefix. */
 static bool header_starts_with(const u8 *value, size_t value_len, const char *prefix) {
   size_t prefix_len = strlen(prefix);
   return value_len >= prefix_len && memcmp(value, prefix, prefix_len) == 0;
 }
 
+/* nghttp2 header callback, invoked once per header field of a HEADERS frame. Keeps a reference
+ * on the name and value rcbufs and records the field in the stream's header array, then parses
+ * the fields the server needs (:method, :scheme, :path with its route lookup, content-type
+ * including grpc-web variants, grpc-encoding, grpc-accept-encoding, grpc-timeout, te); the
+ * stored pointers stay valid until stream_free(). Returns 0, or 1 when the stream has more than
+ * CONFIG_STREAM_MAX_HEADERS fields, which nghttp2 treats as NGHTTP2_ERR_CALLBACK_FAILURE: the
+ * whole connection is closed, not just the stream. */
 static int on_header_callback2([[maybe_unused]] nghttp2_session *session,
                                const nghttp2_frame *frame, nghttp2_rcbuf *name_rcbuf,
                                nghttp2_rcbuf *value_rcbuf, [[maybe_unused]] u8 flags,
@@ -247,7 +295,9 @@ static int on_header_callback2([[maybe_unused]] nghttp2_session *session,
   return 0;
 }
 
-/* a gRPC response that is only trailers, for requests that are not served */
+/* Submits a "trailers-only" gRPC response (one HEADERS frame with :status 200, grpc-status and
+ * grpc-message, ending the stream), used for requests that are not served. Submission errors are
+ * ignored. */
 static void submit_trailers_only(grpc_session *ezsession, i32 stream_id, grpc_status status,
                                  const char *message) {
   char grpc_status[16];
@@ -262,6 +312,14 @@ static void submit_trailers_only(grpc_session *ezsession, i32 stream_id, grpc_st
                                nva, 4, nullptr);
 }
 
+/* Handles a complete request HEADERS frame (END_HEADERS set). Ignores later HEADERS on a stream
+ * that already has a call or is discarded. Answers CORS preflight OPTIONS with 204, a
+ * non-gRPC content-type with 415, a request that is not POST over http(s) with te: trailers (te
+ * is not required for grpc-web) with RST_STREAM, and an unknown or disabled path with
+ * UNIMPLEMENTED unless the fallback route takes it; such streams are marked discarding.
+ * Otherwise creates the call, arms its grpc-timeout deadline, and queues it for dispatch right
+ * away if the request already ended or the stream route has an on_start handler (other calls
+ * are queued when messages arrive). Always returns 0. */
 static inline int on_frame_recv_headers(grpc_session *ezsession, const nghttp2_frame *frame) {
   grpc_server *server = ezsession->server;
   grpc_stream *ezstream =
@@ -360,6 +418,9 @@ static inline int on_frame_recv_headers(grpc_session *ezsession, const nghttp2_f
   return 0;
 }
 
+/* Handles a received SETTINGS frame. nghttp2 applies and acknowledges SETTINGS itself, so ACKs
+ * need nothing here. For other SETTINGS it submits RST_STREAM on stream 0, which nghttp2 rejects
+ * because 0 is not a stream, so the branch has no effect. Always returns 0. */
 static inline int on_frame_recv_settings(grpc_session *ezsession, const nghttp2_frame *frame) {
   if (frame->hd.stream_id != 0) {
     LOG_DEBUG(ezsession->server,
@@ -374,6 +435,13 @@ static inline int on_frame_recv_settings(grpc_session *ezsession, const nghttp2_
   return 0;
 }
 
+/* Handles the end of a DATA frame on a served stream, after on_data_chunk_recv_callback()
+ * buffered its payload: parses the complete messages, removes them from the buffer and appends
+ * them to the call's pending queue, then queues the call for dispatch. At END_STREAM the call is
+ * half-closed, or aborted with DATA_LOSS if a partial message remains. A message that
+ * decompresses past max_message_size - 5 aborts the call with RESOURCE_EXHAUSTED. For
+ * grpc-web-text the whole body is buffered and base64-decoded at END_STREAM; bad base64 aborts
+ * the call with INVALID_ARGUMENT. Always returns 0: errors end the call, not the connection. */
 static inline int on_frame_recv_data(grpc_session *ezsession, const nghttp2_frame *frame) {
   grpc_stream *ezstream =
       nghttp2_session_get_stream_user_data(ezsession->ngsession, frame->hd.stream_id);
@@ -465,6 +533,8 @@ static inline int on_frame_recv_data(grpc_session *ezsession, const nghttp2_fram
   return 0;
 }
 
+/* nghttp2 frame-sent callback, invoked after a frame has been serialized for sending. Only logs
+ * the frame (compiled in with GRPC_TRACE). Returns 0. */
 static int on_frame_send_callback([[maybe_unused]] nghttp2_session *session,
                                   const nghttp2_frame *frame, [[maybe_unused]] void *user_data) {
 #ifdef GRPC_TRACE
@@ -498,6 +568,12 @@ static int on_frame_send_callback([[maybe_unused]] nghttp2_session *session,
   return 0;
 }
 
+/* nghttp2 frame-received callback, invoked once a whole frame has been received (after its
+ * header fields or data chunks). Dispatches SETTINGS, HEADERS and DATA to the handlers above;
+ * RST_STREAM is handled by on_stream_close_callback(). A PING ACK clears the keepalive wait; a
+ * client PING closer than min_ping_interval_ms (default 5 s) to the previous one is a strike,
+ * and more than max_ping_strikes in a row (when enabled) earn a GOAWAY with ENHANCE_YOUR_CALM
+ * "too_many_pings". Returns the handler's result, otherwise 0. */
 static int on_frame_recv_callback([[maybe_unused]] nghttp2_session *session,
                                   const nghttp2_frame *frame, void *user_data) {
   grpc_session *ezsession = user_data;
@@ -563,6 +639,12 @@ static int on_frame_recv_callback([[maybe_unused]] nghttp2_session *session,
   return 0;
 }
 
+/* nghttp2 data-chunk callback, invoked for each piece of DATA payload as it is received.
+ * Appends it to the stream's receive buffer (compacting it, then growing it by doubling and
+ * moving off the inline storage). Ignores chunks for streams without a call or being discarded.
+ * If the buffered bytes would exceed max_message_size the call is aborted with
+ * RESOURCE_EXHAUSTED and the stream discarded, but the connection stays up. Returns 0, or
+ * NGHTTP2_ERR_CALLBACK_FAILURE when out of memory (fatal to the connection). */
 static int on_data_chunk_recv_callback(nghttp2_session *session, [[maybe_unused]] u8 flags,
                                        i32 stream_id, const u8 *data, size_t len, void *user_data) {
   grpc_session *ezsession = user_data;
@@ -611,6 +693,9 @@ static int on_data_chunk_recv_callback(nghttp2_session *session, [[maybe_unused]
   return 0;
 }
 
+/* nghttp2 stream-close callback, invoked when a stream closes for any reason (completed, reset by
+ * either side, or torn down with the session). Detaches the call with GRPC_STATUS_CANCELLED,
+ * which cancels it only if it had not finished, then unlinks and frees the stream. Returns 0. */
 static int on_stream_close_callback(nghttp2_session *session, i32 stream_id,
                                     [[maybe_unused]] u32 error_code, void *user_data) {
   grpc_session *ezsession = user_data;
@@ -628,6 +713,8 @@ static int on_stream_close_callback(nghttp2_session *session, i32 stream_id,
 
 /* ----------- END NGHTTP2 CALLBACKS ------------------*/
 
+/* Installs the callbacks above into the nghttp2_session_callbacks shared by all sessions of a
+ * server; called once from grpc_server_new_ex(). */
 void server_setup_ngcallbacks(nghttp2_session_callbacks *ngcallbacks) {
   /* no send/recv callbacks: the event loop moves the bytes with
    * nghttp2_session_mem_recv() and nghttp2_session_mem_send() */

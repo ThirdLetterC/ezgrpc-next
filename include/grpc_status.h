@@ -1,5 +1,11 @@
 #pragma once
 
+/* grpc_status.h - gRPC status codes
+ *
+ * The status a gRPC call ends with (sent as ``grpc-status``). Distinct from grpc_err
+ * (grpc_error.h), which reports whether a library function succeeded.
+ */
+
 #include "grpc_defs.h"
 
 /**
@@ -29,5 +35,6 @@ typedef enum grpc_status {
 /**
  * Returns a short description of a status, e.g. ``"invalid argument"``. It is
  * the ``grpc-message`` of calls finished with an error and no message.
+ * Returns a static string; ``"(null)"`` for values outside the enum.
  */
 GRPC_API const char *grpc_status_str(grpc_status status);

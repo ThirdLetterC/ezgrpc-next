@@ -1,3 +1,23 @@
+/* internal_helpers.c - connection I/O: accepting, reading, writing and closing sessions
+ *
+ * Everything here runs on the server's loop thread. on_listener_connection() takes a free slot
+ * of the fixed sessions array, accepts into its embedded uv_tcp_t or uv_pipe_t, and sets up TLS
+ * (if enabled) and an nghttp2 server session. Reads land in the server-wide rbuf, which is safe
+ * because each read is fully handed to nghttp2 (after decryption, for TLS) before the next one.
+ * Output is never written from inside nghttp2 callbacks: code that produces frames calls
+ * session_schedule_flush(), and server_flush_sessions() later serializes the frames into obuf and
+ * writes them, first with uv_try_write() and, when the socket is full, with one uv_write() from
+ * wbuf while obuf keeps collecting.
+ *
+ * Closing is two-phase. session_close() tears down the streams (cancelling their calls), the
+ * nghttp2 session and TLS, then calls uv_close(); only on_session_close() frees the buffers and
+ * returns the slot to the free list, so a slot is never reused while libuv still references its
+ * handle. Session buffers are grpc_buf, allocated with the grpc allocator (on MSVC
+ * _aligned_malloc()), so they must be released with buf_free()/grpc_free(), never libc free().
+ *
+ * The file also holds small debugging helpers (ezdump, ezgetdt, ezflog) and the grpc_stream
+ * constructors.
+ */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -15,12 +35,15 @@
 #include "internal_helpers.h"
 #include "internal_tls.h"
 
+/* Compares the names of two grpc_header (data and userdata) case-insensitively, as a grpc_list
+ * comparator. Returns 0 when the names are equal, nonzero otherwise. */
 int list_cmp_ezheader_name(const void *data, const void *userdata) {
   const grpc_header *a = data;
   const grpc_header *b = userdata;
   return a->namelen == b->namelen ? strncasecmp(a->name, b->name, a->namelen) : 1;
 }
 
+/* Prints len bytes to stdout as hex pairs, with an extra space after the 8th byte. */
 static void dump_decode_binary(const i8 *data, size_t len) {
   const i8 look_up[16] = {'0', '1', '2', '3', '4', '5', '6', '7',
                           '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'};
@@ -33,6 +56,7 @@ static void dump_decode_binary(const i8 *data, size_t len) {
   }
 }
 
+/* Prints len bytes to stdout as ASCII, with '.' for control and non-ASCII bytes. */
 static void dump_decode_ascii(const i8 *data, size_t len) {
   for (size_t i = 0; i < len; i++) {
     if (data[i] < 0x20) {
@@ -44,6 +68,8 @@ static void dump_decode_ascii(const i8 *data, size_t len) {
   }
 }
 
+/* Debugging aid: hex dumps len bytes to stdout, 16 per line with an ASCII column; the last line
+ * is padded so the columns line up. Prints nothing when len is 0. */
 void ezdump(void *vdata, size_t len) {
   const i8 *data = vdata;
   if (len == 0)
@@ -79,6 +105,8 @@ void ezdump(void *vdata, size_t len) {
   assert(len == cur);
 }
 
+/* Writes the local time into buf (at most len bytes) and returns buf. On Unix the format is
+ * "YYYY-MM-DD HH:MM:SS.nnnnnnnnn"; elsewhere it is "YYYY/MM/DD HH:MM:SS" with whole seconds. */
 char *ezgetdt(char *buf, size_t len) {
 #ifdef __unix__
   struct timespec ts;
@@ -102,6 +130,8 @@ char *ezgetdt(char *buf, size_t len) {
   return buf;
 }
 
+/* Prints a "[timestamp] " prefix followed by the formatted message to fp. Unlike server_log(),
+ * it ignores log levels and is not tied to a server. */
 void ezflog(FILE *fp, const char *fmt, ...) {
   va_list args;
   va_start(args, fmt);
@@ -114,16 +144,22 @@ void ezflog(FILE *fp, const char *fmt, ...) {
 /* stop pulling frames out of nghttp2 once this many bytes wait for the kernel */
 static const size_t GRPC_OBUF_HIGH_WATER = 256 * 1024;
 
+/* Returns the session's handle as a stream, whichever of the pipe or TCP members is in use. */
 static inline uv_stream_t *session_stream(grpc_session *session) {
   return session->is_unix ? (uv_stream_t *)&session->handle.pipe
                           : (uv_stream_t *)&session->handle.tcp;
 }
 
+/* Returns the session's handle as a generic uv_handle_t, for uv_close() and handle->data. */
 static inline uv_handle_t *session_handle(grpc_session *session) {
   return session->is_unix ? (uv_handle_t *)&session->handle.pipe
                           : (uv_handle_t *)&session->handle.tcp;
 }
 
+/* libuv close callback, invoked once uv_close() on the session handle has completed and any
+ * pending write has been cancelled. Frees obuf and wbuf (grpc allocator), resets the per
+ * connection state and pushes the slot back onto the free stack; this is the only place a
+ * session slot is returned. */
 static void on_session_close(uv_handle_t *handle) {
   grpc_session *session = handle->data;
   grpc_server *server = session->server;
@@ -148,6 +184,11 @@ static void on_session_close(uv_handle_t *handle) {
   server->free_sessions[server->nb_free_sessions++] = ndx;
 }
 
+/* Starts closing an open session; does nothing if it is already closing or inactive, so it is
+ * safe to call repeatedly from any error path on the loop thread. Stops reading, unlinks and
+ * frees every stream (detaching its call with GRPC_STATUS_UNAVAILABLE), deletes the nghttp2
+ * session, sends a best-effort TLS close_notify and frees the TLS state, then hands the handle
+ * to uv_close(). The slot stays taken (is_active) until on_session_close() runs. */
 void session_close(grpc_session *session) {
   if (session == nullptr || !session->is_active || session->is_closing) {
     return;
@@ -191,23 +232,32 @@ void session_close(grpc_session *session) {
   uv_close(session_handle(session), on_session_close);
 }
 
+/* nghttp2_mem hook: allocates through grpc_malloc(), so that all of nghttp2's memory comes from
+ * the library allocator. */
 static void *nghttp2_mem_malloc(size_t size, [[maybe_unused]] void *user_data) {
   return grpc_malloc(size);
 }
 
+/* nghttp2_mem hook: frees through grpc_free(). */
 static void nghttp2_mem_free(void *ptr, [[maybe_unused]] void *user_data) {
   grpc_free(ptr);
 }
 
+/* nghttp2_mem hook: allocates zeroed memory through grpc_calloc(). */
 static void *nghttp2_mem_calloc(size_t nmemb, size_t size, [[maybe_unused]] void *user_data) {
   return grpc_calloc(nmemb, size);
 }
 
+/* nghttp2_mem hook: resizes through grpc_realloc(). */
 static void *nghttp2_mem_realloc(void *ptr, size_t size, [[maybe_unused]] void *user_data) {
   return grpc_realloc(ptr, size);
 }
 
-/* sets up TLS and nghttp2 for an accepted connection */
+/* Sets up TLS (when the server has it) and an nghttp2 server session for an accepted
+ * connection, using the grpc allocator, and submits the server's SETTINGS (initial window =
+ * max_message_size, max frame size, max concurrent streams); the frame goes out on the next
+ * flush. Returns 0 on success, 1 on failure; the caller then closes the session, which releases
+ * whatever was set up. */
 static int session_create(grpc_session *ezsession) {
   grpc_server *server = ezsession->server;
 
@@ -244,6 +294,8 @@ static int session_create(grpc_session *ezsession) {
   return 0;
 }
 
+/* Fills session->peer with "unix", "a.b.c.d:port" or "[v6]:port"; for TCP it also stores the
+ * peer address in sockaddr/socklen. Leaves peer untouched if getpeername() fails. */
 static void session_set_peer(grpc_session *ezsession) {
   if (ezsession->is_unix) {
     snprintf(ezsession->peer, sizeof(ezsession->peer), "unix");
@@ -272,12 +324,16 @@ static void session_set_peer(grpc_session *ezsession) {
   }
 }
 
+/* libuv alloc callback, called before each read: hands out the server-wide rbuf. Sharing it is
+ * safe because on_session_read() consumes the data before the loop reads again. */
 static void on_session_alloc(uv_handle_t *handle, [[maybe_unused]] size_t suggested_size,
                              uv_buf_t *buf) {
   grpc_server *server = ((grpc_session *)handle->data)->server;
   *buf = uv_buf_init((char *)server->rbuf, (unsigned int)server->rbuf_len);
 }
 
+/* Feeds received HTTP/2 bytes to nghttp2, which runs the frame callbacks synchronously. Returns
+ * 0 on success, 1 on an nghttp2 error (the caller closes the session). */
 static int session_recv(grpc_session *ezsession, const u8 *data, size_t len) {
   ssize_t res = nghttp2_session_mem_recv(ezsession->ngsession, data, len);
   if (res < 0) {
@@ -288,6 +344,10 @@ static int session_recv(grpc_session *ezsession, const u8 *data, size_t len) {
   return 0;
 }
 
+/* Feeds ciphertext to TLS, advances the handshake (recording the client certificate subject when
+ * it completes) and passes all available plaintext to session_recv(), reusing rbuf. Returns 0
+ * on success or while the handshake or a record is still incomplete, 1 when the session must be
+ * closed (TLS error, handshake failure, close_notify from the peer, or an nghttp2 error). */
 static int session_recv_tls(grpc_session *ezsession, const u8 *data, size_t len) {
   grpc_server *server = ezsession->server;
   if (grpc_tls_feed(ezsession, data, len)) {
@@ -322,6 +382,10 @@ static int session_recv_tls(grpc_session *ezsession, const u8 *data, size_t len)
   }
 }
 
+/* libuv read callback for a session: called with data, with nread < 0 on EOF or error (the
+ * session is closed), or with nread == 0 (ignored). Updates the byte counter and activity time,
+ * passes the data through TLS and nghttp2, and schedules a flush so that whatever nghttp2 wants
+ * to answer (SETTINGS ACK, WINDOW_UPDATE, responses queued by callbacks) goes out. */
 static void on_session_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf) {
   grpc_session *ezsession = stream->data;
   if (nread == 0 || !ezsession->is_active || ezsession->is_closing) {
@@ -350,11 +414,14 @@ static void on_session_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *
   session_schedule_flush(ezsession);
 }
 
+/* libuv close callback for a rejected connection: frees its heap-allocated handle. */
 static void on_reject_close(uv_handle_t *handle) {
   grpc_free(handle);
 }
 
-/* libuv stops accepting until the pending connection is taken, so take it and drop it */
+/* Accepts the pending connection into a temporary heap handle and closes it right away. libuv
+ * stops accepting until the pending connection is taken, so a connection that cannot be served
+ * must still be accepted. If even the temporary handle cannot be set up, it is left pending. */
 static void reject_connection(grpc_server *server, uv_stream_t *listener, bool is_unix) {
   if (is_unix) {
     uv_pipe_t *pipe = grpc_malloc(sizeof(*pipe));
@@ -380,6 +447,11 @@ static void reject_connection(grpc_server *server, uv_stream_t *listener, bool i
   uv_close((uv_handle_t *)tcp, on_reject_close);
 }
 
+/* libuv connection callback for the TCP and Unix listeners. Rejects the connection when no
+ * session slot is free; otherwise takes the slot on top of the free stack, initializes the
+ * handle, accepts, enables SO_KEEPALIVE and TCP_NODELAY on TCP, records the peer, creates the
+ * TLS/nghttp2 session and starts reading. Once the slot is marked active every failure goes
+ * through session_close(), which returns the slot from on_session_close(). */
 void on_listener_connection(uv_stream_t *listener, int status) {
   grpc_server *server = listener->data;
   if (status < 0) {
@@ -451,6 +523,8 @@ void on_listener_connection(uv_stream_t *listener, int status) {
   session_schedule_flush(session);
 }
 
+/* Pushes the session onto the server's flush list unless it is already queued (is_flush_queued).
+ * The list is LIFO; server_flush_sessions() drains it. */
 void session_schedule_flush(grpc_session *session) {
   if (session->is_flush_queued)
     return;
@@ -459,6 +533,10 @@ void session_schedule_flush(grpc_session *session) {
   session->server->flush_head = session;
 }
 
+/* Pops every queued session and flushes it with session_flush(). Called by grpc_server_poll()
+ * before and after running the loop, by the maintenance timer, grpc_server_drain(),
+ * grpc_server_free() and grpc_server_flush(). A flush may close a session; closing ones are
+ * skipped by session_flush(). */
 void server_flush_sessions(grpc_server *server) {
   grpc_session *session;
   while ((session = server->flush_head) != nullptr) {
@@ -469,7 +547,11 @@ void server_flush_sessions(grpc_server *server) {
   }
 }
 
-/* moves the frames queued in nghttp2 into obuf, encrypting them if needed */
+/* Moves frames queued in nghttp2 into obuf until about GRPC_OBUF_HIGH_WATER bytes are pending.
+ * With TLS, the frames are batched in the shared server->tls_obuf, encrypted with a single
+ * grpc_tls_write() and the ciphertext drained into obuf; nothing is pulled from nghttp2 before
+ * the handshake is done, though handshake output still gets drained. Returns 0 on success, 1 on
+ * an nghttp2, allocation or TLS error. */
 static int session_serialize(grpc_session *ezsession) {
   /* TLS application data cannot be written before the handshake completes */
   bool can_send = !ezsession->is_tls || ezsession->tls_handshake_done;
@@ -502,6 +584,9 @@ static int session_serialize(grpc_session *ezsession) {
   return 0;
 }
 
+/* libuv write callback for the uv_write() of wbuf started by session_flush(); also runs with
+ * UV_ECANCELED when the handle is closed first. Marks the write finished, then closes the
+ * session on error or resumes the flush, which may start the next write. */
 static void on_session_write(uv_write_t *req, int status) {
   grpc_session *ezsession = req->data;
   ezsession->is_writing = false;
@@ -516,6 +601,12 @@ static void on_session_write(uv_write_t *req, int status) {
   session_flush(ezsession);
 }
 
+/* Serializes and writes the session's pending output. Writes synchronously with uv_try_write()
+ * while the socket accepts everything; on a partial write it swaps obuf and wbuf and lets
+ * uv_write() send the remainder from wbuf (counted as sent right away) while obuf collects new
+ * output, then returns. Does nothing while a write is in flight: on_session_write() resumes it.
+ * Closes the session on errors, and once nghttp2 wants neither to read nor to write (e.g. after
+ * a GOAWAY exchange). */
 void session_flush(grpc_session *ezsession) {
   /* an in-flight write resumes the flush from on_session_write */
   if (!ezsession->is_active || ezsession->is_closing || ezsession->is_writing)
@@ -568,6 +659,8 @@ void session_flush(grpc_session *ezsession) {
     session_close(ezsession);
 }
 
+/* Allocates a zeroed stream for stream_id whose receive buffer starts as the inline storage.
+ * Returns nullptr when out of memory. The caller links it with stream_link(). */
 grpc_stream *stream_new(i32 stream_id) {
   grpc_stream *ezstream = grpc_calloc(1, sizeof(*ezstream));
   if (ezstream == nullptr)
@@ -579,6 +672,10 @@ grpc_stream *stream_new(i32 stream_id) {
   return ezstream;
 }
 
+/* Frees a stream that is already unlinked: its heap receive buffer, pending trailers, the
+ * references held on nghttp2's header buffers and the queued outgoing messages. Must run before
+ * the nghttp2 session is deleted, because the header rcbufs are released through it. Does not
+ * touch the stream's call; callers detach it first. Accepts nullptr. */
 void stream_free(grpc_stream *ezstream) {
   if (ezstream == nullptr)
     return;
@@ -599,6 +696,7 @@ void stream_free(grpc_stream *ezstream) {
   grpc_free(ezstream);
 }
 
+/* Adds the stream at the head of the session's stream list and bumps the stream counters. */
 void stream_link(grpc_session *session, grpc_stream *stream) {
   stream->prev = nullptr;
   stream->next = session->streams;
@@ -609,6 +707,8 @@ void stream_link(grpc_session *session, grpc_stream *stream) {
   atomic_fetch_add(&session->server->stat_active_streams, 1);
 }
 
+/* Removes the stream from the session's list and decrements the stream counters; the stream
+ * itself is not freed. */
 void stream_unlink(grpc_session *session, grpc_stream *stream) {
   if (stream->prev != nullptr)
     stream->prev->next = stream->next;

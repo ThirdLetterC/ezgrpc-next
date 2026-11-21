@@ -1,3 +1,21 @@
+/* grpc_server.c - server setup, routing, logging and the poll/run event loop
+ *
+ * A grpc_server owns one libuv loop, driven by a single thread through grpc_server_poll() or
+ * grpc_server_run(). Each poll flushes queued output, runs the loop once (accepting, reading and
+ * feeding nghttp2, which queues calls), dispatches the ready calls to handlers or events
+ * (server_dispatch() in grpc_call.c) and flushes what the handlers answered. Everything except
+ * the statistics, the log level, grpc_server_stop() and grpc_server_post() must be used from
+ * that thread; stop and post wake the loop through the server's uv_async handle, and the
+ * *_async call functions are built on grpc_server_post().
+ *
+ * Connections live in a fixed array of max_connections sessions handed out from a stack of free
+ * indices; internal_helpers.c accepts, reads, writes and closes them. Routes are allocated one
+ * by one and are neither moved nor freed before grpc_server_free(), because calls keep pointers
+ * to them: unregistering a path only disables its route.
+ *
+ * Logging goes through ulog. Each server gets its own topic and is linked into a process-wide
+ * registry, so the single ulog output callback can write each line to the server's log_file.
+ */
 #include <errno.h>
 #include <inttypes.h>
 #include <stdarg.h>
@@ -29,11 +47,18 @@ static atomic_uint_fast64_t next_log_topic = 1;
 static ulog_output_id log_output = ULOG_OUTPUT_INVALID;
 static ulog_status logger_status = ULOG_STATUS_ERROR;
 
+/* Locks (lock == true) or unlocks ulog_mutex; installed as ulog's lock function so that events
+ * from servers on different threads are serialized. Returns ULOG_STATUS_BUSY if the mutex call
+ * fails. */
 static ulog_status logger_lock(bool lock, [[maybe_unused]] void *arg) {
   int rc = lock ? pthread_mutex_lock(&ulog_mutex) : pthread_mutex_unlock(&ulog_mutex);
   return rc == 0 ? ULOG_STATUS_OK : ULOG_STATUS_BUSY;
 }
 
+/* The one ulog output shared by all servers: looks up the server whose topic id matches the
+ * event and writes the formatted message to its log_file under log_registry_mutex. Drops
+ * events without a topic or for a server no longer registered. Messages are cut to 1023 bytes.
+ */
 static void logger_output(ulog_event *event, [[maybe_unused]] void *arg) {
   int topic_id = ulog_event_get_topic(event);
   char message[1024];
@@ -50,6 +75,9 @@ static void logger_output(ulog_event *event, [[maybe_unused]] void *arg) {
   pthread_mutex_unlock(&log_registry_mutex);
 }
 
+/* Runs once per process through pthread_once(): installs logger_lock() and registers
+ * logger_output(). On failure logger_status stays ULOG_STATUS_ERROR, so every later
+ * logger_server_add(), and hence grpc_server_new_ex(), fails with GRPC_ERR_IO. */
 static void logger_initialize(void) {
   if (ulog_lock_set_fn(logger_lock, nullptr) != ULOG_STATUS_OK)
     return;
@@ -57,6 +85,9 @@ static void logger_initialize(void) {
   logger_status = log_output == ULOG_OUTPUT_INVALID ? ULOG_STATUS_ERROR : ULOG_STATUS_OK;
 }
 
+/* Maps a grpc_log_level to the ulog level of a server topic. OFF and DEFAULT map to ERROR: OFF
+ * is enforced by server_log() before ulog is reached, and DEFAULT is resolved by the callers.
+ */
 static ulog_level ulog_level_for(grpc_log_level level) {
   switch (level) {
   case GRPC_LOG_TRACE:
@@ -75,6 +106,9 @@ static ulog_level ulog_level_for(grpc_log_level level) {
   }
 }
 
+/* Gives the server a unique topic ("grpc-server-N") at its current log level and links it into
+ * the registry. Returns GRPC_OK, or GRPC_ERR_IO if ulog could not be set up or the topic could
+ * not be added (the server is then not registered). */
 static grpc_err logger_server_add(grpc_server *server) {
   if (pthread_once(&logger_once, logger_initialize) != 0 || logger_status != ULOG_STATUS_OK)
     return GRPC_ERR_IO;
@@ -95,6 +129,9 @@ static grpc_err logger_server_add(grpc_server *server) {
   return GRPC_OK;
 }
 
+/* Removes the server's topic and unlinks it from the registry; a no-op unless
+ * logger_server_add() succeeded. Once it returns, logger_output() no longer touches the
+ * server's log_file. */
 static void logger_server_remove(grpc_server *server) {
   if (!server->log_topic_initialized)
     return;
@@ -110,6 +147,10 @@ static void logger_server_remove(grpc_server *server) {
   pthread_mutex_unlock(&log_registry_mutex);
 }
 
+/* Formats a timestamped line and emits it on the server's topic; usually reached through the
+ * LOG_* macros. Does nothing when server is nullptr, logging is off or level is more verbose
+ * than the server's level. Lines are cut to 1023 bytes. Safe from any thread: the level is
+ * atomic and ulog is locked. */
 void server_log(grpc_server *server, grpc_log_level level, const char *fmt, ...) {
   if (server == nullptr)
     return;
@@ -150,6 +191,8 @@ void server_log(grpc_server *server, grpc_log_level level, const char *fmt, ...)
 
 /* ---- routes ------------------------------------------------------------------- */
 
+/* Returns the route whose path equals the len bytes at path (not NUL-terminated), whether
+ * disabled or not, or nullptr. A linear scan, run for each request's :path header. */
 grpc_route *server_find_route(grpc_server *server, const char *path, size_t len) {
   for (size_t i = 0; i < server->nb_routes; i++) {
     grpc_route *route = server->routes[i];
@@ -159,6 +202,10 @@ grpc_route *server_find_route(grpc_server *server, const char *path, size_t len)
   return nullptr;
 }
 
+/* Registers path (which must start with '/') as a route of the given kind, or re-enables and
+ * overwrites a disabled route with the same path so that calls still pointing to it stay valid.
+ * Copies path and *stream. Returns GRPC_OK, GRPC_ERR_EXISTS if an enabled route has the path,
+ * GRPC_ERR_INVALID or GRPC_ERR_NOMEM. Loop thread only: routes are not locked. */
 grpc_err server_add_route(grpc_server *server, const char *path, route_kind kind,
                           grpc_handler_fn handler, const grpc_stream_handler *stream,
                           void *userdata) {
@@ -200,6 +247,7 @@ grpc_err server_add_route(grpc_server *server, const char *path, route_kind kind
   return GRPC_OK;
 }
 
+/* Registers a ROUTE_UNARY route; the handler is required. */
 GRPC_API grpc_err grpc_server_handle(grpc_server *server, const char *path, grpc_handler_fn handler,
                                      void *userdata) {
   if (handler == nullptr)
@@ -207,6 +255,7 @@ GRPC_API grpc_err grpc_server_handle(grpc_server *server, const char *path, grpc
   return server_add_route(server, path, ROUTE_UNARY, handler, nullptr, userdata);
 }
 
+/* Registers a ROUTE_STREAM route; the handler (copied) needs on_message or on_start. */
 GRPC_API grpc_err grpc_server_handle_stream(grpc_server *server, const char *path,
                                             const grpc_stream_handler *handler, void *userdata) {
   if (handler == nullptr || (handler->on_message == nullptr && handler->on_start == nullptr))
@@ -214,10 +263,14 @@ GRPC_API grpc_err grpc_server_handle_stream(grpc_server *server, const char *pat
   return server_add_route(server, path, ROUTE_STREAM, nullptr, handler, userdata);
 }
 
+/* Registers a ROUTE_EVENTS route: its calls are reported as events by grpc_server_poll()
+ * instead of being handed to a callback. */
 GRPC_API grpc_err grpc_server_register_path(grpc_server *server, const char *path, void *userdata) {
   return server_add_route(server, path, ROUTE_EVENTS, nullptr, nullptr, userdata);
 }
 
+/* Disables the route instead of freeing it, since calls in progress point to it. New requests
+ * for the path then go to the fallback route, or get UNIMPLEMENTED. */
 GRPC_API grpc_err grpc_server_unregister(grpc_server *server, const char *path) {
   if (server == nullptr || path == nullptr)
     return GRPC_ERR_INVALID;
@@ -229,6 +282,9 @@ GRPC_API grpc_err grpc_server_unregister(grpc_server *server, const char *path) 
   return GRPC_OK;
 }
 
+/* Installs, updates or (handler == nullptr) disables the catch-all route used for unknown or
+ * disabled paths. The route (a ROUTE_STREAM with a placeholder path) is allocated once and kept,
+ * like other routes, until grpc_server_free(). */
 GRPC_API grpc_err grpc_server_set_fallback(grpc_server *server, const grpc_stream_handler *handler,
                                            void *userdata) {
   if (server == nullptr)
@@ -259,6 +315,8 @@ GRPC_API grpc_err grpc_server_set_fallback(grpc_server *server, const grpc_strea
   return GRPC_OK;
 }
 
+/* Copies the atomic counters one by one; callable from any thread. The snapshot is not
+ * atomic as a whole. */
 GRPC_API grpc_err grpc_server_get_stats(const grpc_server *server, grpc_server_stats *out) {
   if (server == nullptr || out == nullptr)
     return GRPC_ERR_INVALID;
@@ -280,13 +338,18 @@ GRPC_API grpc_err grpc_server_get_stats(const grpc_server *server, grpc_server_s
 /* ---- setup ---------------------------------------------------------------------- */
 
 #ifdef _WIN32
+/* Initializes Winsock 2.2 before the first socket is created; run once through uv_once(). */
 static void grpc_winsock_init(void) {
   WSADATA data;
   WSAStartup(MAKEWORD(2, 2), &data);
 }
 #endif
 
-/* binds and listens on one address. returns the socket or GRPC_INVALID_SOCKET */
+/* Creates a TCP socket for family (AF_INET or AF_INET6), binds it to addr:port and listens with
+ * backlog. Sets SO_REUSEADDR, SO_REUSEPORT where available, and IPV6_V6ONLY for IPv6 so that the
+ * IPv4 and IPv6 listeners can share a port. If bound_port is not nullptr it receives the port
+ * actually bound, which resolves port 0. Returns the socket, or GRPC_INVALID_SOCKET after
+ * logging and storing GRPC_ERR_INVALID or GRPC_ERR_IO in *out_err (if not nullptr). */
 static uv_os_sock_t open_listener(grpc_server *server, int family, const char *addr, uint16_t port,
                                   int backlog, uint16_t *bound_port, grpc_err *out_err) {
   struct sockaddr_storage ss = {};
@@ -364,7 +427,9 @@ static uv_os_sock_t open_listener(grpc_server *server, int family, const char *a
   return fd;
 }
 
-/* hands an open socket to an initialized libuv listener, which then owns it */
+/* Hands an open socket to an initialized uv_tcp_t and starts listening with
+ * on_listener_connection(). On a successful uv_tcp_open() *fd is reset to GRPC_INVALID_SOCKET,
+ * since the handle now owns (and closes) it. Returns false on failure. */
 static bool start_listener(grpc_server *server, uv_tcp_t *listener, uv_os_sock_t *fd) {
   listener->data = server;
   if (uv_tcp_open(listener, *fd) != 0)
@@ -373,8 +438,16 @@ static bool start_listener(grpc_server *server, uv_tcp_t *listener, uv_os_sock_t
   return uv_listen((uv_stream_t *)listener, server->config.backlog, on_listener_connection) == 0;
 }
 
+/* Does nothing: the poll timer only exists to make uv_run(UV_RUN_ONCE) return after a
+ * grpc_server_poll() timeout. */
 static void on_poll_timer([[maybe_unused]] uv_timer_t *handle) {}
 
+/* libuv timer callback, every 250 ms when keepalive or connection age/idle limits are
+ * configured. Per open session it closes the connection on a keepalive PING timeout or once a
+ * GOAWAY's grace period ends (or no streams remain), sends GOAWAY when max_connection_age or
+ * max_connection_idle is reached, and sends a keepalive PING after keepalive_time of inactivity.
+ * Flushes the affected sessions itself, since it runs inside uv_run(). The timer is unref'd so
+ * it never keeps the loop alive on its own. */
 static void on_maintenance_timer(uv_timer_t *handle) {
   grpc_server *server = handle->data;
   const grpc_config *cfg = &server->config;
@@ -438,6 +511,9 @@ static void on_maintenance_timer(uv_timer_t *handle) {
   server_flush_sessions(server);
 }
 
+/* Detaches the whole grpc_server_post() queue under post_mutex, then runs each task in order and
+ * frees it, outside the lock so that tasks may post again (those run on the next wakeup). Loop
+ * thread only. */
 static void run_posted(grpc_server *server) {
   pthread_mutex_lock(&server->post_mutex);
   post_task *task = server->post_head;
@@ -452,12 +528,22 @@ static void run_posted(grpc_server *server) {
   }
 }
 
+/* libuv async callback, invoked on the loop thread after grpc_server_stop() or
+ * grpc_server_post() called uv_async_send(); libuv may coalesce several sends into one call.
+ * Runs the posted tasks; the stop flag itself is checked by grpc_server_run(). */
 static void on_async(uv_async_t *handle) {
   grpc_server *server = handle->data;
   server->ready_events++;
   run_posted(server);
 }
 
+/* Copies the config and fills in defaults, validates the log level, frame and message limits
+ * and TLS settings, then binds the sockets before setting up the loop, timers, async handle,
+ * listeners, nghttp2 callbacks, the shared read buffer and the session slots. Addresses are
+ * duplicated into the server; the TLS part of the stored config is cleared because the
+ * caller's TLS strings are not kept. With no address configured it listens on 0.0.0.0 and ::.
+ * On any failure the partially built server is released by grpc_server_free(), which copes with
+ * every intermediate state, and nullptr is returned with *out_err set. */
 GRPC_API grpc_server *grpc_server_new_ex(const grpc_config *config, grpc_err *out_err) {
   if (out_err != nullptr)
     *out_err = GRPC_OK;
@@ -670,14 +756,22 @@ err:
   return nullptr;
 }
 
+/* grpc_server_new_ex() without the error code. */
 GRPC_API grpc_server *grpc_server_new(const grpc_config *config) {
   return grpc_server_new_ex(config, nullptr);
 }
 
+/* Returns the bound TCP port (resolved when the config asked for port 0), or 0. */
 GRPC_API uint16_t grpc_server_port(const grpc_server *server) {
   return server != nullptr ? server->config.port : 0;
 }
 
+/* Flushes queued output, closes every session (detaching their calls), runs posted tasks so
+ * they release their call references, drops ready calls and events, then closes all handles and
+ * runs the loop (bounded to 1000 iterations) until the close callbacks have fired, which also
+ * returns the session slots. Only then are routes, TLS, buffers and the server freed. Must run
+ * on the loop thread with no poll in progress. Also used to unwind a failed grpc_server_new_ex().
+ */
 GRPC_API void grpc_server_free(grpc_server *server) {
   if (server == nullptr)
     return;
@@ -755,6 +849,8 @@ GRPC_API void grpc_server_free(grpc_server *server) {
   grpc_free(server);
 }
 
+/* Changes the ulog topic level and the server's atomic level together under log_level_mutex so
+ * concurrent callers cannot leave them out of sync. Safe from any thread. */
 GRPC_API grpc_err grpc_server_set_log_level(grpc_server *server, grpc_log_level level) {
   if (server == nullptr || level < GRPC_LOG_DEFAULT || level > GRPC_LOG_TRACE)
     return GRPC_ERR_INVALID;
@@ -771,6 +867,10 @@ GRPC_API grpc_err grpc_server_set_log_level(grpc_server *server, grpc_log_level 
 
 /* ---- running ---------------------------------------------------------------------- */
 
+/* One iteration of the event loop: releases the previous poll's events, flushes pending output,
+ * runs libuv once (blocking for at most timeout_ms; 0 does not block, negative blocks until
+ * something happens), dispatches the calls that became ready and flushes the responses. Returns
+ * the number of events now available from grpc_server_events(). */
 GRPC_API int grpc_server_poll(grpc_server *server, int timeout_ms) {
   if (server == nullptr)
     return GRPC_ERR_INVALID;
@@ -797,6 +897,8 @@ GRPC_API int grpc_server_poll(grpc_server *server, int timeout_ms) {
   return (int)server->nb_events;
 }
 
+/* Returns the events produced by the last grpc_server_poll(); they stay valid until the next
+ * poll or grpc_server_free(). */
 GRPC_API const grpc_event *grpc_server_events(grpc_server *server, size_t *count) {
   if (server == nullptr) {
     if (count != nullptr)
@@ -808,6 +910,8 @@ GRPC_API const grpc_event *grpc_server_events(grpc_server *server, size_t *count
   return server->events;
 }
 
+/* Polls without a timeout until the stop flag is set, then clears it so the server can be run
+ * again. */
 GRPC_API grpc_err grpc_server_run(grpc_server *server) {
   if (server == nullptr)
     return GRPC_ERR_INVALID;
@@ -821,6 +925,8 @@ GRPC_API grpc_err grpc_server_run(grpc_server *server) {
   return GRPC_OK;
 }
 
+/* Sets the stop flag and wakes the loop with uv_async_send(), so it is safe from any thread and
+ * from a signal handler. grpc_server_run() returns after the current poll. */
 GRPC_API void grpc_server_stop(grpc_server *server) {
   if (server == nullptr)
     return;
@@ -829,6 +935,7 @@ GRPC_API void grpc_server_stop(grpc_server *server) {
   uv_async_send(&server->async);
 }
 
+/* Counts the streams of sessions that are open and not closing. */
 static size_t server_active_streams(const grpc_server *server) {
   size_t total = 0;
   for (size_t i = 0; i < server->nb_sessions; i++) {
@@ -838,6 +945,12 @@ static size_t server_active_streams(const grpc_server *server) {
   return total;
 }
 
+/* Graceful shutdown on the loop thread: closes the listeners, submits GOAWAY on every open
+ * session and sets the stop flag, then polls until no stream is left or timeout_ms elapses (a
+ * positive timeout polls at most 100 ms at a time, 0 polls once without blocking, a negative one
+ * waits without a limit). Returns GRPC_OK when all streams finished, GRPC_ERR_TIMEOUT
+ * otherwise, or a poll error. The listeners are not reopened, so a drained server accepts no new
+ * connections. */
 GRPC_API grpc_err grpc_server_drain(grpc_server *server, int timeout_ms) {
   if (server == nullptr)
     return GRPC_ERR_INVALID;
@@ -892,6 +1005,8 @@ GRPC_API grpc_err grpc_server_drain(grpc_server *server, int timeout_ms) {
   return server_active_streams(server) == 0 ? GRPC_OK : GRPC_ERR_TIMEOUT;
 }
 
+/* Appends a task to the mutex-protected queue and wakes the loop; on_async() runs it on the loop
+ * thread. Safe from any thread. Returns GRPC_ERR_NOMEM if the task cannot be allocated. */
 GRPC_API grpc_err grpc_server_post(grpc_server *server, void (*fn)(void *arg), void *arg) {
   if (server == nullptr || fn == nullptr)
     return GRPC_ERR_INVALID;
@@ -912,11 +1027,13 @@ GRPC_API grpc_err grpc_server_post(grpc_server *server, void (*fn)(void *arg), v
   return GRPC_OK;
 }
 
+/* Writes the output of every session queued for flushing now instead of at the next poll. */
 GRPC_API void grpc_server_flush(grpc_server *server) {
   if (server != nullptr)
     server_flush_sessions(server);
 }
 
+/* Returns the library's license text (a static string). */
 GRPC_API const char *grpc_license(void) {
   static const char *license =
       "ezGRPC-next - A gRPC server without the extra fancy features.\n"

@@ -1,3 +1,15 @@
+/* grpc_timeout.c - monotonic clock, grpc-timeout parsing and server call deadlines
+ *
+ * Deadlines are absolute times in milliseconds on the libuv high-resolution monotonic clock
+ * (grpc_time_now_ms). When a request carries a grpc-timeout header, the nghttp2 callbacks parse it
+ * with grpc_timeout_parse_ms, store the deadline on the stream and call server_arm_deadline.
+ *
+ * The server uses a single one-shot uv timer for all deadlines, armed for the earliest one
+ * (server->next_deadline_ms). When it fires, every session's streams are scanned, expired calls
+ * are aborted with DEADLINE_EXCEEDED and the timer is re-armed for the next deadline. Everything
+ * here except grpc_timeout_parse_ms and grpc_time_now_ms runs on the server's loop thread.
+ */
+
 #include <time.h>
 #include <ctype.h>
 #include <stdlib.h>
@@ -5,10 +17,17 @@
 #include "core.h"
 #include "grpc_timeout.h"
 
+/* Returns libuv's monotonic high-resolution clock (nanoseconds) truncated to milliseconds. */
 uint64_t grpc_time_now_ms(void) {
   return uv_hrtime() / 1000000ULL;
 }
 
+/* Parses a grpc-timeout header value: ASCII digits followed by exactly one unit character
+ * (H hours, M minutes, S seconds, m milliseconds, u microseconds, n nanoseconds). Sub-millisecond
+ * units round up so a nonzero timeout never becomes 0 ms. Returns the timeout in milliseconds,
+ * clamped to INT64_MAX, or -1 for null/empty input, a missing or unknown unit, trailing bytes, a
+ * zero value, or a value that overflows during unit conversion. The spec's 8-digit limit is not
+ * enforced. */
 int64_t grpc_timeout_parse_ms(const char *timeout_str) {
   if (timeout_str == nullptr || *timeout_str == '\0') {
     return -1;
@@ -74,7 +93,9 @@ int64_t grpc_timeout_parse_ms(const char *timeout_str) {
   return (int64_t)ms;
 }
 
-/* ends the calls past their deadline and returns the earliest deadline left */
+/* Aborts every live call whose deadline is at or before now_ms with DEADLINE_EXCEEDED and clears
+ * its deadline, skipping inactive or closing sessions. Returns the earliest deadline still
+ * pending, or UINT64_MAX if none. Runs on the server loop thread. */
 static u64 expire_deadlines(grpc_server *server, u64 now_ms) {
   u64 next_deadline_ms = UINT64_MAX;
   for (size_t i = 0; i < server->nb_sessions; i++) {
@@ -100,6 +121,9 @@ static u64 expire_deadlines(grpc_server *server, u64 now_ms) {
   return next_deadline_ms;
 }
 
+/* uv timer callback for server->deadline_timer: bumps ready_events, forgets the fired deadline
+ * (so server_arm_deadline accepts any new one), expires overdue calls and re-arms for the next
+ * remaining deadline. */
 static void on_deadline_timer(uv_timer_t *timer) {
   grpc_server *server = timer->data;
   server->ready_events++;
@@ -109,6 +133,9 @@ static void on_deadline_timer(uv_timer_t *timer) {
     server_arm_deadline(server, next);
 }
 
+/* Ensures the deadline timer fires no later than deadline_ms (absolute, grpc_time_now_ms clock).
+ * Does nothing if the timer is already due earlier or at the same time; otherwise (re)starts it,
+ * firing immediately for a deadline in the past. Must run on the server loop thread. */
 void server_arm_deadline(grpc_server *server, u64 deadline_ms) {
   /* the timer already fires earlier */
   if (deadline_ms >= server->next_deadline_ms)
