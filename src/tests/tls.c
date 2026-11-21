@@ -191,6 +191,64 @@ void test_client_server_mtls_end_to_end(void) {
   grpc_client_response_free(&resp);
 
   grpc_client_free(client);
+
+  /* Also exercise client ca_pem (in-memory CA) and insecure_skip_verify */
+  size_t ca_len = 0;
+  char *ca_pem = slurp_file("test_cert.pem", &ca_len);
+  TEST_ASSERT_NOT_NULL(ca_pem);
+  grpc_client *c_pem = grpc_client_new(
+      &(grpc_client_config){
+          .host = "127.0.0.1",
+          .port = grpc_server_port(server),
+          .timeout_ms = 3000,
+          .tls = {
+              .enable = true,
+              .ca_pem = ca_pem,
+              .ca_pem_len = ca_len,
+              .cert_file = "test_cert.pem",
+              .key_file = "test_key.pem",
+              .server_name = "localhost",
+          },
+      },
+      &err);
+  TEST_ASSERT_NOT_NULL(c_pem);
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_client_unary(c_pem, "/mtls.Svc/Echo", "pem", 3, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  grpc_client_response_free(&resp);
+  grpc_client_free(c_pem);
+
+  grpc_client *c_insec = grpc_client_new(
+      &(grpc_client_config){
+          .host = "127.0.0.1",
+          .port = grpc_server_port(server),
+          .timeout_ms = 3000,
+          .tls = {
+              .enable = true,
+              .insecure_skip_verify = true,
+              .cert_file = "test_cert.pem",
+              .key_file = "test_key.pem",
+          },
+      },
+      &err);
+  TEST_ASSERT_NOT_NULL(c_insec);
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_client_unary(c_insec, "/mtls.Svc/Echo", "ok", 2, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  grpc_client_response_free(&resp);
+  grpc_client_free(c_insec);
+  free(ca_pem);
+
+  /* Invalid client TLS cert/key config */
+  TEST_ASSERT_NULL(grpc_client_new(
+      &(grpc_client_config){
+          .host = "127.0.0.1",
+          .port = grpc_server_port(server),
+          .tls = {.enable = true, .cert_file = "nonexistent.pem", .key_file = "nonexistent.pem"},
+      },
+      &err));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
+
   grpc_server_stop(server);
   pthread_join(th, nullptr);
   grpc_server_free(server);

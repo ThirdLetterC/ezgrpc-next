@@ -15,6 +15,7 @@
 #endif
 
 #include "core.h"
+#include "internal_helpers.h"
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -217,12 +218,34 @@ void test_log_level_control(void) {
 }
 
 void test_strings(void) {
+  for (int e = GRPC_OK; e >= GRPC_ERR_TIMEOUT; e--)
+    TEST_ASSERT_NOT_NULL(grpc_strerror((grpc_err)e));
   TEST_ASSERT_EQUAL_STRING("success", grpc_strerror(GRPC_OK));
   TEST_ASSERT_EQUAL_STRING("already exists", grpc_strerror(GRPC_ERR_EXISTS));
+  TEST_ASSERT_EQUAL_STRING("output limit exceeded", grpc_strerror(GRPC_ERR_LIMIT));
+  TEST_ASSERT_EQUAL_STRING("compression or decompression failed", grpc_strerror(GRPC_ERR_CODEC));
+  TEST_ASSERT_EQUAL_STRING("operation timed out", grpc_strerror(GRPC_ERR_TIMEOUT));
   TEST_ASSERT_EQUAL_STRING("unknown error", grpc_strerror((grpc_err)-1000));
+
+  for (int s = GRPC_STATUS_OK; s <= GRPC_STATUS_UNAUTHENTICATED; s++)
+    TEST_ASSERT_NOT_NULL(grpc_status_str((grpc_status)s));
   TEST_ASSERT_EQUAL_STRING("invalid argument", grpc_status_str(GRPC_STATUS_INVALID_ARGUMENT));
   TEST_ASSERT_EQUAL_STRING("aborted", grpc_status_str(GRPC_STATUS_ABORTED));
+  TEST_ASSERT_EQUAL_STRING("(null)", grpc_status_str((grpc_status)999));
   TEST_ASSERT_NOT_NULL(grpc_license());
+
+  /* Internal debug formatting helpers */
+  extern void ezdump(void *vdata, size_t len);
+  uint8_t sample[20];
+  for (size_t i = 0; i < sizeof(sample); i++)
+    sample[i] = (uint8_t)(i + 0x1e);
+  FILE *f = tmpfile();
+  if (f != nullptr) {
+    ezflog(f, "helper test %d\n", 1);
+    fclose(f);
+  }
+  ezdump(sample, sizeof(sample));
+  ezdump(sample, 0);
 }
 
 void test_messages(void) {

@@ -503,8 +503,8 @@ static grpc_err call_finish_internal(grpc_call *call, grpc_status status,
                 .source.ptr = stream,
                 .read_callback = data_source_read_callback2,
             };
-            if (nghttp2_submit_data(call->session->ngsession, NGHTTP2_FLAG_NONE, call->stream_id,
-                                    &data_provider) != 0)
+            if (nghttp2_submit_data(call->session->ngsession, NGHTTP2_FLAG_END_STREAM,
+                                    call->stream_id, &data_provider) != 0)
               err = GRPC_ERR_PROTOCOL;
             else
               stream->is_data_active = true;
@@ -680,7 +680,7 @@ GRPC_API grpc_err grpc_call_send(grpc_call *call, grpc_message *message) {
         .source.ptr = stream,
         .read_callback = data_source_read_callback2,
     };
-    if (nghttp2_submit_data(call->session->ngsession, NGHTTP2_FLAG_NONE, call->stream_id,
+    if (nghttp2_submit_data(call->session->ngsession, NGHTTP2_FLAG_END_STREAM, call->stream_id,
                             &data_provider) != 0)
       return GRPC_ERR_PROTOCOL;
     stream->is_data_active = true;

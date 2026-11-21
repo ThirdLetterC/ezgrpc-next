@@ -275,7 +275,7 @@ if(GRPC_BUILD_TESTS)
     set(GRPC_TEST_TARGETS "${GRPC_TEST_TARGETS}" PARENT_SCOPE)
   endfunction()
 
-  foreach(name IN ITEMS api list mem metadata timeout compression health interceptor status_details reflection version client)
+  foreach(name IN ITEMS api list mem metadata timeout compression health interceptor status_details reflection version client integration)
     grpc_add_unit_test(${name} "src/tests/${name}.c")
   endforeach()
 
