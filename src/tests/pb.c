@@ -126,9 +126,9 @@ static void *pb_fail_realloc([[maybe_unused]] void *p, [[maybe_unused]] size_t s
   return nullptr;
 }
 
-static void pb_noop_free(void *p) {
-  free(p);
-}
+/* a real no-op: the failing allocator hands out nothing, and anything freed while it is
+ * installed came from the default allocator (_aligned_malloc on MSVC), not libc malloc */
+static void pb_noop_free([[maybe_unused]] void *p) {}
 
 static void *pb_fail_aligned([[maybe_unused]] size_t a, [[maybe_unused]] size_t sz) {
   return nullptr;
