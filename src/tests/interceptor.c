@@ -61,9 +61,43 @@ void test_bearer_auth_interceptor(void) {
   grpc_server_free(server);
 }
 
+static void *fail_malloc([[maybe_unused]] size_t n) {
+  return nullptr;
+}
+static void *fail_calloc([[maybe_unused]] size_t a, [[maybe_unused]] size_t b) {
+  return nullptr;
+}
+
+/* The built-in interceptors fail closed: without their state (allocation failure) or with no
+ * validator, they reject calls instead of silently letting everything through. */
+void test_builtin_interceptors_fail_closed(void) {
+  grpc_set_allocator(&(grpc_allocator){.malloc = fail_malloc, .calloc = fail_calloc});
+  grpc_interceptor auth = grpc_interceptor_bearer_auth(validator, nullptr);
+  grpc_interceptor rl = grpc_interceptor_rate_limit(100.0, 10);
+  grpc_set_allocator(nullptr);
+  TEST_ASSERT_NULL(auth.userdata);
+  TEST_ASSERT_NULL(rl.userdata);
+
+  /* with no state the hooks return before looking at the call */
+  const char *msg = nullptr;
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_INTERNAL, auth.on_call(nullptr, &msg, auth.userdata));
+  TEST_ASSERT_NOT_NULL(msg);
+  msg = nullptr;
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_INTERNAL, rl.on_call(nullptr, &msg, rl.userdata));
+  TEST_ASSERT_NOT_NULL(msg);
+
+  grpc_interceptor no_validator = grpc_interceptor_bearer_auth(nullptr, nullptr);
+  TEST_ASSERT_NOT_NULL(no_validator.userdata);
+  msg = nullptr;
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_UNAUTHENTICATED,
+                        no_validator.on_call(nullptr, &msg, no_validator.userdata));
+  no_validator.userdata_free(no_validator.userdata);
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_interceptor_registration);
   RUN_TEST(test_bearer_auth_interceptor);
+  RUN_TEST(test_builtin_interceptors_fail_closed);
   return UNITY_END();
 }

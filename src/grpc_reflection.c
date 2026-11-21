@@ -64,12 +64,20 @@ static uint64_t read_varint(const uint8_t *buf, size_t len, size_t *seek) {
   size_t shift = 0;
   while (*seek < len) {
     uint8_t b = buf[(*seek)++];
-    val |= (uint64_t)(b & 0x7F) << shift;
+    /* bits past the 64th are dropped: shifting by >= 64 is undefined behavior */
+    if (shift < 64)
+      val |= (uint64_t)(b & 0x7F) << shift;
     if (!(b & 0x80))
       break;
     shift += 7;
   }
   return val;
+}
+
+/* Returns seek advanced by n bytes, clamped to limit. Requires seek <= limit. Comparing n with
+ * the remaining length (instead of seek + n with limit) cannot overflow on a hostile length. */
+static size_t skip_bytes(size_t seek, uint64_t n, size_t limit) {
+  return n <= limit - seek ? seek + (size_t)n : limit;
 }
 
 /* Returns the server's reflection state, creating it on first use; nullptr if out of memory. */
@@ -262,24 +270,24 @@ static void reflection_on_message(grpc_call *call, const grpc_message *in_msg, v
 
     if (field_num == 7 && wire_type == 2) {
       // list_services
-      size_t slen = (size_t)read_varint(req_data, req_len, &seek);
-      seek += slen;
+      uint64_t slen = read_varint(req_data, req_len, &seek);
+      seek = skip_bytes(seek, slen, req_len);
       is_list_services = true;
     } else if ((field_num == 3 || field_num == 4) && wire_type == 2) {
       // file_by_filename (3) or file_containing_symbol (4)
-      size_t slen = (size_t)read_varint(req_data, req_len, &seek);
-      if (seek + slen <= req_len) {
-        size_t cpy = slen < MAX_SYMBOL_LEN - 1 ? slen : MAX_SYMBOL_LEN - 1;
+      uint64_t slen = read_varint(req_data, req_len, &seek);
+      if (slen <= req_len - seek) {
+        size_t cpy = slen < MAX_SYMBOL_LEN - 1 ? (size_t)slen : MAX_SYMBOL_LEN - 1;
         memcpy(queried_symbol, req_data + seek, cpy);
         queried_symbol[cpy] = '\0';
       }
-      seek += slen;
+      seek = skip_bytes(seek, slen, req_len);
       is_file_query = true;
     } else if (wire_type == 0) {
       read_varint(req_data, req_len, &seek);
     } else if (wire_type == 2) {
-      size_t skip = (size_t)read_varint(req_data, req_len, &seek);
-      seek += skip;
+      uint64_t skip = read_varint(req_data, req_len, &seek);
+      seek = skip_bytes(seek, skip, req_len);
     } else {
       break;
     }

@@ -1078,10 +1078,16 @@ GRPC_API void grpc_client_response_free(grpc_client_response *response) {
 
 /* ---- Streaming & framing helpers -------------------------------------------- */
 
-/* Returns the next subchannel in round-robin order, regardless of its connection state. */
+/* Returns the next subchannel in round-robin order, regardless of its connection state,
+ * skipping subchannels busy with an open stream when an idle one exists. If all are busy it
+ * returns the next one anyway and stream_open_on_sub() reports GRPC_ERR_STATE. */
 static client_subchannel *pick_subchannel(grpc_client *c) {
-  size_t idx = c->rr_next++ % c->nb_subs;
-  return &c->subs[idx];
+  for (size_t i = 0; i < c->nb_subs; i++) {
+    client_subchannel *s = &c->subs[c->rr_next++ % c->nb_subs];
+    if (s->active_stream == nullptr)
+      return s;
+  }
+  return &c->subs[c->rr_next++ % c->nb_subs];
 }
 
 /* Appends one gRPC length-prefixed message to dst, compressing it with config.compression first
@@ -1138,6 +1144,13 @@ static void stream_free_internal(grpc_client_stream *st) {
 static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *method,
                                               const grpc_metadata *metadata, size_t nb_metadata,
                                               uint32_t timeout_ms, grpc_err *out_err) {
+  /* A subchannel carries one RPC at a time: every nghttp2 callback routes to active_stream, so
+   * replacing it would silently orphan the stream already open there. */
+  if (s->active_stream != nullptr) {
+    if (out_err != nullptr)
+      *out_err = GRPC_ERR_STATE;
+    return nullptr;
+  }
   grpc_err err = sub_connect(s);
   if (err != GRPC_OK) {
     if (out_err != nullptr)
@@ -1358,8 +1371,22 @@ static void sleep_ms(uint32_t ms) {
  * next subchannel after a backoff that starts at retry_backoff_ms and doubles while below 5 s,
  * when the attempt fails with GRPC_ERR_IO / GRPC_ERR_CLOSED or completes with UNAVAILABLE. Other
  * errors return immediately. *out is reset before each attempt and holds the last attempt's
- * response. on_message, when set, sees messages from every attempt, so a retried
- * server-streaming call can deliver duplicates. */
+ * response. Once on_message has seen a message the call is committed (as in gRPC's retry
+ * design) and is not retried, so the application never receives a message twice. */
+typedef struct delivery_counter {
+  void (*on_message)(const grpc_message *msg, void *userdata);
+  void *userdata;
+  size_t delivered;
+} delivery_counter;
+
+/* on_message trampoline for execute_with_retries(): forwards to the caller's callback and counts
+ * deliveries so a committed call is not retried. */
+static void count_delivery(const grpc_message *msg, void *userdata) {
+  delivery_counter *dc = userdata;
+  dc->delivered++;
+  dc->on_message(msg, dc->userdata);
+}
+
 static grpc_err execute_with_retries(grpc_client *c, const char *method, const void *req_data,
                                      size_t req_len, const grpc_metadata *metadata,
                                      size_t nb_metadata, uint32_t timeout_ms,
@@ -1372,6 +1399,7 @@ static grpc_err execute_with_retries(grpc_client *c, const char *method, const v
   uint32_t max_attempts = 1 + c->config.max_retries;
   uint32_t backoff = c->config.retry_backoff_ms;
   grpc_err last_err = GRPC_OK;
+  delivery_counter dc = {.on_message = on_message, .userdata = userdata};
 
   for (uint32_t attempt = 0; attempt < max_attempts; attempt++) {
     if (attempt > 0) {
@@ -1391,8 +1419,10 @@ static grpc_err execute_with_retries(grpc_client *c, const char *method, const v
         continue;
       return open_err;
     }
-    st->on_message = on_message;
-    st->on_message_userdata = userdata;
+    if (on_message != nullptr) {
+      st->on_message = count_delivery;
+      st->on_message_userdata = &dc;
+    }
     grpc_err send_err = grpc_client_stream_send(st, req_data, req_len);
     if (send_err != GRPC_OK) {
       stream_free_internal(st);
@@ -1404,7 +1434,7 @@ static grpc_err execute_with_retries(grpc_client *c, const char *method, const v
     last_err = grpc_client_stream_finish(st, out);
     bool transient = (last_err == GRPC_ERR_IO || last_err == GRPC_ERR_CLOSED) ||
                      (last_err == GRPC_OK && out->status == GRPC_STATUS_UNAVAILABLE);
-    if (!transient)
+    if (!transient || dc.delivered > 0)
       return last_err;
   }
   return last_err;

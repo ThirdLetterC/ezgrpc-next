@@ -157,11 +157,70 @@ void test_status_details_unknown_fields_and_errors(void) {
   grpc_status_details_free(nullptr);
 }
 
+/* Lengths near SIZE_MAX used to wrap `seek + len` past the bounds checks (out-of-bounds read,
+ * and skips that moved backwards). Every decode must stay in bounds and terminate. */
+void test_status_details_hostile_lengths(void) {
+  /* 0xFF x9 + 0x01: a length of 2^64 - 1 */
+#define HUGE_LEN 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01
+  const uint8_t huge_msg[] = {0x12, HUGE_LEN, 'a', 'b'};
+  const uint8_t huge_any[] = {0x1A, HUGE_LEN, 'a', 'b'};
+  const uint8_t huge_skip[] = {0x52, HUGE_LEN, 0x08, 0x05};
+  const uint8_t huge_in_any[] = {0x1A, 0x0C, 0x0A, HUGE_LEN, 'x'};
+  const uint8_t huge_skip_in_any[] = {0x1A, 0x0C, 0x32, HUGE_LEN, 'x'};
+  /* overlong varint (11 bytes, past 64 bits) for the code */
+  const uint8_t overlong[] = {0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                              0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01};
+#undef HUGE_LEN
+  const struct {
+    const uint8_t *data;
+    size_t len;
+  } cases[] = {
+      {huge_msg, sizeof(huge_msg)},
+      {huge_any, sizeof(huge_any)},
+      {huge_skip, sizeof(huge_skip)},
+      {huge_in_any, sizeof(huge_in_any)},
+      {huge_skip_in_any, sizeof(huge_skip_in_any)},
+      {overlong, sizeof(overlong)},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    size_t b64_len = 0;
+    char *b64 = grpc_metadata_encode_bin(cases[i].data, cases[i].len, &b64_len);
+    TEST_ASSERT_NOT_NULL(b64);
+    int32_t code = 0;
+    char *msg = nullptr, *url = nullptr;
+    uint8_t *val = nullptr;
+    size_t vlen = 0;
+    grpc_err e1 = grpc_status_details_decode(b64, &code, &msg, &url, &val, &vlen);
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, e1); /* lenient: skips what does not fit */
+    TEST_ASSERT_NULL(msg);              /* nothing in these inputs is a complete message field */
+    grpc_free(msg);
+    grpc_free(url);
+    grpc_free(val);
+    grpc_status_details all = {0};
+    grpc_err e2 = grpc_status_details_decode_all(b64, &all);
+    (void)e2; /* strict: may reject; it only has to stay in bounds */
+    grpc_status_details_free(&all);
+    grpc_free(b64);
+  }
+
+  /* a repeated message field keeps the last value and does not leak the first */
+  const uint8_t repeated[] = {0x12, 0x01, 'a', 0x12, 0x01, 'b'};
+  size_t b64_len = 0;
+  char *b64 = grpc_metadata_encode_bin(repeated, sizeof(repeated), &b64_len);
+  char *msg = nullptr;
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_status_details_decode(b64, nullptr, &msg, nullptr, nullptr, nullptr));
+  TEST_ASSERT_EQUAL_STRING("b", msg);
+  grpc_free(msg);
+  grpc_free(b64);
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_status_details_roundtrip_with_any);
   RUN_TEST(test_status_details_basic_roundtrip);
   RUN_TEST(test_status_details_decode_all_multiple);
   RUN_TEST(test_status_details_unknown_fields_and_errors);
+  RUN_TEST(test_status_details_hostile_lengths);
   return UNITY_END();
 }

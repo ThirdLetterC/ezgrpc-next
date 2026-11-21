@@ -136,8 +136,10 @@ GRPC_API grpc_err grpc_client_unary(grpc_client *client, const char *method, con
  * Executes a server-streaming gRPC call. Invokes ``on_message`` for each
  * response message as it arrives, and populates ``out`` with headers, trailers,
  * and final status. ``on_message`` runs on the calling thread and ``msg`` is
- * only valid during the callback. Retries work as for grpc_client_unary(), so
- * after a retried attempt ``on_message`` may see messages again.
+ * only valid during the callback. Retries work as for grpc_client_unary(), but
+ * only until the first message reaches ``on_message``: after that the call is
+ * committed and a failure is returned instead of retried, so ``on_message``
+ * never sees a message twice.
  */
 GRPC_API grpc_err grpc_client_server_stream(
     grpc_client *client, const char *method, const void *req_data, size_t req_len,
@@ -153,6 +155,11 @@ GRPC_API grpc_err grpc_client_server_stream(
  * ``metadata`` is sent with the request headers. ``timeout_ms`` of 0 uses
  * ``grpc_client_config.timeout_ms``. No retries are made. Returns nullptr on
  * failure and writes the error code to ``*out_err`` if non-null.
+ *
+ * Each connection carries one RPC at a time. With several targets an idle
+ * connection is picked; if every connection already has an open stream, this
+ * (and grpc_client_unary() / grpc_client_server_stream()) fails with
+ * GRPC_ERR_STATE until a stream is finished or cancelled.
  */
 GRPC_API GRPC_NODISCARD grpc_client_stream *
 grpc_client_stream_open(grpc_client *client, const char *method, const grpc_metadata *metadata,

@@ -68,7 +68,9 @@ typedef bool (*grpc_token_validator_fn)(const char *token, void *userdata);
  * An interceptor that ends calls with UNAUTHENTICATED unless they carry
  * ``authorization: Bearer <token>`` accepted by ``validator``. ``validator``
  * runs on the server thread. The returned struct owns allocated state: pass it
- * to grpc_server_add_interceptor(), which takes ownership.
+ * to grpc_server_add_interceptor(), which takes ownership. It fails closed: if
+ * its state cannot be allocated, or ``validator`` is nullptr, every call it
+ * matches is rejected (INTERNAL or UNAUTHENTICATED).
  */
 GRPC_API grpc_interceptor grpc_interceptor_bearer_auth(grpc_token_validator_fn validator,
                                                        void *userdata);
@@ -78,6 +80,7 @@ GRPC_API grpc_interceptor grpc_interceptor_bearer_auth(grpc_token_validator_fn v
  * once ``burst`` tokens are consumed faster than ``requests_per_sec``. The
  * bucket is shared by all calls the interceptor matches; ``burst`` of 0 acts
  * as 1. Ownership of the returned struct works as for
- * grpc_interceptor_bearer_auth().
+ * grpc_interceptor_bearer_auth(). If its state cannot be allocated, every call
+ * it matches is rejected with INTERNAL rather than left unlimited.
  */
 GRPC_API grpc_interceptor grpc_interceptor_rate_limit(double requests_per_sec, size_t burst);

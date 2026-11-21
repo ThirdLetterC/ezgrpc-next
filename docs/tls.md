@@ -92,7 +92,7 @@ grpc_err err = grpc_server_reload_tls(server, &(grpc_tls_config){
 });
 ```
 
-If loading fails, the previous TLS configuration remains active and `grpc_server_reload_tls()` returns an error. Retired contexts are retained safely for in-flight sessions and freed on `grpc_server_free()`.
+If loading fails, the previous TLS configuration remains active and `grpc_server_reload_tls()` returns an error. Reloading only applies to a server started with TLS: on a plaintext server it returns `GRPC_ERR_STATE` rather than switching new connections to TLS. Retired contexts are retained safely for in-flight sessions and freed on `grpc_server_free()`.
 
 ---
 

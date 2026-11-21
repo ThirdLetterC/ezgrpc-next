@@ -175,6 +175,22 @@ GRPC_API grpc_health_status grpc_health_get_status(grpc_server *server, const ch
   return res;
 }
 
+/* Reads a protobuf varint at *idx, advancing it, without reading past `len`. A truncated varint
+ * returns the bits read so far; bits past the 64th are dropped (a shift by >= 64 is undefined). */
+static uint64_t read_varint(const uint8_t *data, size_t len, size_t *idx) {
+  uint64_t val = 0;
+  unsigned shift = 0;
+  while (*idx < len) {
+    uint8_t b = data[(*idx)++];
+    if (shift < 64)
+      val |= (uint64_t)(b & 0x7F) << shift;
+    if (!(b & 0x80))
+      break;
+    shift += 7;
+  }
+  return val;
+}
+
 /* Extracts HealthCheckRequest.service (field 1) from the serialized request into `out_service`
  * (truncated to max_len - 1 bytes, empty if absent or malformed). Skips varint and
  * length-delimited fields; stops at any other wire type. Only single-byte tags are understood. */
@@ -193,38 +209,21 @@ static void parse_health_request_service(const uint8_t *data, size_t len, char *
     uint8_t wire_type = tag & 0x07;
 
     if (field_num == 1 && wire_type == 2) {
-      // Varint length
-      size_t str_len = 0;
-      size_t shift = 0;
-      while (idx < len) {
-        uint8_t b = data[idx++];
-        str_len |= (size_t)(b & 0x7F) << shift;
-        if (!(b & 0x80))
-          break;
-        shift += 7;
-      }
-      if (idx + str_len <= len) {
-        size_t cpy = str_len < max_len - 1 ? str_len : max_len - 1;
+      uint64_t str_len = read_varint(data, len, &idx);
+      /* compare with the remaining length: idx + str_len could overflow on a hostile length */
+      if (str_len <= len - idx) {
+        size_t cpy = str_len < max_len - 1 ? (size_t)str_len : max_len - 1;
         memcpy(out_service, data + idx, cpy);
         out_service[cpy] = '\0';
       }
       return;
     } else if (wire_type == 0) {
-      // varint
-      while (idx < len && (data[idx++] & 0x80)) {
-      }
+      (void)read_varint(data, len, &idx);
     } else if (wire_type == 2) {
-      // skip length-delimited
-      size_t skip_len = 0;
-      size_t shift = 0;
-      while (idx < len) {
-        uint8_t b = data[idx++];
-        skip_len |= (size_t)(b & 0x7F) << shift;
-        if (!(b & 0x80))
-          break;
-        shift += 7;
-      }
-      idx += skip_len;
+      uint64_t skip_len = read_varint(data, len, &idx);
+      if (skip_len > len - idx)
+        return;
+      idx += (size_t)skip_len;
     } else {
       break;
     }

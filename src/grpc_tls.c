@@ -37,9 +37,10 @@ GRPC_API void *grpc_server_tls_native(grpc_server *server) {
 
 /* Builds a backend context from `cfg` and makes it the server's active context. The previous
  * context is not freed but moved to the retired list, because live sessions created from it may
- * still use it; retired contexts are freed by tls_free(). If growing that list fails, the old
- * context is freed right away. On failure the previous context stays active. Expects the PEM
- * lengths in `cfg` to be already filled in. */
+ * still use it (not every backend reference-counts its context); retired contexts are freed by
+ * tls_free(). The list is grown before anything is switched, so if that allocation fails the new
+ * context is dropped and GRPC_ERR_NOMEM returned. On any failure the previous context stays
+ * active. Expects the PEM lengths in `cfg` to be already filled in. */
 grpc_err tls_enable(grpc_server *server, const grpc_tls_config *cfg) {
   grpc_tls_ctx *ctx = tls_backend_ctx_new(cfg);
   if (ctx == nullptr) {
@@ -49,12 +50,13 @@ grpc_err tls_enable(grpc_server *server, const grpc_tls_config *cfg) {
   if (server->tls_ctx != nullptr) {
     grpc_tls_ctx **retired = grpc_realloc(server->retired_tls_ctxs,
                                           (server->nb_retired_tls_ctxs + 1) * sizeof(*retired));
-    if (retired != nullptr) {
-      server->retired_tls_ctxs = retired;
-      server->retired_tls_ctxs[server->nb_retired_tls_ctxs++] = server->tls_ctx;
-    } else {
-      tls_backend_ctx_free(server->tls_ctx);
+    if (retired == nullptr) {
+      /* never free the old context here: live sessions may still be using it */
+      tls_backend_ctx_free(ctx);
+      return GRPC_ERR_NOMEM;
     }
+    server->retired_tls_ctxs = retired;
+    server->retired_tls_ctxs[server->nb_retired_tls_ctxs++] = server->tls_ctx;
   }
   server->tls_ctx = ctx;
   server->is_tls = 1;
@@ -63,7 +65,9 @@ grpc_err tls_enable(grpc_server *server, const grpc_tls_config *cfg) {
 
 /* Validates `tls` (exactly one of the file pair or the PEM pair, each complete), fills in the
  * lengths of NUL-terminated PEM strings given with a zero length, and installs the new context
- * with tls_enable(). Existing connections keep the context they were created with. */
+ * with tls_enable(). Existing connections keep the context they were created with. A server
+ * started without TLS is refused with GRPC_ERR_STATE: a "reload" must not switch its new
+ * connections from plaintext to TLS under existing clients. */
 GRPC_API grpc_err grpc_server_reload_tls(grpc_server *server, const grpc_tls_config *tls) {
   if (server == nullptr || tls == nullptr)
     return GRPC_ERR_INVALID;
@@ -75,6 +79,8 @@ GRPC_API grpc_err grpc_server_reload_tls(grpc_server *server, const grpc_tls_con
     return GRPC_ERR_INVALID;
   if (has_pems && (tls->cert_pem == nullptr || tls->key_pem == nullptr))
     return GRPC_ERR_INVALID;
+  if (!server->is_tls)
+    return GRPC_ERR_STATE;
   grpc_tls_config normalized = *tls;
   if (normalized.cert_pem != nullptr && normalized.cert_pem_len == 0)
     normalized.cert_pem_len = strlen(normalized.cert_pem);

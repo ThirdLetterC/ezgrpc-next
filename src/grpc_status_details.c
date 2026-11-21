@@ -45,12 +45,20 @@ static uint64_t read_varint(const uint8_t *buf, size_t len, size_t *seek) {
   size_t shift = 0;
   while (*seek < len) {
     uint8_t b = buf[(*seek)++];
-    val |= (uint64_t)(b & 0x7F) << shift;
+    /* bits past the 64th are dropped: shifting by >= 64 is undefined behavior */
+    if (shift < 64)
+      val |= (uint64_t)(b & 0x7F) << shift;
     if (!(b & 0x80))
       break;
     shift += 7;
   }
   return val;
+}
+
+/* Returns seek advanced by n bytes, clamped to limit. Requires seek <= limit. Comparing n with
+ * the remaining length (instead of seek + n with limit) cannot overflow on a hostile length. */
+static size_t skip_bytes(size_t seek, uint64_t n, size_t limit) {
+  return n <= limit - seek ? seek + (size_t)n : limit;
 }
 
 /* Sizes the message in a first pass, then writes it into one buffer and base64-encodes it. The
@@ -187,60 +195,68 @@ GRPC_API grpc_err grpc_status_details_decode(const char *base64_str, int32_t *ou
         *out_code = (int32_t)c;
     } else if (field_num == 2 && wire_type == 2) {
       // message
-      size_t mlen = (size_t)read_varint(raw, raw_len, &seek);
-      if (seek + mlen <= raw_len && out_message) {
-        char *m = grpc_malloc(mlen + 1);
+      uint64_t mlen = read_varint(raw, raw_len, &seek);
+      if (mlen <= raw_len - seek && out_message) {
+        char *m = grpc_malloc((size_t)mlen + 1);
         if (m) {
-          memcpy(m, raw + seek, mlen);
+          memcpy(m, raw + seek, (size_t)mlen);
           m[mlen] = '\0';
+          grpc_free(*out_message); /* a repeated field replaces the earlier one */
           *out_message = m;
         }
       }
-      seek += mlen;
+      seek = skip_bytes(seek, mlen, raw_len);
     } else if (field_num == 3 && wire_type == 2) {
       // Any
-      size_t any_len = (size_t)read_varint(raw, raw_len, &seek);
-      size_t any_end = seek + any_len;
-      while (seek < any_end && seek < raw_len) {
+      uint64_t any_len = read_varint(raw, raw_len, &seek);
+      size_t any_end = skip_bytes(seek, any_len, raw_len);
+      while (seek < any_end) {
         uint8_t any_tag = raw[seek++];
         uint8_t any_field = any_tag >> 3;
         uint8_t any_wire = any_tag & 0x07;
 
         if (any_field == 1 && any_wire == 2) {
-          size_t ulen = (size_t)read_varint(raw, raw_len, &seek);
-          if (seek + ulen <= any_end && out_type_url) {
-            char *u = grpc_malloc(ulen + 1);
+          uint64_t ulen = read_varint(raw, any_end, &seek);
+          if (ulen <= any_end - seek && out_type_url) {
+            char *u = grpc_malloc((size_t)ulen + 1);
             if (u) {
-              memcpy(u, raw + seek, ulen);
+              memcpy(u, raw + seek, (size_t)ulen);
               u[ulen] = '\0';
+              grpc_free(*out_type_url);
               *out_type_url = u;
             }
           }
-          seek += ulen;
+          seek = skip_bytes(seek, ulen, any_end);
         } else if (any_field == 2 && any_wire == 2) {
-          size_t vlen = (size_t)read_varint(raw, raw_len, &seek);
-          if (seek + vlen <= any_end && out_detail_value) {
-            uint8_t *v = grpc_malloc(vlen);
+          uint64_t vlen = read_varint(raw, any_end, &seek);
+          if (vlen <= any_end - seek && out_detail_value) {
+            uint8_t *v = grpc_malloc((size_t)vlen);
             if (v) {
-              memcpy(v, raw + seek, vlen);
+              memcpy(v, raw + seek, (size_t)vlen);
+              grpc_free(*out_detail_value);
               *out_detail_value = v;
               if (out_detail_len)
-                *out_detail_len = vlen;
+                *out_detail_len = (size_t)vlen;
             }
           }
-          seek += vlen;
+          seek = skip_bytes(seek, vlen, any_end);
         } else if (any_wire == 0) {
-          read_varint(raw, raw_len, &seek);
+          read_varint(raw, any_end, &seek);
         } else if (any_wire == 2) {
-          size_t sk = (size_t)read_varint(raw, raw_len, &seek);
-          seek += sk;
+          uint64_t sk = read_varint(raw, any_end, &seek);
+          seek = skip_bytes(seek, sk, any_end);
+        } else {
+          break;
         }
       }
+      seek = any_end;
     } else if (wire_type == 0) {
       read_varint(raw, raw_len, &seek);
     } else if (wire_type == 2) {
-      size_t sk = (size_t)read_varint(raw, raw_len, &seek);
-      seek += sk;
+      uint64_t sk = read_varint(raw, raw_len, &seek);
+      seek = skip_bytes(seek, sk, raw_len);
+    } else {
+      break;
     }
   }
 
@@ -284,30 +300,30 @@ GRPC_API grpc_err grpc_status_details_decode_all(const char *base64_str, grpc_st
     if (field_num == 1 && wire_type == 0) {
       out->code = (int32_t)read_varint(raw, raw_len, &seek);
     } else if (field_num == 2 && wire_type == 2) {
-      size_t mlen = (size_t)read_varint(raw, raw_len, &seek);
-      if (seek + mlen > raw_len) {
+      uint64_t mlen = read_varint(raw, raw_len, &seek);
+      if (mlen > raw_len - seek) {
         grpc_free(raw);
         grpc_status_details_free(out);
         return GRPC_ERR_INVALID;
       }
       grpc_free(out->message);
-      out->message = grpc_malloc(mlen + 1);
+      out->message = grpc_malloc((size_t)mlen + 1);
       if (out->message == nullptr) {
         grpc_free(raw);
         grpc_status_details_free(out);
         return GRPC_ERR_NOMEM;
       }
-      memcpy(out->message, raw + seek, mlen);
+      memcpy(out->message, raw + seek, (size_t)mlen);
       out->message[mlen] = '\0';
-      seek += mlen;
+      seek += (size_t)mlen;
     } else if (field_num == 3 && wire_type == 2) {
-      size_t any_len = (size_t)read_varint(raw, raw_len, &seek);
-      if (seek + any_len > raw_len) {
+      uint64_t any_len = read_varint(raw, raw_len, &seek);
+      if (any_len > raw_len - seek) {
         grpc_free(raw);
         grpc_status_details_free(out);
         return GRPC_ERR_INVALID;
       }
-      size_t any_end = seek + any_len;
+      size_t any_end = seek + (size_t)any_len;
       char *url = nullptr;
       uint8_t *val = nullptr;
       size_t vlen = 0;
@@ -316,24 +332,25 @@ GRPC_API grpc_err grpc_status_details_decode_all(const char *base64_str, grpc_st
         uint8_t any_field = any_tag >> 3;
         uint8_t any_wire = any_tag & 0x07;
         if (any_field == 1 && any_wire == 2) {
-          size_t ulen = (size_t)read_varint(raw, any_end, &seek);
-          if (seek + ulen > any_end)
+          uint64_t ulen = read_varint(raw, any_end, &seek);
+          if (ulen > any_end - seek)
             break;
           grpc_free(url);
-          url = grpc_malloc(ulen + 1);
+          url = grpc_malloc((size_t)ulen + 1);
           if (url == nullptr) {
             grpc_free(val);
             grpc_free(raw);
             grpc_status_details_free(out);
             return GRPC_ERR_NOMEM;
           }
-          memcpy(url, raw + seek, ulen);
+          memcpy(url, raw + seek, (size_t)ulen);
           url[ulen] = '\0';
-          seek += ulen;
+          seek += (size_t)ulen;
         } else if (any_field == 2 && any_wire == 2) {
-          size_t len = (size_t)read_varint(raw, any_end, &seek);
-          if (seek + len > any_end)
+          uint64_t len64 = read_varint(raw, any_end, &seek);
+          if (len64 > any_end - seek)
             break;
+          size_t len = (size_t)len64;
           grpc_free(val);
           val = len > 0 ? grpc_malloc(len) : nullptr;
           if (len > 0 && val == nullptr) {
@@ -349,8 +366,8 @@ GRPC_API grpc_err grpc_status_details_decode_all(const char *base64_str, grpc_st
         } else if (any_wire == 0) {
           read_varint(raw, any_end, &seek);
         } else if (any_wire == 2) {
-          size_t sk = (size_t)read_varint(raw, any_end, &seek);
-          seek = seek + sk <= any_end ? seek + sk : any_end;
+          uint64_t sk = read_varint(raw, any_end, &seek);
+          seek = skip_bytes(seek, sk, any_end);
         } else {
           break;
         }
@@ -377,8 +394,8 @@ GRPC_API grpc_err grpc_status_details_decode_all(const char *base64_str, grpc_st
     } else if (wire_type == 0) {
       read_varint(raw, raw_len, &seek);
     } else if (wire_type == 2) {
-      size_t sk = (size_t)read_varint(raw, raw_len, &seek);
-      seek = seek + sk <= raw_len ? seek + sk : raw_len;
+      uint64_t sk = read_varint(raw, raw_len, &seek);
+      seek = skip_bytes(seek, sk, raw_len);
     } else {
       break;
     }

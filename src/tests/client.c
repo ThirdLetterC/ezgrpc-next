@@ -287,6 +287,22 @@ static void flaky_unary(grpc_call *call, const grpc_message *req, void *userdata
   (void)grpc_call_reply_data(call, req->data, req->len);
 }
 
+/* Server-streaming handler that sends one message, then fails with UNAVAILABLE (a retryable
+ * status) on every attempt. */
+static void flaky_stream(grpc_call *call, [[maybe_unused]] const grpc_message *req,
+                         void *userdata) {
+  int *attempts = userdata;
+  (*attempts)++;
+  (void)grpc_call_send_data(call, "partial", 7);
+  (void)grpc_call_finish(call, GRPC_STATUS_UNAVAILABLE, "failed after a message");
+}
+
+static void count_messages(const grpc_message *msg, void *userdata) {
+  int *count = userdata;
+  (void)msg;
+  (*count)++;
+}
+
 static void count_hits_unary(grpc_call *call, const grpc_message *req, void *userdata) {
   int *hits = userdata;
   (*hits)++;
@@ -295,6 +311,7 @@ static void count_hits_unary(grpc_call *call, const grpc_message *req, void *use
 
 void test_client_streaming_bidi_retries_and_lb(void) {
   int flaky_attempts = 0;
+  int flaky_stream_attempts = 0;
   int hits_a = 0, hits_b = 0;
 
   grpc_server *srv_a = grpc_server_new(
@@ -318,6 +335,8 @@ void test_client_streaming_bidi_retries_and_lb(void) {
                                                            nullptr));
   TEST_ASSERT_EQUAL_INT(
       GRPC_OK, grpc_server_handle(srv_a, "/retry.Svc/Flaky", flaky_unary, &flaky_attempts));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(srv_a, "/retry.Svc/FlakyStream", flaky_stream,
+                                                    &flaky_stream_attempts));
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_server_handle(srv_a, "/lb.Svc/Ping", count_hits_unary, &hits_a));
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
@@ -355,6 +374,24 @@ void test_client_streaming_bidi_retries_and_lb(void) {
   TEST_ASSERT_EQUAL_MEMORY("9", resp.message->data, 1);
   grpc_client_response_free(&resp);
 
+  /* One RPC per connection: a second RPC while a stream is open fails with GRPC_ERR_STATE
+   * instead of silently orphaning the open stream. */
+  grpc_client_stream *busy =
+      grpc_client_stream_open(client, "/stream.Svc/Sum", nullptr, 0, 3000, &err);
+  TEST_ASSERT_NOT_NULL(busy);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(busy, "ab", 2));
+  TEST_ASSERT_NULL(grpc_client_stream_open(client, "/stream.Svc/Bidi", nullptr, 0, 3000, &err));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_STATE, err);
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_STATE,
+                        grpc_client_unary(client, "/lb.Svc/Ping", "x", 1, nullptr, 0, 0, &resp));
+  grpc_client_response_free(&resp);
+  /* the first stream is unaffected */
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(busy, "c", 1));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_finish(busy, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  TEST_ASSERT_EQUAL_MEMORY("3", resp.message->data, 1);
+  grpc_client_response_free(&resp);
+
   /* Bidi streaming: interleaved send & recv */
   grpc_client_stream *bs =
       grpc_client_stream_open(client, "/stream.Svc/Bidi", nullptr, 0, 3000, &err);
@@ -379,6 +416,16 @@ void test_client_streaming_bidi_retries_and_lb(void) {
       GRPC_OK, grpc_client_unary(client, "/retry.Svc/Flaky", "ok", 2, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   TEST_ASSERT_EQUAL_INT(2, flaky_attempts);
+  grpc_client_response_free(&resp);
+
+  /* A server stream that already delivered a message is committed: no retry, no duplicates */
+  int seen = 0;
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_server_stream(client, "/retry.Svc/FlakyStream", "x", 1, nullptr,
+                                                  0, 0, count_messages, &seen, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_UNAVAILABLE, resp.status);
+  TEST_ASSERT_EQUAL_INT(1, seen);
+  TEST_ASSERT_EQUAL_INT(1, flaky_stream_attempts);
   grpc_client_response_free(&resp);
   grpc_client_free(client);
 
@@ -408,10 +455,87 @@ void test_client_streaming_bidi_retries_and_lb(void) {
   grpc_server_free(srv_b);
 }
 
+/* Health and reflection parse protobuf from the client by hand. A length near SIZE_MAX used to
+ * wrap `seek + len` past their bounds checks (out-of-bounds read) and make skips move backwards.
+ * The server must answer every hostile request and keep serving. */
+void test_hostile_protobuf_lengths(void) {
+  grpc_server *server = grpc_server_new(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
+  TEST_ASSERT_NOT_NULL(server);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_health_enable(server));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_reflection_enable(server));
+  pthread_t th;
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_thread, server));
+
+  grpc_err err = GRPC_OK;
+  grpc_client *client = grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
+                                                              .port = grpc_server_port(server),
+                                                              .timeout_ms = 3000},
+                                        &err);
+  TEST_ASSERT_NOT_NULL(client);
+
+#define HUGE_LEN 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01 /* 2^64 - 1 */
+  const uint8_t health_name[] = {0x0A, HUGE_LEN, 's', 'v', 'c'};
+  const uint8_t health_skip[] = {0x12, HUGE_LEN, 0x0A, 0x01, 'x'};
+  const uint8_t refl_symbol[] = {0x22, HUGE_LEN, 's', 'v', 'c'};
+  const uint8_t refl_list[] = {0x3A, HUGE_LEN, 0x22, 0x01, 'x'};
+  const uint8_t refl_skip[] = {0x12, HUGE_LEN, 0x22, 0x01, 'x'};
+#undef HUGE_LEN
+  const struct {
+    const char *method;
+    const uint8_t *data;
+    size_t len;
+  } cases[] = {
+      {"/grpc.health.v1.Health/Check", health_name, sizeof(health_name)},
+      {"/grpc.health.v1.Health/Check", health_skip, sizeof(health_skip)},
+      {"/grpc.reflection.v1.ServerReflection/ServerReflectionInfo", refl_symbol,
+       sizeof(refl_symbol)},
+      {"/grpc.reflection.v1.ServerReflection/ServerReflectionInfo", refl_list, sizeof(refl_list)},
+      {"/grpc.reflection.v1.ServerReflection/ServerReflectionInfo", refl_skip, sizeof(refl_skip)},
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    grpc_client_response resp = {0};
+    TEST_ASSERT_EQUAL_INT_MESSAGE(GRPC_OK,
+                                  grpc_client_unary(client, cases[i].method, cases[i].data,
+                                                    cases[i].len, nullptr, 0, 0, &resp),
+                                  cases[i].method);
+    grpc_client_response_free(&resp);
+  }
+
+  /* Too many headers resets only that stream (it used to kill the whole connection) */
+  grpc_metadata many[40];
+  char keys[40][16];
+  for (int i = 0; i < 40; i++) {
+    snprintf(keys[i], sizeof(keys[i]), "x-key-%d", i);
+    many[i] = (grpc_metadata){.key = keys[i], .value = "v"};
+  }
+  grpc_client_response big = {0};
+  grpc_err big_err =
+      grpc_client_unary(client, "/grpc.health.v1.Health/Check", "", 0, many, 40, 0, &big);
+  TEST_ASSERT_TRUE(big_err != GRPC_OK || big.status != GRPC_STATUS_OK);
+  grpc_client_response_free(&big);
+
+  /* still serving, on the same connection */
+  grpc_client_response resp = {0};
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_unary(client, "/grpc.health.v1.Health/Check", "", 0,
+                                                   nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  grpc_client_response_free(&resp);
+  grpc_server_stats stats = {0};
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_get_stats(server, &stats));
+  TEST_ASSERT_EQUAL_UINT64(1, stats.total_connections);
+
+  grpc_client_free(client);
+  grpc_server_stop(server);
+  pthread_join(th, nullptr);
+  grpc_server_free(server);
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_client_server_tcp_end_to_end);
   RUN_TEST(test_client_streaming_bidi_retries_and_lb);
+  RUN_TEST(test_hostile_protobuf_lengths);
 #ifndef _WIN32
   RUN_TEST(test_unix_domain_socket);
 #endif

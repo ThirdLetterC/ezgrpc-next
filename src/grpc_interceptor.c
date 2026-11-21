@@ -152,12 +152,18 @@ typedef struct bearer_auth_data {
 
 /* on_call hook of the bearer-auth interceptor: requires an "authorization: Bearer <token>"
  * header (scheme matched case-insensitively, extra spaces before the token skipped) and passes
- * the token to the validator. Returns UNAUTHENTICATED with a static message otherwise. A null
- * state (allocation failed in grpc_interceptor_bearer_auth()) lets every call through. */
+ * the token to the validator. Returns UNAUTHENTICATED with a static message otherwise. Fails
+ * closed: a null state (allocation failed in grpc_interceptor_bearer_auth()) or a null validator
+ * rejects every call, so an allocation failure can never switch authentication off. */
 static grpc_status bearer_auth_on_call(grpc_call *call, const char **message, void *userdata) {
   bearer_auth_data *auth = userdata;
-  if (auth == nullptr || auth->validator == nullptr) {
-    return GRPC_STATUS_OK;
+  if (auth == nullptr) {
+    *message = "authentication unavailable";
+    return GRPC_STATUS_INTERNAL;
+  }
+  if (auth->validator == nullptr) {
+    *message = "no token validator configured";
+    return GRPC_STATUS_UNAUTHENTICATED;
   }
 
   size_t len = 0;
@@ -183,7 +189,8 @@ static grpc_status bearer_auth_on_call(grpc_call *call, const char **message, vo
 }
 
 /* Allocates the validator state as userdata, released with grpc_free by interceptors_free(). If
- * the allocation fails the interceptor is still returned, with null userdata. */
+ * the allocation fails the interceptor is still returned, with null userdata, and rejects every
+ * call (see bearer_auth_on_call()). */
 GRPC_API grpc_interceptor grpc_interceptor_bearer_auth(grpc_token_validator_fn validator,
                                                        void *userdata) {
   bearer_auth_data *data = grpc_malloc(sizeof(*data));
@@ -219,12 +226,15 @@ static void rate_limit_free(void *userdata) {
 
 /* on_call hook of the rate limiter: refills the token bucket for the elapsed time (capped at
  * the burst size) and takes one token, or rejects the call with RESOURCE_EXHAUSTED. The bucket
- * is updated under its mutex. A null state lets every call through. */
+ * is updated under its mutex. Fails closed: a null state (allocation failed) rejects every call
+ * rather than silently removing the limit. */
 static grpc_status rate_limit_on_call([[maybe_unused]] grpc_call *call, const char **message,
                                       void *userdata) {
   rate_limit_data *rl = userdata;
-  if (rl == nullptr)
-    return GRPC_STATUS_OK;
+  if (rl == nullptr) {
+    *message = "rate limiter unavailable";
+    return GRPC_STATUS_INTERNAL;
+  }
 
   pthread_mutex_lock(&rl->lock);
   uint64_t now = grpc_time_now_ms();
@@ -248,7 +258,8 @@ static grpc_status rate_limit_on_call([[maybe_unused]] grpc_call *call, const ch
 }
 
 /* Starts with a full bucket. A non-positive rate never refills it; a zero burst becomes 1. If
- * the allocation fails the interceptor is still returned, with null userdata. */
+ * the allocation fails the interceptor is still returned, with null userdata, and rejects every
+ * call (see rate_limit_on_call()). */
 GRPC_API grpc_interceptor grpc_interceptor_rate_limit(double requests_per_sec, size_t burst) {
   rate_limit_data *rl = grpc_calloc(1, sizeof(*rl));
   if (rl != nullptr) {

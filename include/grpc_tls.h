@@ -45,8 +45,9 @@ typedef struct grpc_tls_config {
  * On failure, the previous TLS configuration remains active.
  * ``tls`` must name exactly one of the file pair or the PEM pair (else
  * GRPC_ERR_INVALID) and is not kept after the call. Call it from the server
- * thread. On a server started without TLS it enables TLS for new connections.
- * Returns GRPC_ERR_UNSUPPORTED when built without TLS.
+ * thread. Returns GRPC_ERR_STATE on a server started without TLS (a reload
+ * never switches a plaintext server to TLS), GRPC_ERR_NOMEM if the new context
+ * cannot be recorded, and GRPC_ERR_UNSUPPORTED when built without TLS.
  */
 GRPC_API grpc_err grpc_server_reload_tls(grpc_server *server, const grpc_tls_config *tls);
 

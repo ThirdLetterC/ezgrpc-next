@@ -38,6 +38,10 @@ void test_tls_invalid_files(void) {
   TEST_ASSERT_NULL(new_tls_server("test_cert.pem", "test_cert.pem"));
 }
 
+static void *fail_realloc([[maybe_unused]] void *p, [[maybe_unused]] size_t n) {
+  return nullptr;
+}
+
 void test_tls_server(void) {
   grpc_server *server = new_tls_server("test_cert.pem", "test_key.pem");
   TEST_ASSERT_NOT_NULL(server);
@@ -56,11 +60,27 @@ void test_tls_server(void) {
   TEST_ASSERT_NOT_NULL(grpc_server_tls_native(server));
   TEST_ASSERT_TRUE(grpc_server_tls_native(server) != old_ctx);
 
+  /* If the old context cannot be retired, the reload fails and the active context (which live
+   * sessions may use) is left untouched rather than freed. */
+  old_ctx = grpc_server_tls_native(server);
+  grpc_set_allocator(&(grpc_allocator){.realloc = fail_realloc});
+  grpc_err nomem = grpc_server_reload_tls(
+      server, &(grpc_tls_config){.cert_file = "test_cert.pem", .key_file = "test_key.pem"});
+  grpc_set_allocator(nullptr);
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_NOMEM, nomem);
+  TEST_ASSERT_EQUAL_PTR(old_ctx, grpc_server_tls_native(server));
+
   grpc_server_free(server);
 
   server = grpc_server_new(
       &(grpc_config){.port = 19995, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
   TEST_ASSERT_NOT_NULL(server);
+  TEST_ASSERT_NULL(grpc_server_tls_native(server));
+  /* a reload never turns a plaintext server into a TLS one */
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_ERR_STATE,
+      grpc_server_reload_tls(
+          server, &(grpc_tls_config){.cert_file = "test_cert.pem", .key_file = "test_key.pem"}));
   TEST_ASSERT_NULL(grpc_server_tls_native(server));
   grpc_server_free(server);
 }

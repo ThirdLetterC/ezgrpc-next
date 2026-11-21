@@ -214,9 +214,10 @@ static bool header_starts_with(const u8 *value, size_t value_len, const char *pr
  * on the name and value rcbufs and records the field in the stream's header array, then parses
  * the fields the server needs (:method, :scheme, :path with its route lookup, content-type
  * including grpc-web variants, grpc-encoding, grpc-accept-encoding, grpc-timeout, te); the
- * stored pointers stay valid until stream_free(). Returns 0, or 1 when the stream has more than
- * CONFIG_STREAM_MAX_HEADERS fields, which nghttp2 treats as NGHTTP2_ERR_CALLBACK_FAILURE: the
- * whole connection is closed, not just the stream. */
+ * stored pointers stay valid until stream_free(). Returns 0, or
+ * NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE when the stream has more than CONFIG_STREAM_MAX_HEADERS
+ * fields: nghttp2 then resets just that stream (RST_STREAM INTERNAL_ERROR). Any other non-zero
+ * value would be fatal to the session and drop every stream on the connection. */
 static int on_header_callback2([[maybe_unused]] nghttp2_session *session,
                                const nghttp2_frame *frame, nghttp2_rcbuf *name_rcbuf,
                                nghttp2_rcbuf *value_rcbuf, [[maybe_unused]] u8 flags,
@@ -229,7 +230,7 @@ static int on_header_callback2([[maybe_unused]] nghttp2_session *session,
 
   if (ezstream->nb_headers + 1 > CONFIG_STREAM_MAX_HEADERS) {
     LOG_ERROR(ezsession->server, "stream max headers exceeded\n");
-    return 1;
+    return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
   }
   nghttp2_vec vname = nghttp2_rcbuf_get_buf(name_rcbuf);
   nghttp2_vec vvalue = nghttp2_rcbuf_get_buf(value_rcbuf);
