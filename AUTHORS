@@ -1,0 +1,16 @@
+# This is the list of ezGRPC-next's significant contributors: "The ezGRPC-next Authors" named in
+# LICENSE.
+#
+# ezGRPC-next is a fork of EZgRPC2 (https://github.com/mnyoshie/ezgrpc2). Its authors are listed
+# first, as credited in that project's copyright notices and history.
+
+# EZgRPC2 (upstream)
+Minato Nakamura Yoshie (M. N. Yoshie) <https://github.com/mnyoshie>
+Al-buharie Amjari
+CEDoromal <https://github.com/cedoromal>
+
+# ezGRPC-next
+Yehor Smoliakov
+
+# Third-party code bundled in this repository keeps its own copyright, for example the Unity test
+# framework in src/tests/unity/ (Mike Karlesky, Mark VanderVoord and Greg Williams).

@@ -74,3 +74,9 @@ Full guides and code examples live in [`docs/`](docs/README.md):
 - [`examples/python_client_c_server/`](examples/python_client_c_server/) — Full Protobuf-C server + Python `grpcio` integration tests
 - [`examples/flatbuffers/`](examples/flatbuffers/) — Zero-copy FlatBuffers (`flatcc`) server + Python client
 - CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) tests Ubuntu 22.04/24.04 (GCC/Clang), Windows MSVC, `mimalloc`/`jemalloc`, AddressSanitizer, FlatBuffers, and all 7 TLS backends.
+
+---
+
+## Credits
+
+ezGRPC-next is a fork of [EZgRPC2](https://github.com/mnyoshie/ezgrpc2) by M. N. Yoshie and contributors. See [AUTHORS](AUTHORS) for the people behind both projects and [LICENSE](LICENSE) for the license.

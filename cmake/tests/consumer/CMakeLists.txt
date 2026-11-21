@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(grpc_consumer_test LANGUAGES C CXX)
+project(grpc_consumer_test LANGUAGES C)
 
 include(CTest)
 # A parent may already own these generic developer target names.
@@ -24,7 +24,7 @@ if(GRPC_BUILD_TESTS OR GRPC_BUILD_EXAMPLES OR GRPC_BUILD_INTEGRATION_TESTS OR GR
   message(FATAL_ERROR "grpc enabled standalone-only defaults in an embedded build")
 endif()
 
-add_executable(unrelated unrelated.cpp)
+add_executable(unrelated unrelated.c)
 add_executable(consumer consumer.c)
 target_link_libraries(consumer PRIVATE grpc::static)
 add_test(NAME consumer COMMAND consumer)
