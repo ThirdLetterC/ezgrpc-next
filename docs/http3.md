@@ -98,6 +98,26 @@ With TLS 1.3, a server that requires a client certificate may reject a client wi
 
 ---
 
+## Example
+
+[`examples/http3/`](../examples/http3/) has a server and a client:
+
+- **`server.c`** serves a small Greeter (unary, server-streaming and bidirectional calls, plus health checking) over HTTP/3 and HTTP/2 on one port number, with Alt-Svc.
+- **`client.c`** calls it over HTTP/3.
+
+The CMake build creates a self-signed certificate for `localhost` next to them:
+
+```bash
+cmake --preset http3 && cmake --build --preset http3
+cd build/http3/generated/http3-example
+../../http3_server.bin 50443 &
+../../http3_client.bin localhost:50443
+```
+
+`ctest -R integration_http3_example` runs the same exchange as a test.
+
+---
+
 ## Limitations
 
 - **No 0-RTT** (early data) and no connection migration: the server advertises `disable_active_migration`.

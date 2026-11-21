@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Start an example server, run its integration client, then stop the server."""
+"""Start an example server, run its integration client, then stop the server.
+
+The client is a Python script (run with this interpreter) or any executable."""
 
 import argparse
 import os
@@ -45,8 +47,9 @@ def main():
         if args.tls:
             client_env["USE_TLS"] = "1"
             client_env["TLS_CERT"] = os.path.join(args.cwd, "server.crt")
+        client_cmd = [sys.executable, args.client] if args.client.endswith(".py") else [args.client]
         result = subprocess.run(
-            [sys.executable, args.client, *args.client_arg,
+            [*client_cmd, *args.client_arg,
              f"localhost:{args.port}", *( ["--tls"] if args.tls else [] )],
             cwd=args.cwd, env=client_env, check=False
         )

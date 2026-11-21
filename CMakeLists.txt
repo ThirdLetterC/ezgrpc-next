@@ -488,6 +488,27 @@ if(GRPC_BUILD_EXAMPLES)
     endif()
   endif()
 
+  if(GRPC_HTTP3_ENABLED)
+    # HTTP/3 server and client; the certificate pair for CN=localhost is generated next to them
+    set(http3_example_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/http3-example")
+    grpc_add_certificate(example_http3_certificates "${http3_example_dir}" server.crt server.key)
+    foreach(side IN ITEMS server client)
+      add_executable(example_http3_${side} examples/http3/${side}.c)
+      set_target_properties(example_http3_${side} PROPERTIES OUTPUT_NAME http3_${side}.bin)
+      target_link_libraries(example_http3_${side} PRIVATE grpc_static)
+      add_dependencies(example_http3_${side} example_http3_certificates)
+      list(APPEND GRPC_EXAMPLE_TARGETS example_http3_${side})
+    endforeach()
+    # the runner needs only the Python standard library, so this runs wherever tests do
+    if(NOT Python3_EXECUTABLE)
+      find_package(Python3 COMPONENTS Interpreter QUIET)
+    endif()
+    if((GRPC_BUILD_TESTS OR GRPC_BUILD_INTEGRATION_TESTS) AND Python3_EXECUTABLE)
+      grpc_add_integration_test(http3_example SERVER example_http3_server
+        CLIENT "$<TARGET_FILE:example_http3_client>" PORT 19051 CWD "${http3_example_dir}")
+    endif()
+  endif()
+
   if(GRPC_BUILD_INTEGRATION_TESTS)
     set(examples_client "${CMAKE_CURRENT_SOURCE_DIR}/examples/test_examples.py")
     grpc_add_integration_test(single_threaded SERVER example_single_threaded

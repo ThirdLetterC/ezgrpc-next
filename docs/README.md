@@ -21,3 +21,4 @@ Welcome to the **ezGRPC-next** documentation.
 - [`examples/multi_threaded.c`](../examples/multi_threaded.c) — server with a worker thread pool
 - [`examples/python_client_c_server/`](../examples/python_client_c_server/) — full Protobuf-C Greeter server + Python `grpcio` integration suite
 - [`examples/flatbuffers/`](../examples/flatbuffers/) — zero-copy FlatBuffers (`flatcc`) server + Python client
+- [`examples/http3/`](../examples/http3/) — HTTP/3 (QUIC) server and client in C (needs `-DGRPC_HTTP3=ON`)
