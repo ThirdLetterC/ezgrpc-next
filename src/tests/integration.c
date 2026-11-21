@@ -1,9 +1,9 @@
-#include <nghttp2/nghttp2.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #ifndef _WIN32
+#include <nghttp2/nghttp2.h>
 #include <signal.h>
 #endif
 #include <uv.h>
@@ -208,7 +208,7 @@ void test_integration_full_server_and_client(void) {
                                                     async_err_handler, nullptr));
   atomic_int cancel_hits = 0;
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/int.Svc/Cancel",
-                                                    slow_cancel_handler, &cancel_hits));
+                                                    slow_cancel_handler, (void *)&cancel_hits));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/int.Svc/Deadline",
                                                     slow_deadline_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/int.Svc/Backpressure",
@@ -568,6 +568,7 @@ typedef struct raw_h2_buf {
   size_t cap;
 } raw_h2_buf;
 
+#ifndef _WIN32
 static void raw_h2_send_all(int fd, const uint8_t *data, size_t len) {
   size_t off = 0;
   while (off < len) {
@@ -626,6 +627,7 @@ static int raw_h2_on_frame([[maybe_unused]] nghttp2_session *s, const nghttp2_fr
     (*done)++;
   return 0;
 }
+#endif
 
 static void run_raw_h2_requests(uint16_t port) {
 #ifndef _WIN32

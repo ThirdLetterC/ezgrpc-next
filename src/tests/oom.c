@@ -28,27 +28,35 @@ static bool should_fail(void) {
   return false;
 }
 
+static grpc_allocator g_base_alloc;
+static bool g_base_alloc_init = false;
+
 static void *oom_malloc(size_t sz) {
-  return should_fail() ? nullptr : malloc(sz);
+  return should_fail() ? nullptr : g_base_alloc.malloc(sz);
 }
 
 static void *oom_calloc(size_t n, size_t sz) {
-  return should_fail() ? nullptr : calloc(n, sz);
+  return should_fail() ? nullptr : g_base_alloc.calloc(n, sz);
 }
 
 static void *oom_realloc(void *p, size_t sz) {
-  return should_fail() ? nullptr : realloc(p, sz);
+  return should_fail() ? nullptr : g_base_alloc.realloc(p, sz);
 }
 
 static void oom_free(void *p) {
-  free(p);
+  g_base_alloc.free(p);
 }
 
 static void *oom_aligned_alloc(size_t align, size_t sz) {
-  return should_fail() ? nullptr : aligned_alloc(align, sz);
+  return should_fail() ? nullptr : g_base_alloc.aligned_alloc(align, sz);
 }
 
 static void oom_enable(int fail_after) {
+  if (!g_base_alloc_init) {
+    grpc_set_allocator(nullptr);
+    g_base_alloc = *grpc_get_allocator();
+    g_base_alloc_init = true;
+  }
   atomic_store(&g_fail_after, fail_after);
   grpc_allocator a = {
       .malloc = oom_malloc,
