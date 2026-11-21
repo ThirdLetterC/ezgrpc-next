@@ -60,14 +60,16 @@ void test_tls_server(void) {
   TEST_ASSERT_NOT_NULL(grpc_server_tls_native(server));
   TEST_ASSERT_TRUE(grpc_server_tls_native(server) != old_ctx);
 
-  /* If the old context cannot be retired, the reload fails and the active context (which live
-   * sessions may use) is left untouched rather than freed. */
+  /* If the reload runs out of memory, it fails and the active context (which live sessions may
+   * use) is left untouched rather than freed. Where the failure surfaces depends on the backend:
+   * retiring the old context (GRPC_ERR_NOMEM), or already building the new one when the backend
+   * loads certificates through the grpc allocator, as rustls does (GRPC_ERR_INVALID). */
   old_ctx = grpc_server_tls_native(server);
   grpc_set_allocator(&(grpc_allocator){.realloc = fail_realloc});
   grpc_err nomem = grpc_server_reload_tls(
       server, &(grpc_tls_config){.cert_file = "test_cert.pem", .key_file = "test_key.pem"});
   grpc_set_allocator(nullptr);
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_NOMEM, nomem);
+  TEST_ASSERT_TRUE(nomem == GRPC_ERR_NOMEM || nomem == GRPC_ERR_INVALID);
   TEST_ASSERT_EQUAL_PTR(old_ctx, grpc_server_tls_native(server));
 
   grpc_server_free(server);
