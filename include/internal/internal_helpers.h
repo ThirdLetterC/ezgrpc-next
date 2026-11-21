@@ -30,7 +30,9 @@ static inline int buf_reserve(grpc_buf *buf, size_t extra) {
   size_t cap = buf->cap ? buf->cap : 4096;
   while (cap - buf->len < extra)
     cap *= 2;
-  u8 *data = realloc(buf->data, cap);
+  /* the library allocator, never libc: on MSVC grpc_free() is _aligned_free(), so
+   * buffers must come from the same family (e.g. server->tls_obuf is grpc_free()d) */
+  u8 *data = grpc_realloc(buf->data, cap);
   if (data == nullptr)
     return 1;
   buf->data = data;
@@ -47,7 +49,7 @@ static inline int buf_append(grpc_buf *buf, const void *data, size_t len) {
 }
 
 static inline void buf_free(grpc_buf *buf) {
-  free(buf->data);
+  grpc_free(buf->data);
   *buf = (grpc_buf){};
 }
 
