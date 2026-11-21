@@ -610,9 +610,7 @@ static void sub_disconnect(client_subchannel *s) {
       uv_close((uv_handle_t *)&s->timer, nullptr);
       s->timer_initialized = false;
     }
-    int limit = 100;
-    while (uv_loop_alive(&s->loop) && limit-- > 0)
-      uv_run(&s->loop, UV_RUN_NOWAIT);
+    uv_run(&s->loop, UV_RUN_DEFAULT);
     uv_loop_close(&s->loop);
     s->loop_initialized = false;
   }

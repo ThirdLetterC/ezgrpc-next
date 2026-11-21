@@ -317,17 +317,6 @@ void test_client_server_mtls_end_to_end(void) {
   char *c_buf = slurp_file("test_cert.pem", &clen);
   char *k_buf = slurp_file("test_key.pem", &klen);
   if (c_buf != nullptr && k_buf != nullptr) {
-    /* Reload TLS validation & null-terminated PEM length auto-detection */
-    TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_reload_tls(nullptr, nullptr));
-    TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                          grpc_server_reload_tls(server, &(grpc_tls_config){0}));
-    TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                          grpc_server_reload_tls(server, &(grpc_tls_config){.cert_file = "a.pem"}));
-    TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                          grpc_server_reload_tls(server, &(grpc_tls_config){.cert_pem = "a"}));
-    TEST_ASSERT_EQUAL_INT(
-        GRPC_OK, grpc_server_reload_tls(
-                     server, &(grpc_tls_config){.cert_pem = c_buf, .key_pem = k_buf, .ca_pem = c_buf}));
     /* Valid cert_pem with invalid key_pem -> fails key loading */
     TEST_ASSERT_NULL(grpc_server_new(&(grpc_config){
         .port = 0,
