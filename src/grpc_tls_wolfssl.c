@@ -82,18 +82,18 @@ grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg) {
   }
 
   if (cfg->ca_file != nullptr || cfg->ca_pem != nullptr) {
-    bool ca_ok = cfg->ca_file != nullptr
-                     ? wolfSSL_CTX_load_verify_locations(ctx, cfg->ca_file, nullptr) ==
-                           WOLFSSL_SUCCESS
-                     : wolfSSL_CTX_load_verify_buffer(ctx, (const unsigned char *)cfg->ca_pem,
-                                                      (long)cfg->ca_pem_len,
-                                                      WOLFSSL_FILETYPE_PEM) == WOLFSSL_SUCCESS;
+    bool ca_ok =
+        cfg->ca_file != nullptr
+            ? wolfSSL_CTX_load_verify_locations(ctx, cfg->ca_file, nullptr) == WOLFSSL_SUCCESS
+            : wolfSSL_CTX_load_verify_buffer(ctx, (const unsigned char *)cfg->ca_pem,
+                                             (long)cfg->ca_pem_len,
+                                             WOLFSSL_FILETYPE_PEM) == WOLFSSL_SUCCESS;
     if (!ca_ok) {
       wolfSSL_CTX_free(ctx);
       return nullptr;
     }
-    int mode = WOLFSSL_VERIFY_PEER |
-               (cfg->require_client_cert ? WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT : 0);
+    int mode =
+        WOLFSSL_VERIFY_PEER | (cfg->require_client_cert ? WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT : 0);
     wolfSSL_CTX_set_verify(ctx, mode, nullptr);
   }
 

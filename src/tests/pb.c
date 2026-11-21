@@ -78,14 +78,16 @@ void test_pb_live_call(void) {
   grpc_server *server = grpc_server_new(
       &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
   TEST_ASSERT_NOT_NULL(server);
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/test.Pb/Echo", pb_echo_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(server, "/test.Pb/Echo", pb_echo_handler, nullptr));
   pthread_t th;
   TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, pb_server_run, server));
 
   grpc_err err = GRPC_OK;
-  grpc_client *client = grpc_client_new(
-      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(server), .timeout_ms = 2000},
-      &err);
+  grpc_client *client = grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
+                                                              .port = grpc_server_port(server),
+                                                              .timeout_ms = 2000},
+                                        &err);
   TEST_ASSERT_NOT_NULL(client);
 
   Test__Echo req = TEST__ECHO__INIT;
@@ -95,8 +97,8 @@ void test_pb_live_call(void) {
   TEST_ASSERT_NOT_NULL(packed);
 
   grpc_client_response resp = {0};
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_client_unary(client, "/test.Pb/Echo", packed->data, packed->len, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_unary(client, "/test.Pb/Echo", packed->data,
+                                                   packed->len, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   TEST_ASSERT_NOT_NULL(resp.message);
   Test__Echo *reply = GRPC_PB_UNPACK(Test__Echo, &test__echo__descriptor, resp.message);

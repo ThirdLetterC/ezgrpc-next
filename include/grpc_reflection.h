@@ -5,7 +5,7 @@
 
 typedef struct grpc_server grpc_server;
 
-#define GRPC_REFLECTION_V1ALPHA_PATH                                                            \
+#define GRPC_REFLECTION_V1ALPHA_PATH \
   "/grpc.reflection.v1alpha.ServerReflection/ServerReflectionInfo"
 #define GRPC_REFLECTION_V1_PATH "/grpc.reflection.v1.ServerReflection/ServerReflectionInfo"
 
@@ -20,6 +20,5 @@ GRPC_API grpc_err grpc_reflection_enable(grpc_server *server);
  * so that tools like ``grpcurl describe`` can show the schema.
  */
 GRPC_API grpc_err grpc_reflection_add_file_descriptor(grpc_server *server,
-                                                               const char *symbol_or_filename,
-                                                               const uint8_t *descriptor,
-                                                               size_t len);
+                                                      const char *symbol_or_filename,
+                                                      const uint8_t *descriptor, size_t len);

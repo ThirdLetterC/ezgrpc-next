@@ -231,8 +231,8 @@ static void sub_flush(client_subchannel *s) {
         while (off < s->tls_obuf.len) {
           size_t chunk = s->tls_obuf.len - off;
           ERR_clear_error();
-          int wr = SSL_write(s->ssl, s->tls_obuf.data + off,
-                             chunk > INT_MAX ? INT_MAX : (int)chunk);
+          int wr =
+              SSL_write(s->ssl, s->tls_obuf.data + off, chunk > INT_MAX ? INT_MAX : (int)chunk);
           if (wr <= 0) {
             s->closed = true;
             if (s->active_stream != nullptr) {
@@ -252,7 +252,7 @@ static void sub_flush(client_subchannel *s) {
     }
   } else
 #endif
-  if (s->ngsession != nullptr) {
+      if (s->ngsession != nullptr) {
     for (;;) {
       const u8 *data;
       ssize_t n = nghttp2_session_mem_send(s->ngsession, &data);
@@ -734,9 +734,8 @@ static grpc_err sub_connect(client_subchannel *s) {
     }
     BIO_set_mem_eof_return(rbio, -1);
     SSL_set_bio(s->ssl, rbio, wbio);
-    const char *sni = s->parent->config.tls.server_name != nullptr
-                          ? s->parent->config.tls.server_name
-                          : s->host;
+    const char *sni =
+        s->parent->config.tls.server_name != nullptr ? s->parent->config.tls.server_name : s->host;
     if (sni != nullptr && sni[0] != '\0')
       (void)SSL_set_tlsext_host_name(s->ssl, sni);
     SSL_set_connect_state(s->ssl);
@@ -790,8 +789,7 @@ fail_io:
   return GRPC_ERR_IO;
 }
 
-static bool parse_target(const char *target, char **out_host, uint16_t *out_port,
-                         char **out_unix) {
+static bool parse_target(const char *target, char **out_host, uint16_t *out_port, char **out_unix) {
   *out_host = nullptr;
   *out_port = 0;
   *out_unix = nullptr;
@@ -1047,11 +1045,20 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
   grpc_client *c = s->parent;
   const char *enc_name = nullptr;
   switch (c->config.compression) {
-  case GRPC_COMPRESS_GZIP: enc_name = "gzip"; break;
-  case GRPC_COMPRESS_DEFLATE: enc_name = "deflate"; break;
-  case GRPC_COMPRESS_ZSTD: enc_name = "zstd"; break;
-  case GRPC_COMPRESS_SNAPPY: enc_name = "snappy"; break;
-  default: break;
+  case GRPC_COMPRESS_GZIP:
+    enc_name = "gzip";
+    break;
+  case GRPC_COMPRESS_DEFLATE:
+    enc_name = "deflate";
+    break;
+  case GRPC_COMPRESS_ZSTD:
+    enc_name = "zstd";
+    break;
+  case GRPC_COMPRESS_SNAPPY:
+    enc_name = "snappy";
+    break;
+  default:
+    break;
   }
   uint32_t eff_timeout = timeout_ms ? timeout_ms : c->config.timeout_ms;
   char timeout_str[32] = {0};
@@ -1068,16 +1075,24 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
   }
   size_t n = 0;
   nva[n++] = (nghttp2_nv){(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE};
-  nva[n++] = (nghttp2_nv){(uint8_t *)":scheme", (uint8_t *)scheme, 7, strlen(scheme), NGHTTP2_NV_FLAG_NONE};
-  nva[n++] = (nghttp2_nv){(uint8_t *)":path", (uint8_t *)method, 5, strlen(method), NGHTTP2_NV_FLAG_NONE};
-  nva[n++] = (nghttp2_nv){(uint8_t *)":authority", (uint8_t *)s->authority, 10, strlen(s->authority), NGHTTP2_NV_FLAG_NONE};
-  nva[n++] = (nghttp2_nv){(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16, NGHTTP2_NV_FLAG_NONE};
+  nva[n++] = (nghttp2_nv){(uint8_t *)":scheme", (uint8_t *)scheme, 7, strlen(scheme),
+                          NGHTTP2_NV_FLAG_NONE};
+  nva[n++] =
+      (nghttp2_nv){(uint8_t *)":path", (uint8_t *)method, 5, strlen(method), NGHTTP2_NV_FLAG_NONE};
+  nva[n++] = (nghttp2_nv){(uint8_t *)":authority", (uint8_t *)s->authority, 10,
+                          strlen(s->authority), NGHTTP2_NV_FLAG_NONE};
+  nva[n++] = (nghttp2_nv){(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16,
+                          NGHTTP2_NV_FLAG_NONE};
   nva[n++] = (nghttp2_nv){(uint8_t *)"te", (uint8_t *)"trailers", 2, 8, NGHTTP2_NV_FLAG_NONE};
-  nva[n++] = (nghttp2_nv){(uint8_t *)"grpc-accept-encoding", (uint8_t *)"gzip,deflate,zstd,snappy,identity", 20, 33, NGHTTP2_NV_FLAG_NONE};
+  nva[n++] =
+      (nghttp2_nv){(uint8_t *)"grpc-accept-encoding",
+                   (uint8_t *)"gzip,deflate,zstd,snappy,identity", 20, 33, NGHTTP2_NV_FLAG_NONE};
   if (enc_name != nullptr)
-    nva[n++] = (nghttp2_nv){(uint8_t *)"grpc-encoding", (uint8_t *)enc_name, 13, strlen(enc_name), NGHTTP2_NV_FLAG_NONE};
+    nva[n++] = (nghttp2_nv){(uint8_t *)"grpc-encoding", (uint8_t *)enc_name, 13, strlen(enc_name),
+                            NGHTTP2_NV_FLAG_NONE};
   if (eff_timeout > 0)
-    nva[n++] = (nghttp2_nv){(uint8_t *)"grpc-timeout", (uint8_t *)timeout_str, 12, strlen(timeout_str), NGHTTP2_NV_FLAG_NONE};
+    nva[n++] = (nghttp2_nv){(uint8_t *)"grpc-timeout", (uint8_t *)timeout_str, 12,
+                            strlen(timeout_str), NGHTTP2_NV_FLAG_NONE};
   for (size_t i = 0; i < nb_metadata; i++) {
     if (metadata[i].key == nullptr || metadata[i].value == nullptr) {
       grpc_free(nva);
@@ -1088,7 +1103,8 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
     }
     size_t klen = metadata[i].key_len ? metadata[i].key_len : strlen(metadata[i].key);
     size_t vlen = metadata[i].value_len ? metadata[i].value_len : strlen(metadata[i].value);
-    nva[n++] = (nghttp2_nv){(uint8_t *)metadata[i].key, (uint8_t *)metadata[i].value, klen, vlen, NGHTTP2_NV_FLAG_NONE};
+    nva[n++] = (nghttp2_nv){(uint8_t *)metadata[i].key, (uint8_t *)metadata[i].value, klen, vlen,
+                            NGHTTP2_NV_FLAG_NONE};
   }
 
   s->active_stream = st;

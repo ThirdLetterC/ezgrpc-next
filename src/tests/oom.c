@@ -73,12 +73,15 @@ static void oom_disable(void) {
   grpc_set_allocator(nullptr);
 }
 
-void setUp(void) { oom_disable(); }
-void tearDown(void) { oom_disable(); }
+void setUp(void) {
+  oom_disable();
+}
+void tearDown(void) {
+  oom_disable();
+}
 
 static void dummy_handler([[maybe_unused]] grpc_call *call,
-                          [[maybe_unused]] const grpc_message *req,
-                          [[maybe_unused]] void *ud) {}
+                          [[maybe_unused]] const grpc_message *req, [[maybe_unused]] void *ud) {}
 
 static void dummy_post([[maybe_unused]] void *arg) {}
 
@@ -211,8 +214,7 @@ static void *oom_srv_run(void *arg) {
   return nullptr;
 }
 
-static void oom_call_handler(grpc_call *call, const grpc_message *req,
-                             [[maybe_unused]] void *ud) {
+static void oom_call_handler(grpc_call *call, const grpc_message *req, [[maybe_unused]] void *ud) {
   grpc_metadata md[] = {{.key = "x-k", .value = "v"}};
   const uint8_t raw[] = {0x01};
   grpc_status_detail_entry det = {
@@ -244,15 +246,13 @@ static void oom_call_handler(grpc_call *call, const grpc_message *req,
   (void)grpc_call_reply_data(call, req->data, req->len);
 }
 
-static void oom_echo_handler(grpc_call *call, const grpc_message *req,
-                             [[maybe_unused]] void *ud) {
+static void oom_echo_handler(grpc_call *call, const grpc_message *req, [[maybe_unused]] void *ud) {
   grpc_metadata md[] = {{.key = "x-r", .value = "1"}};
   (void)grpc_call_send_metadata(call, md, 1);
   (void)grpc_call_reply_data(call, req->data, req->len);
 }
 
-static void oom_gzip_handler(grpc_call *call, const grpc_message *req,
-                             [[maybe_unused]] void *ud) {
+static void oom_gzip_handler(grpc_call *call, const grpc_message *req, [[maybe_unused]] void *ud) {
   (void)grpc_call_set_compression(call, GRPC_COMPRESS_GZIP, GRPC_COMPRESSION_LEVEL_DEFAULT);
   for (int n = 0; n < 4; n++) {
     oom_enable(n);
@@ -268,9 +268,12 @@ void test_oom_live_call_and_client(void) {
   grpc_server *srv = grpc_server_new(
       &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
   TEST_ASSERT_NOT_NULL(srv);
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(srv, "/oom.Svc/Call", oom_call_handler, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(srv, "/oom.Svc/Echo", oom_echo_handler, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(srv, "/oom.Svc/Gzip", oom_gzip_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(srv, "/oom.Svc/Call", oom_call_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(srv, "/oom.Svc/Echo", oom_echo_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(srv, "/oom.Svc/Gzip", oom_gzip_handler, nullptr));
   pthread_t th;
   TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, oom_srv_run, srv));
 
@@ -324,8 +327,7 @@ void test_oom_live_call_and_client(void) {
 #ifndef _WIN32
 static atomic_int g_web_oom_step = 0;
 
-static void oom_web_handler(grpc_call *call, const grpc_message *req,
-                            [[maybe_unused]] void *ud) {
+static void oom_web_handler(grpc_call *call, const grpc_message *req, [[maybe_unused]] void *ud) {
   int step = atomic_fetch_add(&g_web_oom_step, 1);
   grpc_metadata tr[] = {{.key = "x-t", .value = "val"}};
   (void)grpc_call_add_trailers(call, tr, 1);
@@ -342,9 +344,8 @@ typedef struct oom_h2_buf {
   size_t off;
 } oom_h2_buf;
 
-static ssize_t oom_h2_read_cb([[maybe_unused]] nghttp2_session *s,
-                              [[maybe_unused]] int32_t sid, uint8_t *buf, size_t len,
-                              uint32_t *flags, nghttp2_data_source *src,
+static ssize_t oom_h2_read_cb([[maybe_unused]] nghttp2_session *s, [[maybe_unused]] int32_t sid,
+                              uint8_t *buf, size_t len, uint32_t *flags, nghttp2_data_source *src,
                               [[maybe_unused]] void *ud) {
   oom_h2_buf *b = src->ptr;
   size_t rem = b->len - b->off;
@@ -374,7 +375,8 @@ static oom_h2_buf g_oom_resp_src;
 static int oom_raw_srv_on_frame(nghttp2_session *s, const nghttp2_frame *f,
                                 [[maybe_unused]] void *ud) {
   if (f->hd.stream_id > 0 && (f->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
-    g_oom_resp_src = (oom_h2_buf){.data = g_oom_resp_frame, .len = sizeof(g_oom_resp_frame), .off = 0};
+    g_oom_resp_src =
+        (oom_h2_buf){.data = g_oom_resp_frame, .len = sizeof(g_oom_resp_frame), .off = 0};
     nghttp2_data_provider dp = {.source.ptr = &g_oom_resp_src, .read_callback = oom_h2_read_cb};
     nghttp2_nv hdrs[] = {
         {(uint8_t *)":status", (uint8_t *)"200", 7, 3, NGHTTP2_NV_FLAG_NONE},
@@ -446,7 +448,8 @@ void test_oom_grpc_web_and_client_deterministic(void) {
     (void)grpc_server_handle(srv, "/oom/Route", oom_web_handler, nullptr);
     oom_disable();
   }
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(srv, "/oom.Web/Call", oom_web_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(srv, "/oom.Web/Call", oom_web_handler, nullptr));
   pthread_t th;
   TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, oom_srv_run, srv));
 

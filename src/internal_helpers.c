@@ -234,8 +234,7 @@ static int session_create(grpc_session *ezsession) {
   nghttp2_settings_entry siv[] = {
       {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, server->config.max_message_size},
       {NGHTTP2_SETTINGS_MAX_FRAME_SIZE, server->config.max_frame_size},
-      {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS,
-       server->config.max_concurrent_streams},
+      {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, server->config.max_concurrent_streams},
   };
   res = nghttp2_submit_settings(ezsession->ngsession, NGHTTP2_FLAG_NONE, siv, 3);
   if (res < 0) {
@@ -283,7 +282,7 @@ static int session_recv(grpc_session *ezsession, const u8 *data, size_t len) {
   ssize_t res = nghttp2_session_mem_recv(ezsession->ngsession, data, len);
   if (res < 0) {
     LOG_ERROR(ezsession->server, "@ %s: nghttp2: %s. killing...\n", __func__,
-                      nghttp2_strerror((int)res));
+              nghttp2_strerror((int)res));
     return 1;
   }
   return 0;
@@ -555,7 +554,8 @@ void session_flush(grpc_session *ezsession) {
     atomic_fetch_add(&ezsession->server->stat_bytes_sent, (uint64_t)rem);
     buf = uv_buf_init((char *)ezsession->wbuf.data + n, (unsigned int)rem);
     ezsession->write_req.data = ezsession;
-    if (uv_write(&ezsession->write_req, session_stream(ezsession), &buf, 1, on_session_write) != 0) {
+    if (uv_write(&ezsession->write_req, session_stream(ezsession), &buf, 1, on_session_write) !=
+        0) {
       session_close(ezsession);
       return;
     }

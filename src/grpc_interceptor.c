@@ -15,14 +15,13 @@ static bool interceptor_matches_call(const grpc_interceptor *inc, const grpc_cal
 }
 
 GRPC_API grpc_err grpc_server_add_interceptor(grpc_server *server,
-                                                       const grpc_interceptor *interceptor) {
+                                              const grpc_interceptor *interceptor) {
   if (server == nullptr || interceptor == nullptr) {
     return GRPC_ERR_INVALID;
   }
 
   size_t new_nb = server->nb_interceptors + 1;
-  grpc_interceptor *new_arr =
-      grpc_realloc(server->interceptors, new_nb * sizeof(grpc_interceptor));
+  grpc_interceptor *new_arr = grpc_realloc(server->interceptors, new_nb * sizeof(grpc_interceptor));
   if (new_arr == nullptr) {
     return GRPC_ERR_NOMEM;
   }
@@ -122,8 +121,7 @@ typedef struct bearer_auth_data {
   void *userdata;
 } bearer_auth_data;
 
-static grpc_status bearer_auth_on_call(grpc_call *call, const char **message,
-                                          void *userdata) {
+static grpc_status bearer_auth_on_call(grpc_call *call, const char **message, void *userdata) {
   bearer_auth_data *auth = userdata;
   if (auth == nullptr || auth->validator == nullptr) {
     return GRPC_STATUS_OK;
@@ -152,7 +150,7 @@ static grpc_status bearer_auth_on_call(grpc_call *call, const char **message,
 }
 
 GRPC_API grpc_interceptor grpc_interceptor_bearer_auth(grpc_token_validator_fn validator,
-                                                                void *userdata) {
+                                                       void *userdata) {
   bearer_auth_data *data = grpc_malloc(sizeof(*data));
   if (data != nullptr) {
     data->validator = validator;

@@ -63,8 +63,10 @@ grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg) {
   }
   int key_res = -1;
   if (cfg->cert_pem != nullptr && cfg->key_pem != nullptr) {
-    gnutls_datum_t c = {.data = (unsigned char *)cfg->cert_pem, .size = (unsigned int)cfg->cert_pem_len};
-    gnutls_datum_t k = {.data = (unsigned char *)cfg->key_pem, .size = (unsigned int)cfg->key_pem_len};
+    gnutls_datum_t c = {.data = (unsigned char *)cfg->cert_pem,
+                        .size = (unsigned int)cfg->cert_pem_len};
+    gnutls_datum_t k = {.data = (unsigned char *)cfg->key_pem,
+                        .size = (unsigned int)cfg->key_pem_len};
     key_res = gnutls_certificate_set_x509_key_mem(ctx->cred, &c, &k, GNUTLS_X509_FMT_PEM);
   } else if (cfg->cert_file != nullptr && cfg->key_file != nullptr) {
     key_res = gnutls_certificate_set_x509_key_file(ctx->cred, cfg->cert_file, cfg->key_file,
@@ -81,7 +83,8 @@ grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg) {
     if (cfg->ca_file != nullptr) {
       ca_res = gnutls_certificate_set_x509_trust_file(ctx->cred, cfg->ca_file, GNUTLS_X509_FMT_PEM);
     } else {
-      gnutls_datum_t ca = {.data = (unsigned char *)cfg->ca_pem, .size = (unsigned int)cfg->ca_pem_len};
+      gnutls_datum_t ca = {.data = (unsigned char *)cfg->ca_pem,
+                           .size = (unsigned int)cfg->ca_pem_len};
       ca_res = gnutls_certificate_set_x509_trust_mem(ctx->cred, &ca, GNUTLS_X509_FMT_PEM);
     }
     if (ca_res <= 0) {

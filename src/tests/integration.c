@@ -70,8 +70,12 @@ static void rich_error_handler(grpc_call *call, [[maybe_unused]] const grpc_mess
   const uint8_t d1[] = {0x01, 0x02, 0x03};
   const uint8_t d2[] = {0x04, 0x05};
   grpc_status_detail_entry details[] = {
-      {.type_url = "type.googleapis.com/google.rpc.ErrorInfo", .value = d1, .value_len = sizeof(d1)},
-      {.type_url = "type.googleapis.com/google.rpc.RetryInfo", .value = d2, .value_len = sizeof(d2)},
+      {.type_url = "type.googleapis.com/google.rpc.ErrorInfo",
+       .value = d1,
+       .value_len = sizeof(d1)},
+      {.type_url = "type.googleapis.com/google.rpc.RetryInfo",
+       .value = d2,
+       .value_len = sizeof(d2)},
   };
   /* Includes '%' and non-ASCII to exercise percent-encoding of grpc-message */
   (void)grpc_call_finish_with_details(call, GRPC_STATUS_INVALID_ARGUMENT, "100% bad\x01input",
@@ -199,37 +203,37 @@ void test_integration_full_server_and_client(void) {
   });
   TEST_ASSERT_NOT_NULL(server);
 
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/int.Svc/Meta",
-                                                    inspect_metadata_handler, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/int.Svc/RichErr",
-                                                    rich_error_handler, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/int.Svc/AsyncOk",
-                                                    async_ok_handler, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/int.Svc/AsyncErr",
-                                                    async_err_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_handle(server, "/int.Svc/Meta", inspect_metadata_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_handle(server, "/int.Svc/RichErr", rich_error_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(server, "/int.Svc/AsyncOk", async_ok_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_handle(server, "/int.Svc/AsyncErr", async_err_handler, nullptr));
   atomic_int cancel_hits = 0;
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/int.Svc/Cancel",
-                                                    slow_cancel_handler, (void *)&cancel_hits));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/int.Svc/Deadline",
-                                                    slow_deadline_handler, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/int.Svc/Backpressure",
-                                                    backpressure_handler, bp_hit));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/int.Svc/LargeEcho",
-                                                    large_echo_handler, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/auth.Svc/Secret",
-                                                    large_echo_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/int.Svc/Cancel", slow_cancel_handler,
+                                                    (void *)&cancel_hits));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_handle(server, "/int.Svc/Deadline", slow_deadline_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_handle(server, "/int.Svc/Backpressure", backpressure_handler, bp_hit));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_handle(server, "/int.Svc/LargeEcho", large_echo_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_handle(server, "/auth.Svc/Secret", large_echo_handler, nullptr));
 
   grpc_interceptor auth = grpc_interceptor_bearer_auth(bearer_validator, nullptr);
   auth.path_prefix = "/auth.Svc/";
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_add_interceptor(server, &auth));
 
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_server_add_interceptor(server, &(grpc_interceptor){
-                                                       .name = "guard",
-                                                       .path_prefix = "/int.Svc/LargeEcho",
-                                                       .on_recv_message = reject_recv_bad,
-                                                       .on_send_message = reject_send_bad,
-                                                   }));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_add_interceptor(server, &(grpc_interceptor){
+                                                                .name = "guard",
+                                                                .path_prefix = "/int.Svc/LargeEcho",
+                                                                .on_recv_message = reject_recv_bad,
+                                                                .on_send_message = reject_send_bad,
+                                                            }));
 
   pthread_t th;
   TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, server));
@@ -262,8 +266,8 @@ void test_integration_full_server_and_client(void) {
   grpc_client_response_free(&resp);
 
   /* 2. Rich error details + percent-encoded grpc-message */
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_client_unary(client, "/int.Svc/RichErr", "", 0, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(client, "/int.Svc/RichErr", "", 0, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_INVALID_ARGUMENT, resp.status);
   const char *details_b64 = nullptr;
   for (size_t i = 0; i < resp.nb_trailers; i++) {
@@ -327,17 +331,16 @@ void test_integration_full_server_and_client(void) {
   char *big = malloc(48 * 1024);
   TEST_ASSERT_NOT_NULL(big);
   memset(big, 'Z', 48 * 1024);
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK,
-      grpc_client_unary(client, "/int.Svc/LargeEcho", big, 48 * 1024, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_unary(client, "/int.Svc/LargeEcho", big, 48 * 1024,
+                                                   nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   TEST_ASSERT_NOT_NULL(resp.message);
   TEST_ASSERT_EQUAL_UINT32(48 * 1024, resp.message->len);
   grpc_client_response_free(&resp);
   free(big);
 
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_client_unary(client, "/no.Such/Method", "", 0, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(client, "/no.Such/Method", "", 0, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_UNIMPLEMENTED, resp.status);
   grpc_client_response_free(&resp);
 
@@ -380,22 +383,23 @@ void test_integration_health_watch_and_reflection(void) {
   TEST_ASSERT_NOT_NULL(server);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_health_enable(server));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_reflection_enable(server));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/demo.Echo/Ping",
-                                                    large_echo_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(server, "/demo.Echo/Ping", large_echo_handler, nullptr));
   const uint8_t fake_fdp[] = {0x0A, 0x0A, 'd', 'e', 'm', 'o', '.', 'p', 'r', 'o', 't', 'o'};
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_reflection_add_file_descriptor(
-                                     server, "demo.proto", fake_fdp, sizeof(fake_fdp)));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_reflection_add_file_descriptor(
-                                     server, "demo.Echo", fake_fdp, sizeof(fake_fdp)));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_reflection_add_file_descriptor(server, "demo.proto", fake_fdp,
+                                                                     sizeof(fake_fdp)));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_reflection_add_file_descriptor(server, "demo.Echo", fake_fdp,
+                                                                     sizeof(fake_fdp)));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_health_set_status(server, "demo.Echo", GRPC_HEALTH_SERVING));
 
   pthread_t th;
   TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, server));
 
   grpc_err err = GRPC_OK;
-  grpc_client *client = grpc_client_new(
-      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(server), .timeout_ms = 3000},
-      &err);
+  grpc_client *client = grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
+                                                              .port = grpc_server_port(server),
+                                                              .timeout_ms = 3000},
+                                        &err);
   TEST_ASSERT_NOT_NULL(client);
 
   /* 1. Health Check for "" and "demo.Echo" */
@@ -746,9 +750,9 @@ static void run_raw_h2_requests(uint16_t port) {
   memset(big_plain, 'Z', sizeof(big_plain));
   uint8_t *zbuf = nullptr;
   size_t zlen = 0;
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_compress(GRPC_COMPRESS_GZIP, GRPC_COMPRESSION_LEVEL_DEFAULT,
-                             (const uint8_t *)big_plain, sizeof(big_plain), &zbuf, &zlen));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_compress(GRPC_COMPRESS_GZIP, GRPC_COMPRESSION_LEVEL_DEFAULT,
+                                      (const uint8_t *)big_plain, sizeof(big_plain), &zbuf, &zlen));
   uint8_t *zframe = grpc_malloc(5 + zlen);
   TEST_ASSERT_NOT_NULL(zframe);
   zframe[0] = 0x01;
@@ -871,10 +875,10 @@ static void run_raw_h2_requests(uint16_t port) {
   nghttp2_nv many_hdrs[265];
   many_hdrs[0] = (nghttp2_nv){(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE};
   many_hdrs[1] = (nghttp2_nv){(uint8_t *)":scheme", (uint8_t *)"http", 7, 4, NGHTTP2_NV_FLAG_NONE};
-  many_hdrs[2] = (nghttp2_nv){(uint8_t *)":path", (uint8_t *)"/web.Svc/NoBody", 5, 15,
-                              NGHTTP2_NV_FLAG_NONE};
-  many_hdrs[3] = (nghttp2_nv){(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9,
-                              NGHTTP2_NV_FLAG_NONE};
+  many_hdrs[2] =
+      (nghttp2_nv){(uint8_t *)":path", (uint8_t *)"/web.Svc/NoBody", 5, 15, NGHTTP2_NV_FLAG_NONE};
+  many_hdrs[3] =
+      (nghttp2_nv){(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE};
   many_hdrs[4] = (nghttp2_nv){(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16,
                               NGHTTP2_NV_FLAG_NONE};
   for (int h = 5; h < 265; h++) {
@@ -951,14 +955,14 @@ void test_integration_grpc_web_cors_ipv6_and_client_edge_cases(void) {
       .log_level = GRPC_LOG_OFF,
   });
   TEST_ASSERT_NOT_NULL(server);
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/web.Svc/Echo", large_echo_handler,
-                                                    nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/web.Svc/Slow", slow_deadline_handler,
-                                                    nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/web.Svc/NoBody", no_body_handler,
-                                                    nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/web.Svc/Codec", codec_resp_handler,
-                                                    nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(server, "/web.Svc/Echo", large_echo_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_handle(server, "/web.Svc/Slow", slow_deadline_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(server, "/web.Svc/NoBody", no_body_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(server, "/web.Svc/Codec", codec_resp_handler, nullptr));
 
   pthread_t th;
   TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, server));
@@ -972,8 +976,8 @@ void test_integration_grpc_web_cors_ipv6_and_client_edge_cases(void) {
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
   const char *bad_targets[] = {"no-port", "", "unix:", "[::1", "[::1]:0", "127.0.0.1:99999"};
   for (size_t i = 0; i < sizeof(bad_targets) / sizeof(bad_targets[0]); i++) {
-    TEST_ASSERT_NULL(grpc_client_new(
-        &(grpc_client_config){.targets = &bad_targets[i], .nb_targets = 1}, &err));
+    TEST_ASSERT_NULL(
+        grpc_client_new(&(grpc_client_config){.targets = &bad_targets[i], .nb_targets = 1}, &err));
     TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
   }
 
@@ -984,19 +988,18 @@ void test_integration_grpc_web_cors_ipv6_and_client_edge_cases(void) {
                             .port = port,
                             .tls = {.enable = true, .ca_file = "/nonexistent/ca.pem"}},
       &err));
-  TEST_ASSERT_NULL(grpc_client_new(
-      &(grpc_client_config){.host = "127.0.0.1",
-                            .port = port,
-                            .tls = {.enable = true,
-                                    .cert_file = "/nonexistent/c.pem",
-                                    .key_file = "/nonexistent/k.pem"}},
-      &err));
-  TEST_ASSERT_NULL(grpc_client_new(
-      &(grpc_client_config){.host = "127.0.0.1",
-                            .port = port,
-                            .timeout_ms = 500,
-                            .tls = {.enable = true, .insecure_skip_verify = true}},
-      &err));
+  TEST_ASSERT_NULL(grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
+                                                         .port = port,
+                                                         .tls = {.enable = true,
+                                                                 .cert_file = "/nonexistent/c.pem",
+                                                                 .key_file = "/nonexistent/k.pem"}},
+                                   &err));
+  TEST_ASSERT_NULL(
+      grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
+                                            .port = port,
+                                            .timeout_ms = 500,
+                                            .tls = {.enable = true, .insecure_skip_verify = true}},
+                      &err));
 #endif
 
   char ep6[64];
@@ -1037,8 +1040,8 @@ void test_integration_grpc_web_cors_ipv6_and_client_edge_cases(void) {
       &(grpc_client_config){.targets = t6, .nb_targets = 1, .timeout_ms = 2000}, &err);
   TEST_ASSERT_NOT_NULL(c);
   grpc_client_response resp = {0};
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_ERR_TIMEOUT, grpc_client_unary(c, "/web.Svc/Slow", "", 0, nullptr, 0, 40, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_TIMEOUT,
+                        grpc_client_unary(c, "/web.Svc/Slow", "", 0, nullptr, 0, 40, &resp));
   grpc_client_response_free(&resp);
 
   char huge[2048];
@@ -1049,30 +1052,31 @@ void test_integration_grpc_web_cors_ipv6_and_client_edge_cases(void) {
   grpc_client_response_free(&resp);
 
   /* Identity, Gzip, and Zstd responses */
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_client_unary(c, "/web.Svc/Codec", "gzip", 4, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(c, "/web.Svc/Codec", "gzip", 4, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   grpc_client_response_free(&resp);
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_client_unary(c, "/web.Svc/Codec", "id", 2, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(c, "/web.Svc/Codec", "id", 2, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   grpc_client_response_free(&resp);
 
   /* Client max_message_size exceeded on compressed response -> GRPC_ERR_LIMIT */
   grpc_client *c_tiny = grpc_client_new(
-      &(grpc_client_config){.targets = t6, .nb_targets = 1, .max_message_size = 8, .timeout_ms = 2000},
+      &(grpc_client_config){
+          .targets = t6, .nb_targets = 1, .max_message_size = 8, .timeout_ms = 2000},
       &err);
   TEST_ASSERT_NOT_NULL(c_tiny);
   char msg64[64];
   memset(msg64, 'M', sizeof(msg64));
-  grpc_err tiny_rc = grpc_client_unary(c_tiny, "/web.Svc/Echo", msg64, sizeof(msg64), nullptr, 0, 0,
-                                       &resp);
+  grpc_err tiny_rc =
+      grpc_client_unary(c_tiny, "/web.Svc/Echo", msg64, sizeof(msg64), nullptr, 0, 0, &resp);
   TEST_ASSERT_NOT_EQUAL_INT(GRPC_OK, tiny_rc);
   grpc_client_response_free(&resp);
   grpc_client_free(c_tiny);
 #if defined(GRPC_ENABLE_ZSTD)
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_client_unary(c, "/web.Svc/Codec", "zstd", 4, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(c, "/web.Svc/Codec", "zstd", 4, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   grpc_client_response_free(&resp);
 #endif
@@ -1082,15 +1086,13 @@ void test_integration_grpc_web_cors_ipv6_and_client_edge_cases(void) {
   /* Server edge-case validation & fallback disable */
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_register_path(nullptr, "/a/b", nullptr));
   TEST_ASSERT_EQUAL_INT(
-      GRPC_OK,
-      grpc_server_set_fallback(server, &(grpc_stream_handler){.on_message = no_body_handler},
-                               nullptr));
+      GRPC_OK, grpc_server_set_fallback(
+                   server, &(grpc_stream_handler){.on_message = no_body_handler}, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_set_fallback(server, nullptr, nullptr));
 #if defined(GRPC_ENABLE_TLS)
   TEST_ASSERT_NULL(grpc_server_new_ex(
-      &(grpc_config){.port = 0,
-                     .tls = {.cert_file = "a.pem", .cert_pem = "pem"},
-                     .log_level = GRPC_LOG_INFO},
+      &(grpc_config){
+          .port = 0, .tls = {.cert_file = "a.pem", .cert_pem = "pem"}, .log_level = GRPC_LOG_INFO},
       &err));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
 #endif
@@ -1179,14 +1181,14 @@ void test_integration_maintenance_drain_and_edge_paths(void) {
       .log_level = GRPC_LOG_TRACE,
   });
   TEST_ASSERT_NOT_NULL(srv);
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(srv, "/m.Svc/AsyncFin",
-                                                    async_finish_only_handler, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(srv, "/m.Svc/Codecs",
-                                                    comp_codecs_handler, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(srv, "/m.Svc/Big",
-                                                    large_echo_handler, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(srv, "/m.Svc/Hold",
-                                                    slow_deadline_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_handle(srv, "/m.Svc/AsyncFin", async_finish_only_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(srv, "/m.Svc/Codecs", comp_codecs_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(srv, "/m.Svc/Big", large_echo_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(srv, "/m.Svc/Hold", slow_deadline_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_health_enable(srv));
 
   pthread_t th;
@@ -1200,21 +1202,20 @@ void test_integration_maintenance_drain_and_edge_paths(void) {
   TEST_ASSERT_NOT_NULL(c);
 
   grpc_client_response resp = {0};
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_client_unary(c, "/m.Svc/AsyncFin", "", 0, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(c, "/m.Svc/AsyncFin", "", 0, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_ALREADY_EXISTS, resp.status);
   grpc_client_response_free(&resp);
 
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_client_unary(c, "/m.Svc/Codecs", "hello", 5, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(c, "/m.Svc/Codecs", "hello", 5, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   grpc_client_response_free(&resp);
 
   /* Health check with unknown varint + length-delimited fields before service name */
   const uint8_t hreq_unk[] = {0x10, 0x01, 0x1A, 0x02, 'x', 'y', 0x0A, 0x00};
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_client_unary(c, GRPC_HEALTH_PATH_CHECK, hreq_unk, sizeof(hreq_unk), nullptr, 0,
-                                 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_unary(c, GRPC_HEALTH_PATH_CHECK, hreq_unk,
+                                                   sizeof(hreq_unk), nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   grpc_client_response_free(&resp);
 
@@ -1223,8 +1224,8 @@ void test_integration_maintenance_drain_and_edge_paths(void) {
   char *big = malloc(big_sz);
   TEST_ASSERT_NOT_NULL(big);
   memset(big, 'M', big_sz);
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_client_unary(c, "/m.Svc/Big", big, big_sz, nullptr, 0, 5000, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(c, "/m.Svc/Big", big, big_sz, nullptr, 0, 5000, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   TEST_ASSERT_NOT_NULL(resp.message);
   TEST_ASSERT_EQUAL_UINT32((uint32_t)big_sz, resp.message->len);
@@ -1243,14 +1244,12 @@ void test_integration_maintenance_drain_and_edge_paths(void) {
   TEST_ASSERT_NOT_NULL(c_small);
   char med[256];
   memset(med, 'R', sizeof(med));
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_ERR_LIMIT,
-      grpc_client_unary(c_small, "/m.Svc/Big", med, sizeof(med), nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_LIMIT, grpc_client_unary(c_small, "/m.Svc/Big", med, sizeof(med),
+                                                          nullptr, 0, 0, &resp));
   grpc_client_response_free(&resp);
   grpc_metadata null_key[] = {{.key = nullptr, .value = "v"}};
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_ERR_INVALID,
-      grpc_client_unary(c_small, "/m.Svc/Big", "a", 1, null_key, 1, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
+                        grpc_client_unary(c_small, "/m.Svc/Big", "a", 1, null_key, 1, 0, &resp));
   grpc_client_free(c_small);
 
   /* Wait for maintenance_timer (250ms) to send PING / GOAWAY and close */
@@ -1291,7 +1290,8 @@ uds_test:;
   grpc_server *usrv = grpc_server_new(
       &(grpc_config){.unix_path = upath, .max_connections = 1, .log_level = GRPC_LOG_OFF});
   TEST_ASSERT_NOT_NULL(usrv);
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(usrv, "/u.Svc/Echo", large_echo_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(usrv, "/u.Svc/Echo", large_echo_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, usrv));
 
   const char *utargets[] = {"unix:///tmp/ezgrpc_uds_reject.sock"};
@@ -1300,8 +1300,8 @@ uds_test:;
   TEST_ASSERT_NOT_NULL(uc1);
   grpc_client *uc2 = grpc_client_new(
       &(grpc_client_config){.targets = utargets, .nb_targets = 1, .timeout_ms = 2000}, &err);
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_client_unary(uc1, "/u.Svc/Echo", "u", 1, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(uc1, "/u.Svc/Echo", "u", 1, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   grpc_client_response_free(&resp);
   grpc_client_free(uc2);
@@ -1315,8 +1315,8 @@ uds_test:;
   TEST_ASSERT_NULL(grpc_server_new_ex(
       &(grpc_config){.port = 0, .ipv6_addr = "not-ipv6", .log_level = GRPC_LOG_OFF}, &err));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
-  TEST_ASSERT_NULL(grpc_server_new_ex(
-      &(grpc_config){.port = 0, .log_level = (grpc_log_level)99}, &err));
+  TEST_ASSERT_NULL(
+      grpc_server_new_ex(&(grpc_config){.port = 0, .log_level = (grpc_log_level)99}, &err));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
 
   /* Keepalive timeout + PING ACK: raw socket ignores PING (timeout), grpc_client ACKs PING */
@@ -1328,13 +1328,14 @@ uds_test:;
       .log_level = GRPC_LOG_DEBUG,
   });
   TEST_ASSERT_NOT_NULL(ka_srv);
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(ka_srv, "/ka.Svc/Ping", no_body_handler,
-                                                    nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(ka_srv, "/ka.Svc/Ping", no_body_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, ka_srv));
 #ifndef _WIN32
-  grpc_client *ka_c = grpc_client_new(
-      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(ka_srv), .timeout_ms = 2000},
-      &err);
+  grpc_client *ka_c = grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
+                                                            .port = grpc_server_port(ka_srv),
+                                                            .timeout_ms = 2000},
+                                      &err);
   TEST_ASSERT_NOT_NULL(ka_c);
   int raw_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (raw_fd >= 0) {
@@ -1366,9 +1367,10 @@ uds_test:;
       .log_level = GRPC_LOG_OFF,
   });
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_status_details_decode_all(nullptr, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_handle(nullptr, "/a/b", no_body_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_server_handle_stream(nullptr, "/a/b", &(grpc_stream_handler){0}, nullptr));
+                        grpc_server_handle(nullptr, "/a/b", no_body_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_handle_stream(
+                                              nullptr, "/a/b", &(grpc_stream_handler){0}, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_unregister(nullptr, "/a/b"));
   TEST_ASSERT_NOT_NULL(idle_srv);
   TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, idle_srv));
@@ -1416,12 +1418,12 @@ uds_test:;
       &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
   TEST_ASSERT_NOT_NULL(pc_srv);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_register_path(pc_srv, "/pc.Svc/Hold", nullptr));
-  grpc_client *pc_c = grpc_client_new(
-      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(pc_srv), .timeout_ms = 2000},
-      &err);
+  grpc_client *pc_c = grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
+                                                            .port = grpc_server_port(pc_srv),
+                                                            .timeout_ms = 2000},
+                                      &err);
   TEST_ASSERT_NOT_NULL(pc_c);
-  grpc_client_stream *pc_st =
-      grpc_client_stream_open(pc_c, "/pc.Svc/Hold", nullptr, 0, 2000, &err);
+  grpc_client_stream *pc_st = grpc_client_stream_open(pc_c, "/pc.Svc/Hold", nullptr, 0, 2000, &err);
   TEST_ASSERT_NOT_NULL(pc_st);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(pc_st, "x", 1));
   int saw_msg = 0;
@@ -1465,52 +1467,50 @@ uds_test:;
       .log_level = GRPC_LOG_INFO,
   });
   TEST_ASSERT_NOT_NULL(big_srv);
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(big_srv, "/big.Svc/Echo", large_echo_handler,
-                                                    nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(big_srv, "/big.Svc/Echo", large_echo_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_server_handle_stream(
-                   big_srv, "/big.Svc/Hold",
-                   &(grpc_stream_handler){.on_start = cancel_watch_on_start}, nullptr));
+      GRPC_OK, grpc_server_handle_stream(big_srv, "/big.Svc/Hold",
+                                         &(grpc_stream_handler){.on_start = cancel_watch_on_start},
+                                         nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_health_enable(big_srv));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_channelz_enable(big_srv));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_reflection_enable(big_srv));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_reflection_enable(nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK,
-                        grpc_server_add_interceptor(
-                            big_srv, &(grpc_interceptor){.on_done = test_on_done_cb}));
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK,
-      grpc_server_add_interceptor(big_srv, &(grpc_interceptor){.path_prefix = "/other.Svc/"}));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_add_interceptor(
+                                     big_srv, &(grpc_interceptor){.on_done = test_on_done_cb}));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_add_interceptor(
+                                     big_srv, &(grpc_interceptor){.path_prefix = "/other.Svc/"}));
   grpc_interceptor ba_inc = grpc_interceptor_bearer_auth(bearer_validator, nullptr);
   ba_inc.path_prefix = "/big.Svc/Auth";
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_add_interceptor(big_srv, &ba_inc));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(big_srv, "/big.Svc/Auth", no_body_handler,
-                                                    nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(big_srv, "/big.Svc/Auth", no_body_handler, nullptr));
   grpc_interceptor rl_inc = grpc_interceptor_rate_limit(100.0, 2);
   rl_inc.path_prefix = "/big.Svc/RL";
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_add_interceptor(big_srv, &rl_inc));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(big_srv, "/big.Svc/RL", no_body_handler,
-                                                    nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(big_srv, "/big.Svc/RL", no_body_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, big_srv));
-  grpc_client *bc1 = grpc_client_new(
-      &(grpc_client_config){.host = "127.0.0.1",
-                            .port = grpc_server_port(big_srv),
-                            .max_message_size = 8 * 1024 * 1024,
-                            .timeout_ms = 5000},
-      &err);
+  grpc_client *bc1 = grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
+                                                           .port = grpc_server_port(big_srv),
+                                                           .max_message_size = 8 * 1024 * 1024,
+                                                           .timeout_ms = 5000},
+                                     &err);
   TEST_ASSERT_NOT_NULL(bc1);
   /* 2nd TCP connection while max_connections=1 -> triggers reject_connection() */
-  grpc_client *bc2 = grpc_client_new(
-      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(big_srv), .timeout_ms = 500},
-      &err);
+  grpc_client *bc2 = grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
+                                                           .port = grpc_server_port(big_srv),
+                                                           .timeout_ms = 500},
+                                     &err);
   grpc_client_free(bc2);
 
   size_t c_big_sz = 4 * 1024 * 1024;
   char *c_big_buf = grpc_malloc(c_big_sz);
   TEST_ASSERT_NOT_NULL(c_big_buf);
   memset(c_big_buf, 'A', c_big_sz);
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_client_unary(bc1, "/big.Svc/Echo", c_big_buf, c_big_sz, nullptr, 0, 5000, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_unary(bc1, "/big.Svc/Echo", c_big_buf, c_big_sz,
+                                                   nullptr, 0, 5000, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   TEST_ASSERT_NOT_NULL(resp.message);
   TEST_ASSERT_EQUAL_UINT32((uint32_t)c_big_sz, resp.message->len);
@@ -1524,10 +1524,11 @@ uds_test:;
   grpc_client_response_free(&resp);
 
   /* Reflection with unknown protobuf fields (varint, len-delimited, fixed64) */
-  grpc_client_stream *rf = grpc_client_stream_open(
-      bc1, GRPC_REFLECTION_V1_PATH, nullptr, 0, 2000, &err);
+  grpc_client_stream *rf =
+      grpc_client_stream_open(bc1, GRPC_REFLECTION_V1_PATH, nullptr, 0, 2000, &err);
   TEST_ASSERT_NOT_NULL(rf);
-  const uint8_t unk_rf[] = {0xF8, 0x06, 0x01, 0xFA, 0x06, 0x01, 'A', 0xF9, 0x06, 0, 0, 0, 0, 0, 0, 0, 0};
+  const uint8_t unk_rf[] = {0xF8, 0x06, 0x01, 0xFA, 0x06, 0x01, 'A', 0xF9, 0x06,
+                            0,    0,    0,    0,    0,    0,    0,   0};
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(rf, unk_rf, sizeof(unk_rf)));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_close_send(rf));
   grpc_message *rfm = nullptr;
@@ -1538,17 +1539,17 @@ uds_test:;
 
   /* Bearer auth with extra spaces + rate-limit refill after sleep + on_cancel callback */
   grpc_metadata sp_auth[] = {{.key = "authorization", .value = "Bearer   valid-token"}};
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_unary(bc1, "/big.Svc/Auth", "", 0, sp_auth, 1, 2000,
-                                                   &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(bc1, "/big.Svc/Auth", "", 0, sp_auth, 1, 2000, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   grpc_client_response_free(&resp);
 
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_unary(bc1, "/big.Svc/RL", "", 0, nullptr, 0, 2000,
-                                                   &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(bc1, "/big.Svc/RL", "", 0, nullptr, 0, 2000, &resp));
   grpc_client_response_free(&resp);
   uv_sleep(40);
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_unary(bc1, "/big.Svc/RL", "", 0, nullptr, 0, 2000,
-                                                   &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(bc1, "/big.Svc/RL", "", 0, nullptr, 0, 2000, &resp));
   grpc_client_response_free(&resp);
 
   atomic_store(&g_cancel_cb_fired, 0);
@@ -1583,8 +1584,8 @@ uds_test:;
   grpc_server *srv_ok = grpc_server_new(
       &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
   TEST_ASSERT_NOT_NULL(srv_ok);
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(srv_ok, "/big.Svc/Echo", large_echo_handler,
-                                                    nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(srv_ok, "/big.Svc/Echo", large_echo_handler, nullptr));
   pthread_t th_ok;
   TEST_ASSERT_EQUAL_INT(0, pthread_create(&th_ok, nullptr, run_server_fn, srv_ok));
   char ep_a[64], ep_b[64];
@@ -1721,8 +1722,8 @@ void test_integration_async_write_backpressure(void) {
       .log_level = GRPC_LOG_OFF,
   });
   TEST_ASSERT_NOT_NULL(srv);
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(srv, "/bp.Svc/Burst", burst_8mb_handler,
-                                                    nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(srv, "/bp.Svc/Burst", burst_8mb_handler, nullptr));
   pthread_t th;
   TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, srv));
 

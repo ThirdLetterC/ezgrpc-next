@@ -42,7 +42,7 @@ GRPC_API grpc_err grpc_fb_builder_init(flatcc_builder_t *builder);
  *         ``flatcc_verify_error_string()``.
  */
 GRPC_API int grpc_fb_verify(const grpc_message *message, const char *fid,
-                                  flatcc_table_verifier_f *verifier);
+                            flatcc_table_verifier_f *verifier);
 
 /**
  * Verifies a received message and returns its root table.
@@ -51,7 +51,7 @@ GRPC_API int grpc_fb_verify(const grpc_message *message, const char *fid,
  *         message is not a valid buffer of the expected type.
  */
 GRPC_API const void *grpc_fb_unpack(const grpc_message *message, const char *fid,
-                                          flatcc_table_verifier_f *verifier);
+                                    flatcc_table_verifier_f *verifier);
 
 /**
  * Type-safe verification and reading of a root table:
@@ -66,8 +66,7 @@ GRPC_API const void *grpc_fb_unpack(const grpc_message *message, const char *fid
 /**
  * Like :c:macro:`GRPC_FB_UNPACK`, but returns the flatcc verifier result.
  */
-#define GRPC_FB_VERIFY(Type, msg) \
-  grpc_fb_verify((msg), Type##_file_identifier, Type##_verify_table)
+#define GRPC_FB_VERIFY(Type, msg) grpc_fb_verify((msg), Type##_file_identifier, Type##_verify_table)
 
 /**
  * Copies the buffer finished in ``builder`` into a newly allocated

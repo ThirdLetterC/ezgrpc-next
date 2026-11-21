@@ -4,7 +4,6 @@
 #include <string.h>
 #include "core.h"
 
-
 void session_close(grpc_session *session);
 
 /* Queue the session's pending nghttp2 output for the next poll. */

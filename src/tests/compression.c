@@ -64,7 +64,8 @@ void test_configurable_codecs_roundtrip(void) {
   const char sample[] = "codec selection and level configuration round trip";
   const grpc_compression_algorithm algorithms[] = {
 #if defined(GRPC_ENABLE_ZLIB)
-      GRPC_COMPRESS_GZIP, GRPC_COMPRESS_DEFLATE,
+      GRPC_COMPRESS_GZIP,
+      GRPC_COMPRESS_DEFLATE,
 #endif
 #if defined(GRPC_ENABLE_ZSTD)
       GRPC_COMPRESS_ZSTD,
@@ -74,16 +75,16 @@ void test_configurable_codecs_roundtrip(void) {
 #endif
   };
   for (size_t i = 0; i < sizeof(algorithms) / sizeof(algorithms[0]); ++i) {
-    int level = algorithms[i] == GRPC_COMPRESS_SNAPPY
-                    ? GRPC_COMPRESSION_LEVEL_DEFAULT
-                    : algorithms[i] == GRPC_COMPRESS_ZSTD ? 3 : 6;
+    int level = algorithms[i] == GRPC_COMPRESS_SNAPPY ? GRPC_COMPRESSION_LEVEL_DEFAULT
+                : algorithms[i] == GRPC_COMPRESS_ZSTD ? 3
+                                                      : 6;
     uint8_t *packed = nullptr, *unpacked = nullptr;
     size_t packed_len = 0, unpacked_len = 0;
     TEST_ASSERT_EQUAL_INT(0, grpc_compress(algorithms[i], level, (const uint8_t *)sample,
-                                              sizeof(sample) - 1, &packed, &packed_len));
+                                           sizeof(sample) - 1, &packed, &packed_len));
     TEST_ASSERT_NOT_NULL(packed);
-    TEST_ASSERT_EQUAL_INT(0, grpc_decompress(algorithms[i], packed, packed_len, &unpacked,
-                                                &unpacked_len));
+    TEST_ASSERT_EQUAL_INT(
+        0, grpc_decompress(algorithms[i], packed, packed_len, &unpacked, &unpacked_len));
     TEST_ASSERT_EQUAL_UINT64(sizeof(sample) - 1, unpacked_len);
     TEST_ASSERT_EQUAL_MEMORY(sample, unpacked, unpacked_len);
     grpc_free(packed);
@@ -96,7 +97,8 @@ void test_configurable_codecs_roundtrip(void) {
 void test_decompression_limits(void) {
   const grpc_compression_algorithm algorithms[] = {
 #if defined(GRPC_ENABLE_ZLIB)
-      GRPC_COMPRESS_GZIP, GRPC_COMPRESS_DEFLATE,
+      GRPC_COMPRESS_GZIP,
+      GRPC_COMPRESS_DEFLATE,
 #endif
 #if defined(GRPC_ENABLE_ZSTD)
       GRPC_COMPRESS_ZSTD,
@@ -107,17 +109,19 @@ void test_decompression_limits(void) {
   };
   uint8_t input[65536];
   memset(input, 'x', sizeof(input));
-  const size_t limits[] = {0, 1, 255, 256, 4096, sizeof(input) - 1, sizeof(input), sizeof(input) + 1};
+  const size_t limits[] = {
+      0, 1, 255, 256, 4096, sizeof(input) - 1, sizeof(input), sizeof(input) + 1};
   for (size_t codec = 0; codec < sizeof(algorithms) / sizeof(algorithms[0]); codec++) {
     uint8_t *packed = nullptr;
     size_t packed_len = 0;
-    TEST_ASSERT_EQUAL_INT(0, grpc_compress(algorithms[codec], GRPC_COMPRESSION_LEVEL_DEFAULT,
-        input, sizeof(input), &packed, &packed_len));
+    TEST_ASSERT_EQUAL_INT(0, grpc_compress(algorithms[codec], GRPC_COMPRESSION_LEVEL_DEFAULT, input,
+                                           sizeof(input), &packed, &packed_len));
     TEST_ASSERT_TRUE(packed_len < sizeof(input) / 2);
     for (size_t i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
       uint8_t *output = nullptr;
       size_t size = 123;
-      grpc_err rc = grpc_decompress_limited(algorithms[codec], packed, packed_len, &output, &size, limits[i]);
+      grpc_err rc =
+          grpc_decompress_limited(algorithms[codec], packed, packed_len, &output, &size, limits[i]);
       if (limits[i] < sizeof(input)) {
         TEST_ASSERT_EQUAL_INT(GRPC_ERR_LIMIT, rc);
         TEST_ASSERT_NULL(output);
@@ -132,19 +136,20 @@ void test_decompression_limits(void) {
     uint8_t *output = nullptr;
     size_t size = 123;
     TEST_ASSERT_NOT_EQUAL(0, grpc_decompress_limited(algorithms[codec], packed, packed_len - 1,
-        &output, &size, sizeof(input)));
+                                                     &output, &size, sizeof(input)));
     TEST_ASSERT_NULL(output);
     TEST_ASSERT_EQUAL_UINT64(0, size);
     grpc_free(packed);
-    TEST_ASSERT_EQUAL_INT(0, grpc_compress(algorithms[codec], GRPC_COMPRESSION_LEVEL_DEFAULT,
-        input, 0, &packed, &packed_len));
-    TEST_ASSERT_EQUAL_INT(0, grpc_decompress_limited(algorithms[codec], packed, packed_len, &output, &size, 0));
+    TEST_ASSERT_EQUAL_INT(0, grpc_compress(algorithms[codec], GRPC_COMPRESSION_LEVEL_DEFAULT, input,
+                                           0, &packed, &packed_len));
+    TEST_ASSERT_EQUAL_INT(
+        0, grpc_decompress_limited(algorithms[codec], packed, packed_len, &output, &size, 0));
     TEST_ASSERT_EQUAL_UINT64(0, size);
     grpc_free(output);
     grpc_free(packed);
     const uint8_t invalid[] = {0xff, 0xff, 0xff};
     TEST_ASSERT_NOT_EQUAL(0, grpc_decompress_limited(algorithms[codec], invalid, sizeof(invalid),
-        &output, &size, sizeof(input)));
+                                                     &output, &size, sizeof(input)));
     TEST_ASSERT_NULL(output);
     TEST_ASSERT_EQUAL_UINT64(0, size);
   }
@@ -164,7 +169,8 @@ void test_message_all_codecs_and_errors(void) {
 
   const grpc_compression_algorithm algs[] = {
 #if defined(GRPC_ENABLE_ZLIB)
-      GRPC_COMPRESS_GZIP, GRPC_COMPRESS_DEFLATE,
+      GRPC_COMPRESS_GZIP,
+      GRPC_COMPRESS_DEFLATE,
 #endif
 #if defined(GRPC_ENABLE_ZSTD)
       GRPC_COMPRESS_ZSTD,
@@ -200,28 +206,25 @@ void test_message_all_codecs_and_errors(void) {
   size_t out_len = 0;
 #if defined(GRPC_ENABLE_ZLIB)
   TEST_ASSERT_NULL(grpc_message_compress(orig, GRPC_COMPRESS_GZIP, 99));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_compress(GRPC_COMPRESS_GZIP, 99, (const uint8_t *)"a", 1, &out,
-                                      &out_len));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_compress(GRPC_COMPRESS_GZIP, 99,
+                                                        (const uint8_t *)"a", 1, &out, &out_len));
 #endif
 #if defined(GRPC_ENABLE_ZSTD)
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_compress(GRPC_COMPRESS_ZSTD, 9999, (const uint8_t *)"a", 1, &out,
-                                      &out_len));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_compress(GRPC_COMPRESS_ZSTD, 9999,
+                                                        (const uint8_t *)"a", 1, &out, &out_len));
 #endif
 #if defined(GRPC_ENABLE_SNAPPY)
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_compress(GRPC_COMPRESS_SNAPPY, 3, (const uint8_t *)"a", 1, &out,
-                                      &out_len));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_compress(GRPC_COMPRESS_SNAPPY, 3,
+                                                        (const uint8_t *)"a", 1, &out, &out_len));
 #endif
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
                         grpc_compress(GRPC_COMPRESS_GZIP, -1, nullptr, 5, &out, &out_len));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_UNSUPPORTED,
-                        grpc_compress((grpc_compression_algorithm)99, -1, (const uint8_t *)"a", 1,
-                                      &out, &out_len));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_UNSUPPORTED,
-                        grpc_decompress((grpc_compression_algorithm)99, (const uint8_t *)"a", 1,
-                                        &out, &out_len));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_ERR_UNSUPPORTED,
+      grpc_compress((grpc_compression_algorithm)99, -1, (const uint8_t *)"a", 1, &out, &out_len));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_ERR_UNSUPPORTED,
+      grpc_decompress((grpc_compression_algorithm)99, (const uint8_t *)"a", 1, &out, &out_len));
   grpc_message_free(orig);
 }
 

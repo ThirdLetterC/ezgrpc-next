@@ -21,13 +21,11 @@ static inline void grpc_list_message_free(grpc_list_message_t *list) {
   grpc_list_free(l);
 }
 
-static inline int grpc_list_message_push_back(grpc_list_message_t *list,
-                                                 grpc_message *message) {
+static inline int grpc_list_message_push_back(grpc_list_message_t *list, grpc_message *message) {
   return grpc_list_push_back((grpc_list *)list, (void *)message);
 }
 
-static inline int grpc_list_message_push_front(grpc_list_message_t *list,
-                                                  grpc_message *message) {
+static inline int grpc_list_message_push_front(grpc_list_message_t *list, grpc_message *message) {
   return grpc_list_push_front((grpc_list *)list, (void *)message);
 }
 
@@ -56,6 +54,6 @@ static inline int grpc_list_message_is_empty(grpc_list_message_t *list) {
 }
 
 static inline void grpc_list_message_concat_and_empty_src(grpc_list_message_t *dst,
-                                                             grpc_list_message_t *src) {
+                                                          grpc_list_message_t *src) {
   grpc_list_concat_and_empty_src((grpc_list *)dst, (grpc_list *)src);
 }

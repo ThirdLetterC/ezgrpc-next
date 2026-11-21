@@ -12,9 +12,8 @@ void tearDown(void) {}
 
 static int s_freed = 0;
 
-static grpc_status pass([[maybe_unused]] grpc_call *call,
-                           [[maybe_unused]] const char **message,
-                           [[maybe_unused]] void *userdata) {
+static grpc_status pass([[maybe_unused]] grpc_call *call, [[maybe_unused]] const char **message,
+                        [[maybe_unused]] void *userdata) {
   return GRPC_STATUS_OK;
 }
 

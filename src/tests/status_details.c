@@ -21,8 +21,7 @@ void test_status_details_roundtrip_with_any(void) {
   };
 
   size_t enc_len = 0;
-  char *b64 = grpc_status_details_encode((int32_t)GRPC_STATUS_NOT_FOUND, msg, &detail, 1,
-                                            &enc_len);
+  char *b64 = grpc_status_details_encode((int32_t)GRPC_STATUS_NOT_FOUND, msg, &detail, 1, &enc_len);
 
   TEST_ASSERT_NOT_NULL(b64);
   TEST_ASSERT_TRUE(enc_len > 0);
@@ -53,8 +52,8 @@ void test_status_details_roundtrip_with_any(void) {
 void test_status_details_basic_roundtrip(void) {
   const char *msg = "Invalid user argument";
   size_t enc_len = 0;
-  char *b64 = grpc_status_details_encode((int32_t)GRPC_STATUS_INVALID_ARGUMENT, msg,
-                                            nullptr, 0, &enc_len);
+  char *b64 =
+      grpc_status_details_encode((int32_t)GRPC_STATUS_INVALID_ARGUMENT, msg, nullptr, 0, &enc_len);
 
   TEST_ASSERT_NOT_NULL(b64);
 
@@ -75,8 +74,12 @@ void test_status_details_decode_all_multiple(void) {
   const uint8_t p1[] = {0x01, 0x02, 0x03};
   const uint8_t p2[] = {0x0A, 0x0B};
   grpc_status_detail_entry entries[] = {
-      {.type_url = "type.googleapis.com/google.rpc.ErrorInfo", .value = p1, .value_len = sizeof(p1)},
-      {.type_url = "type.googleapis.com/google.rpc.RetryInfo", .value = p2, .value_len = sizeof(p2)},
+      {.type_url = "type.googleapis.com/google.rpc.ErrorInfo",
+       .value = p1,
+       .value_len = sizeof(p1)},
+      {.type_url = "type.googleapis.com/google.rpc.RetryInfo",
+       .value = p2,
+       .value_len = sizeof(p2)},
   };
 
   size_t enc_len = 0;
@@ -106,16 +109,16 @@ void test_status_details_unknown_fields_and_errors(void) {
   /* Proto with unknown varint (field 9, wire 0) and length-delimited (field 10, wire 2),
    * plus an Any (field 3) with unknown varint (field 5, wire 0) and len-delim (field 6, wire 2). */
   const uint8_t proto[] = {
-      0x08, 0x05,                   /* code = 5 */
-      0x12, 0x02, 'o', 'k',         /* message = "ok" */
-      0x48, 0x7F,                   /* unknown field 9, varint 127 */
-      0x52, 0x02, 'x', 'y',         /* unknown field 10, bytes "xy" */
-      0x1A, 0x0E,                   /* field 3: Any (14 bytes) */
-      0x0A, 0x01, 'u',              /* Any.type_url = "u" */
-      0x12, 0x01, 0x42,             /* Any.value = {0x42} */
-      0x28, 0x01,                   /* Any unknown varint field 5 */
-      0x32, 0x02, 0x00, 0x01,       /* Any unknown bytes field 6 */
-      0x28, 0x02,                   /* another varint */
+      0x08, 0x05,             /* code = 5 */
+      0x12, 0x02, 'o',  'k',  /* message = "ok" */
+      0x48, 0x7F,             /* unknown field 9, varint 127 */
+      0x52, 0x02, 'x',  'y',  /* unknown field 10, bytes "xy" */
+      0x1A, 0x0E,             /* field 3: Any (14 bytes) */
+      0x0A, 0x01, 'u',        /* Any.type_url = "u" */
+      0x12, 0x01, 0x42,       /* Any.value = {0x42} */
+      0x28, 0x01,             /* Any unknown varint field 5 */
+      0x32, 0x02, 0x00, 0x01, /* Any unknown bytes field 6 */
+      0x28, 0x02,             /* another varint */
   };
   size_t b64_len = 0;
   char *b64 = grpc_metadata_encode_bin(proto, sizeof(proto), &b64_len);
@@ -140,8 +143,8 @@ void test_status_details_unknown_fields_and_errors(void) {
   grpc_free(b64);
 
   /* Invalid inputs & truncated length-delimited field */
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_status_details_decode(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_status_details_decode(nullptr, nullptr, nullptr,
+                                                                     nullptr, nullptr, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_status_details_decode_all(nullptr, &all));
   const uint8_t trunc_msg[] = {0x12, 0x50, 'a'};
   char *b64_trunc = grpc_metadata_encode_bin(trunc_msg, sizeof(trunc_msg), &b64_len);

@@ -17,9 +17,8 @@ void test_reflection(void) {
 
   const uint8_t descriptor[] = {0x0a, 0x0e, 'h', 'e', 'l', 'l', 'o', 'w', 'o',
                                 'r',  'l',  'd', '.', 'p', 'r', 'o', 't', 'o'};
-  TEST_ASSERT_EQUAL_INT(GRPC_OK,
-                        grpc_reflection_add_file_descriptor(server, "helloworld.proto",
-                                                               descriptor, sizeof(descriptor)));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_reflection_add_file_descriptor(
+                                     server, "helloworld.proto", descriptor, sizeof(descriptor)));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
                         grpc_reflection_add_file_descriptor(server, nullptr, descriptor, 1));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,

@@ -26,11 +26,10 @@ GRPC_API grpc_err grpc_health_enable(grpc_server *server);
  * nullptr or "". Safe to call from any thread.
  */
 GRPC_API grpc_err grpc_health_set_status(grpc_server *server, const char *service,
-                                                  grpc_health_status status);
+                                         grpc_health_status status);
 
 /**
  * Returns the status of a service, or of the whole server when ``service`` is
  * nullptr or "". Safe to call from any thread.
  */
-GRPC_API grpc_health_status grpc_health_get_status(grpc_server *server,
-                                                            const char *service);
+GRPC_API grpc_health_status grpc_health_get_status(grpc_server *server, const char *service);

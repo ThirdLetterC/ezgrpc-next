@@ -20,12 +20,11 @@ GRPC_API ProtobufCAllocator *grpc_pb_get_allocator(void) {
 }
 
 GRPC_API ProtobufCMessage *grpc_pb_unpack(const ProtobufCMessageDescriptor *descriptor,
-                                                const grpc_message *message) {
+                                          const grpc_message *message) {
   if (descriptor == nullptr || message == nullptr) {
     return nullptr;
   }
-  return protobuf_c_message_unpack(descriptor, &g_grpc_pb_allocator, message->len,
-                                   message->data);
+  return protobuf_c_message_unpack(descriptor, &g_grpc_pb_allocator, message->len, message->data);
 }
 
 GRPC_API grpc_message *grpc_pb_pack(const ProtobufCMessage *message) {

@@ -28,8 +28,8 @@ grpc_err tls_enable(grpc_server *server, const grpc_tls_config *cfg) {
     return GRPC_ERR_INVALID;
   }
   if (server->tls_ctx != nullptr) {
-    grpc_tls_ctx **retired = grpc_realloc(
-        server->retired_tls_ctxs, (server->nb_retired_tls_ctxs + 1) * sizeof(*retired));
+    grpc_tls_ctx **retired = grpc_realloc(server->retired_tls_ctxs,
+                                          (server->nb_retired_tls_ctxs + 1) * sizeof(*retired));
     if (retired != nullptr) {
       server->retired_tls_ctxs = retired;
       server->retired_tls_ctxs[server->nb_retired_tls_ctxs++] = server->tls_ctx;
@@ -188,12 +188,11 @@ int grpc_tls_session_init([[maybe_unused]] grpc_session *session) {
 }
 
 int grpc_tls_feed([[maybe_unused]] grpc_session *session, [[maybe_unused]] const void *buf,
-                     [[maybe_unused]] size_t len) {
+                  [[maybe_unused]] size_t len) {
   return 1;
 }
 
-int grpc_tls_drain([[maybe_unused]] grpc_session *session,
-                      [[maybe_unused]] grpc_buf *out) {
+int grpc_tls_drain([[maybe_unused]] grpc_session *session, [[maybe_unused]] grpc_buf *out) {
   return 1;
 }
 
@@ -202,12 +201,12 @@ int grpc_tls_handshake([[maybe_unused]] grpc_session *session) {
 }
 
 ssize_t grpc_tls_read([[maybe_unused]] grpc_session *session, [[maybe_unused]] void *buf,
-                         [[maybe_unused]] size_t len) {
+                      [[maybe_unused]] size_t len) {
   return -1;
 }
 
-ssize_t grpc_tls_write([[maybe_unused]] grpc_session *session,
-                          [[maybe_unused]] const void *buf, [[maybe_unused]] size_t len) {
+ssize_t grpc_tls_write([[maybe_unused]] grpc_session *session, [[maybe_unused]] const void *buf,
+                       [[maybe_unused]] size_t len) {
   return -1;
 }
 

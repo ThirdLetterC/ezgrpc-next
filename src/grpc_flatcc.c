@@ -61,7 +61,7 @@ GRPC_API grpc_err grpc_fb_builder_init(flatcc_builder_t *builder) {
 }
 
 GRPC_API int grpc_fb_verify(const grpc_message *message, const char *fid,
-                                  flatcc_table_verifier_f *verifier) {
+                            flatcc_table_verifier_f *verifier) {
   if (message == nullptr || verifier == nullptr) {
     return flatcc_verify_error_buffer_header_too_small;
   }
@@ -69,7 +69,7 @@ GRPC_API int grpc_fb_verify(const grpc_message *message, const char *fid,
 }
 
 GRPC_API const void *grpc_fb_unpack(const grpc_message *message, const char *fid,
-                                          flatcc_table_verifier_f *verifier) {
+                                    flatcc_table_verifier_f *verifier) {
   if (grpc_fb_verify(message, fid, verifier) != flatcc_verify_ok) {
     return nullptr;
   }

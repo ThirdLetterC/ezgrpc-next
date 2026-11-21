@@ -95,13 +95,12 @@ GRPC_API grpc_err grpc_client_server_stream(
  * grpc_client_stream_close_send(), read responses with grpc_client_stream_recv(),
  * and complete with grpc_client_stream_finish() (or abort with grpc_client_stream_cancel()).
  */
-GRPC_API GRPC_NODISCARD grpc_client_stream *grpc_client_stream_open(
-    grpc_client *client, const char *method, const grpc_metadata *metadata, size_t nb_metadata,
-    uint32_t timeout_ms, grpc_err *out_err);
+GRPC_API GRPC_NODISCARD grpc_client_stream *
+grpc_client_stream_open(grpc_client *client, const char *method, const grpc_metadata *metadata,
+                        size_t nb_metadata, uint32_t timeout_ms, grpc_err *out_err);
 
 /** Sends one message on an open client/bidi stream. */
-GRPC_API grpc_err grpc_client_stream_send(grpc_client_stream *stream, const void *data,
-                                          size_t len);
+GRPC_API grpc_err grpc_client_stream_send(grpc_client_stream *stream, const void *data, size_t len);
 
 /** Half-closes the client send direction (signals no more request messages). */
 GRPC_API grpc_err grpc_client_stream_close_send(grpc_client_stream *stream);

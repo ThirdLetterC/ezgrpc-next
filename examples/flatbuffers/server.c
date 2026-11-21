@@ -37,12 +37,11 @@ static const char *request_name(greeter_HelloRequest_table_t req) {
 }
 
 /* verifies the request; the table points into it and lives as long as the call */
-static greeter_HelloRequest_table_t read_request(grpc_call *call,
-                                                 const grpc_message *request) {
+static greeter_HelloRequest_table_t read_request(grpc_call *call, const grpc_message *request) {
   greeter_HelloRequest_table_t req = GRPC_FB_UNPACK(greeter_HelloRequest, request);
   if (req == nullptr)
     grpc_call_finish(call, GRPC_STATUS_INVALID_ARGUMENT,
-                        "request is not a valid greeter.HelloRequest");
+                     "request is not a valid greeter.HelloRequest");
   return req;
 }
 

@@ -70,9 +70,8 @@ void reflection_free(grpc_server *server) {
 }
 
 GRPC_API grpc_err grpc_reflection_add_file_descriptor(grpc_server *server,
-                                                               const char *symbol_or_filename,
-                                                               const uint8_t *descriptor,
-                                                               size_t len) {
+                                                      const char *symbol_or_filename,
+                                                      const uint8_t *descriptor, size_t len) {
   if (server == nullptr || symbol_or_filename == nullptr || descriptor == nullptr || len == 0) {
     return GRPC_ERR_INVALID;
   }
@@ -208,8 +207,7 @@ static uint8_t *build_list_services_response(const char services[][MAX_SYMBOL_LE
 }
 
 /* one ServerReflectionRequest of the stream: answer it */
-static void reflection_on_message(grpc_call *call, const grpc_message *in_msg,
-                                  void *userdata) {
+static void reflection_on_message(grpc_call *call, const grpc_message *in_msg, void *userdata) {
   grpc_server *server = userdata;
   struct reflection_state *state = server->reflection;
 
@@ -346,8 +344,7 @@ GRPC_API grpc_err grpc_reflection_enable(grpc_server *server) {
       .on_message = reflection_on_message,
       .on_end = reflection_on_end,
   };
-  grpc_err err =
-      grpc_server_handle_stream(server, GRPC_REFLECTION_V1ALPHA_PATH, &handler, server);
+  grpc_err err = grpc_server_handle_stream(server, GRPC_REFLECTION_V1ALPHA_PATH, &handler, server);
   if (err != GRPC_OK)
     return err;
   return grpc_server_handle_stream(server, GRPC_REFLECTION_V1_PATH, &handler, server);

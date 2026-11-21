@@ -23,7 +23,7 @@ GRPC_API ProtobufCAllocator *grpc_pb_get_allocator(void);
  *         or nullptr if unpacking failed or message was invalid.
  */
 GRPC_API ProtobufCMessage *grpc_pb_unpack(const ProtobufCMessageDescriptor *descriptor,
-                                                const grpc_message *message);
+                                          const grpc_message *message);
 
 /**
  * Helper macro for type-safe unpacking:

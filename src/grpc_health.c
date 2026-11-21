@@ -84,7 +84,7 @@ static void notify_watchers_on_loop(void *arg) {
 }
 
 GRPC_API grpc_err grpc_health_set_status(grpc_server *server, const char *service,
-                                                  grpc_health_status status) {
+                                         grpc_health_status status) {
   if (server == nullptr)
     return GRPC_ERR_INVALID;
   /* created on first use; set statuses before other threads use the server */
@@ -126,8 +126,7 @@ out:
   return err;
 }
 
-GRPC_API grpc_health_status grpc_health_get_status(grpc_server *server,
-                                                            const char *service) {
+GRPC_API grpc_health_status grpc_health_get_status(grpc_server *server, const char *service) {
   if (server == nullptr || server->health == nullptr)
     return GRPC_HEALTH_UNKNOWN;
   struct health_state *health = server->health;
@@ -207,8 +206,7 @@ static void health_check(grpc_call *call, const grpc_message *request, void *use
   grpc_server *server = userdata;
   char service_name[MAX_SERVICE_NAME_LEN] = {};
   if (request->len > 0) {
-    parse_health_request_service(request->data, request->len, service_name,
-                                 sizeof(service_name));
+    parse_health_request_service(request->data, request->len, service_name, sizeof(service_name));
   }
 
   grpc_health_status status = grpc_health_get_status(server, service_name);

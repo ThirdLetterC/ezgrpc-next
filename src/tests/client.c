@@ -103,21 +103,20 @@ void test_client_server_tcp_end_to_end(void) {
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_health_enable(server));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_channelz_enable(server));
   TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_server_set_fallback(
-                   server,
-                   &(grpc_stream_handler){.on_start = fallback_on_start,
-                                          .on_message = fallback_on_message},
-                   &ctx));
+      GRPC_OK, grpc_server_set_fallback(server,
+                                        &(grpc_stream_handler){.on_start = fallback_on_start,
+                                                               .on_message = fallback_on_message},
+                                        &ctx));
 
   /* Scoped message-level interceptor on /test.Svc/ */
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_server_add_interceptor(server, &(grpc_interceptor){
-                                                       .name = "msg_counter",
-                                                       .path_prefix = "/test.Svc/",
-                                                       .on_recv_message = count_recv,
-                                                       .on_send_message = count_send,
-                                                       .userdata = &ctx,
-                                                   }));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_add_interceptor(server, &(grpc_interceptor){
+                                                                .name = "msg_counter",
+                                                                .path_prefix = "/test.Svc/",
+                                                                .on_recv_message = count_recv,
+                                                                .on_send_message = count_send,
+                                                                .userdata = &ctx,
+                                                            }));
 
   /* Rate limiter scoped to /test.Svc/Echo: burst of 2 */
   grpc_interceptor rl = grpc_interceptor_rate_limit(0.0, 2);
@@ -144,8 +143,8 @@ void test_client_server_tcp_end_to_end(void) {
   grpc_metadata md[] = {{.key = "traceparent", .value = tp}};
 
   grpc_client_response resp = {0};
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_client_unary(client, "/test.Svc/Echo", "hello", 5, md, 1, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(client, "/test.Svc/Echo", "hello", 5, md, 1, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   TEST_ASSERT_NOT_NULL(resp.message);
   TEST_ASSERT_EQUAL_UINT32(5, resp.message->len);
@@ -166,9 +165,9 @@ void test_client_server_tcp_end_to_end(void) {
 
   /* 3. Server streaming */
   int streamed = 0;
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_client_server_stream(client, "/test.Svc/Stream", "go", 2, nullptr, 0, 0,
-                                         collect_stream_msg, &streamed, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_server_stream(client, "/test.Svc/Stream", "go", 2, nullptr, 0,
+                                                  0, collect_stream_msg, &streamed, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   TEST_ASSERT_EQUAL_INT(3, streamed);
   grpc_client_response_free(&resp);
@@ -185,16 +184,15 @@ void test_client_server_tcp_end_to_end(void) {
   grpc_client_response_free(&resp);
 
   /* 5. Channelz GetServers & GetServerSockets */
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_client_unary(client, GRPC_CHANNELZ_PATH_GET_SERVERS, "", 0, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_unary(client, GRPC_CHANNELZ_PATH_GET_SERVERS, "", 0,
+                                                   nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   TEST_ASSERT_NOT_NULL(resp.message);
   TEST_ASSERT_TRUE(resp.message->len > 0);
   grpc_client_response_free(&resp);
 
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK,
-      grpc_client_unary(client, GRPC_CHANNELZ_PATH_GET_SERVER_SOCKETS, "", 0, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_unary(client, GRPC_CHANNELZ_PATH_GET_SERVER_SOCKETS,
+                                                   "", 0, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   TEST_ASSERT_NOT_NULL(resp.message);
   TEST_ASSERT_TRUE(resp.message->len > 0);
@@ -223,8 +221,8 @@ void test_unix_domain_socket(void) {
   const char *sock_path = "/tmp/ezgrpc_next_test.sock";
   server_thread_ctx ctx = {0};
   grpc_err err = GRPC_OK;
-  grpc_server *server = grpc_server_new_ex(
-      &(grpc_config){.unix_path = sock_path, .log_level = GRPC_LOG_OFF}, &err);
+  grpc_server *server =
+      grpc_server_new_ex(&(grpc_config){.unix_path = sock_path, .log_level = GRPC_LOG_OFF}, &err);
   TEST_ASSERT_NOT_NULL(server);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, err);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/uds.Svc/Echo", echo_unary, &ctx));
@@ -232,8 +230,8 @@ void test_unix_domain_socket(void) {
   pthread_t th;
   TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_thread, server));
 
-  grpc_client *client = grpc_client_new(
-      &(grpc_client_config){.unix_path = sock_path, .timeout_ms = 3000}, &err);
+  grpc_client *client =
+      grpc_client_new(&(grpc_client_config){.unix_path = sock_path, .timeout_ms = 3000}, &err);
   TEST_ASSERT_NOT_NULL(client);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, err);
 
@@ -306,23 +304,24 @@ void test_client_streaming_bidi_retries_and_lb(void) {
   TEST_ASSERT_NOT_NULL(srv_a);
   TEST_ASSERT_NOT_NULL(srv_b);
 
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_server_handle_stream(
-                   srv_a, "/stream.Svc/Bidi",
-                   &(grpc_stream_handler){.on_message = bidi_on_msg, .on_end = bidi_on_end},
-                   nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
-                        grpc_server_handle_stream(srv_a, "/stream.Svc/Sum",
-                                                  &(grpc_stream_handler){
-                                                      .on_start = cstream_on_start,
-                                                      .on_message = cstream_on_msg,
-                                                      .on_end = cstream_on_end,
-                                                  },
+                        grpc_server_handle_stream(srv_a, "/stream.Svc/Bidi",
+                                                  &(grpc_stream_handler){.on_message = bidi_on_msg,
+                                                                         .on_end = bidi_on_end},
                                                   nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle_stream(srv_a, "/stream.Svc/Sum",
+                                                           &(grpc_stream_handler){
+                                                               .on_start = cstream_on_start,
+                                                               .on_message = cstream_on_msg,
+                                                               .on_end = cstream_on_end,
+                                                           },
+                                                           nullptr));
   TEST_ASSERT_EQUAL_INT(
       GRPC_OK, grpc_server_handle(srv_a, "/retry.Svc/Flaky", flaky_unary, &flaky_attempts));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(srv_a, "/lb.Svc/Ping", count_hits_unary, &hits_a));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(srv_b, "/lb.Svc/Ping", count_hits_unary, &hits_b));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(srv_a, "/lb.Svc/Ping", count_hits_unary, &hits_a));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(srv_b, "/lb.Svc/Ping", count_hits_unary, &hits_b));
 
   pthread_t th_a, th_b;
   TEST_ASSERT_EQUAL_INT(0, pthread_create(&th_a, nullptr, run_server_thread, srv_a));
@@ -392,8 +391,8 @@ void test_client_streaming_bidi_retries_and_lb(void) {
       &(grpc_client_config){.targets = targets, .nb_targets = 2, .timeout_ms = 3000}, &err);
   TEST_ASSERT_NOT_NULL(lb);
   for (int i = 0; i < 4; i++) {
-    TEST_ASSERT_EQUAL_INT(
-        GRPC_OK, grpc_client_unary(lb, "/lb.Svc/Ping", "p", 1, nullptr, 0, 0, &resp));
+    TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                          grpc_client_unary(lb, "/lb.Svc/Ping", "p", 1, nullptr, 0, 0, &resp));
     TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
     grpc_client_response_free(&resp);
   }

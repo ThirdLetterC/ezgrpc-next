@@ -99,8 +99,7 @@ typedef struct grpc_server_stats {
  * grpc_call_send() (any number of times) and grpc_call_finish(), now or
  * later.
  */
-typedef void (*grpc_handler_fn)(grpc_call *call, const grpc_message *request,
-                                   void *userdata);
+typedef void (*grpc_handler_fn)(grpc_call *call, const grpc_message *request, void *userdata);
 
 /**
  * Handles a method whose client streams requests: client-streaming and
@@ -145,29 +144,26 @@ GRPC_API void grpc_server_free(grpc_server *server);
  * Changes the server's log threshold. Safe to call from any thread while the
  * server is alive. GRPC_LOG_DEFAULT selects GRPC_LOG_INFO.
  */
-GRPC_API grpc_err grpc_server_set_log_level(grpc_server *server,
-                                                     grpc_log_level level);
+GRPC_API grpc_err grpc_server_set_log_level(grpc_server *server, grpc_log_level level);
 
 /**
  * Registers a handler for a single-request method, e.g.
  * ``"/helloworld.Greeter/SayHello"``.
  */
-GRPC_API grpc_err grpc_server_handle(grpc_server *server, const char *path,
-                                              grpc_handler_fn handler, void *userdata);
+GRPC_API grpc_err grpc_server_handle(grpc_server *server, const char *path, grpc_handler_fn handler,
+                                     void *userdata);
 
 /**
  * Registers handlers for a method whose client streams requests.
  */
 GRPC_API grpc_err grpc_server_handle_stream(grpc_server *server, const char *path,
-                                                     const grpc_stream_handler *handler,
-                                                     void *userdata);
+                                            const grpc_stream_handler *handler, void *userdata);
 
 /**
  * Registers a method whose calls are reported as events instead of
  * dispatched to a handler; see grpc_server_poll().
  */
-GRPC_API grpc_err grpc_server_register_path(grpc_server *server, const char *path,
-                                                     void *userdata);
+GRPC_API grpc_err grpc_server_register_path(grpc_server *server, const char *path, void *userdata);
 
 /**
  * Stops accepting new calls to a method. Calls in progress are unaffected.
@@ -179,8 +175,8 @@ GRPC_API grpc_err grpc_server_unregister(grpc_server *server, const char *path);
  * (enabling proxies, gateways, and dynamic routing). Pass nullptr to clear it
  * and restore automatic UNIMPLEMENTED responses.
  */
-GRPC_API grpc_err grpc_server_set_fallback(grpc_server *server,
-                                           const grpc_stream_handler *handler, void *userdata);
+GRPC_API grpc_err grpc_server_set_fallback(grpc_server *server, const grpc_stream_handler *handler,
+                                           void *userdata);
 
 /**
  * Copies a snapshot of runtime metrics into ``out``. Thread-safe.
@@ -230,8 +226,7 @@ GRPC_API void grpc_server_flush(grpc_server *server);
  * Runs ``fn(arg)`` on the server thread soon. Safe to call from any thread:
  * this is how worker threads hand results back.
  */
-GRPC_API grpc_err grpc_server_post(grpc_server *server, void (*fn)(void *arg),
-                                            void *arg);
+GRPC_API grpc_err grpc_server_post(grpc_server *server, void (*fn)(void *arg), void *arg);
 
 /**
  * The TLS library's own context, see grpc_tls.h. nullptr without TLS.

@@ -28,8 +28,7 @@ typedef struct grpc_interceptor {
   /** Optional hook called before each response message is queued for sending. */
   grpc_status (*on_send_message)(grpc_call *call, const grpc_message *message,
                                  const char **error_msg, void *userdata);
-  void (*on_done)(grpc_call *call, grpc_status status, uint64_t duration_ms,
-                  void *userdata);
+  void (*on_done)(grpc_call *call, grpc_status status, uint64_t duration_ms, void *userdata);
   void *userdata;
   /** Called on ``userdata`` when the server is freed. Optional. */
   void (*userdata_free)(void *userdata);
@@ -39,7 +38,7 @@ typedef struct grpc_interceptor {
  * Adds an interceptor. The struct is copied.
  */
 GRPC_API grpc_err grpc_server_add_interceptor(grpc_server *server,
-                                                       const grpc_interceptor *interceptor);
+                                              const grpc_interceptor *interceptor);
 
 /** Returns true if ``token`` (from ``authorization: Bearer <token>``) is valid. */
 typedef bool (*grpc_token_validator_fn)(const char *token, void *userdata);
@@ -49,7 +48,7 @@ typedef bool (*grpc_token_validator_fn)(const char *token, void *userdata);
  * ``authorization: Bearer <token>`` accepted by ``validator``.
  */
 GRPC_API grpc_interceptor grpc_interceptor_bearer_auth(grpc_token_validator_fn validator,
-                                                                void *userdata);
+                                                       void *userdata);
 
 /**
  * A token-bucket rate limiter interceptor. Ends calls with RESOURCE_EXHAUSTED

@@ -9,7 +9,7 @@
 #if defined(malloc) || defined(free) || defined(calloc) || defined(realloc) || defined(strdup)
 #error "grpc.h redefines allocation functions"
 #endif
-#if defined(likely) || defined(unlikely) || defined(REALIGN) || defined(COLSTR) ||                 \
+#if defined(likely) || defined(unlikely) || defined(REALIGN) || defined(COLSTR) || \
     defined(LOG_ERROR) || defined(CONFIG_STREAM_MAX_HEADERS)
 #error "grpc.h leaks internal macros"
 #endif
@@ -22,8 +22,7 @@ void tearDown(void) {}
 
 #define PORT 19990
 
-static void handler([[maybe_unused]] grpc_call *call,
-                    [[maybe_unused]] const grpc_message *request,
+static void handler([[maybe_unused]] grpc_call *call, [[maybe_unused]] const grpc_message *request,
                     [[maybe_unused]] void *userdata) {}
 
 static void on_message([[maybe_unused]] grpc_call *call,
@@ -48,18 +47,19 @@ void test_config_validation(void) {
   TEST_ASSERT_EQUAL_UINT16(0, grpc_server_port(nullptr));
 
   /* invalid addresses and limits */
-  TEST_ASSERT_NULL(grpc_server_new_ex(&(grpc_config){
-      .port = PORT, .ipv4_addr = "not an address", .log_level = GRPC_LOG_OFF}, &err));
+  TEST_ASSERT_NULL(grpc_server_new_ex(
+      &(grpc_config){.port = PORT, .ipv4_addr = "not an address", .log_level = GRPC_LOG_OFF},
+      &err));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
-  TEST_ASSERT_NULL(grpc_server_new_ex(&(grpc_config){
-      .port = PORT, .max_frame_size = 100, .log_level = GRPC_LOG_OFF}, &err));
+  TEST_ASSERT_NULL(grpc_server_new_ex(
+      &(grpc_config){.port = PORT, .max_frame_size = 100, .log_level = GRPC_LOG_OFF}, &err));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
   /* TLS needs both files or both PEMs */
-  TEST_ASSERT_NULL(grpc_server_new_ex(&(grpc_config){
-      .port = PORT, .tls.cert_file = "cert.pem", .log_level = GRPC_LOG_OFF}, &err));
+  TEST_ASSERT_NULL(grpc_server_new_ex(
+      &(grpc_config){.port = PORT, .tls.cert_file = "cert.pem", .log_level = GRPC_LOG_OFF}, &err));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
-  TEST_ASSERT_NULL(grpc_server_new_ex(&(grpc_config){
-      .port = PORT, .tls.cert_pem = "pem", .log_level = GRPC_LOG_OFF}, &err));
+  TEST_ASSERT_NULL(grpc_server_new_ex(
+      &(grpc_config){.port = PORT, .tls.cert_pem = "pem", .log_level = GRPC_LOG_OFF}, &err));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
 
   /* only the given address family */
@@ -78,23 +78,17 @@ void test_routes(void) {
   TEST_ASSERT_NOT_NULL(server);
 
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/a.B/C", handler, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_EXISTS,
-                        grpc_server_handle(server, "/a.B/C", handler, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_server_handle(server, "no-slash", handler, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_server_handle(server, "/a.B/D", nullptr, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_server_handle_stream(server, "/a.B/D",
-                                                     &(grpc_stream_handler){}, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK,
-                        grpc_server_handle_stream(
-                            server, "/a.B/D", &(grpc_stream_handler){.on_message = on_message},
-                            nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK,
-                        grpc_server_handle_stream(
-                            server, "/a.B/StartOnly", &(grpc_stream_handler){.on_start = on_start},
-                            nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_EXISTS, grpc_server_handle(server, "/a.B/C", handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_handle(server, "no-slash", handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_handle(server, "/a.B/D", nullptr, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_handle_stream(
+                                              server, "/a.B/D", &(grpc_stream_handler){}, nullptr));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_handle_stream(
+                   server, "/a.B/D", &(grpc_stream_handler){.on_message = on_message}, nullptr));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_handle_stream(server, "/a.B/StartOnly",
+                                         &(grpc_stream_handler){.on_start = on_start}, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_register_path(server, "/a.B/E", nullptr));
 
   /* more methods than the old fixed limit of 10 */
@@ -174,22 +168,17 @@ void test_log_level_control(void) {
   TEST_ASSERT_NOT_NULL(second_log);
 
   grpc_server *first = grpc_server_new(&(grpc_config){.port = PORT,
-                                                               .ipv4_addr = "127.0.0.1",
-                                                               .log_level = GRPC_LOG_WARNING,
-                                                               .log_file = first_log});
+                                                      .ipv4_addr = "127.0.0.1",
+                                                      .log_level = GRPC_LOG_WARNING,
+                                                      .log_file = first_log});
   TEST_ASSERT_NOT_NULL(first);
-  grpc_server *second = grpc_server_new(&(grpc_config){.port = PORT,
-                                                                .ipv4_addr = "127.0.0.1",
-                                                                .log_level = GRPC_LOG_ERROR,
-                                                                .log_file = second_log});
+  grpc_server *second = grpc_server_new(&(grpc_config){
+      .port = PORT, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_ERROR, .log_file = second_log});
   TEST_ASSERT_NOT_NULL(second);
 
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_server_set_log_level(nullptr, GRPC_LOG_INFO));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_server_set_log_level(first, (grpc_log_level)-1));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_server_set_log_level(first, (grpc_log_level)7));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_set_log_level(nullptr, GRPC_LOG_INFO));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_set_log_level(first, (grpc_log_level)-1));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_set_log_level(first, (grpc_log_level)7));
 
   server_log(first, GRPC_LOG_INFO, "filtered-first\n");
   server_log(first, GRPC_LOG_WARNING, "warning-first\n");
@@ -296,15 +285,15 @@ void test_call_null_safety(void) {
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_send_data(nullptr, "x", 1));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_reply(nullptr, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_reply_data(nullptr, "x", 1));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_set_compression(nullptr, GRPC_COMPRESS_GZIP, -1));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
+                        grpc_call_set_compression(nullptr, GRPC_COMPRESS_GZIP, -1));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_send_async(nullptr, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_send_data_async(nullptr, "x", 1));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_reply_async(nullptr, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_send_metadata_async(nullptr, nullptr, 0));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_add_trailers_async(nullptr, nullptr, 0));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_call_finish_with_details_async(nullptr, GRPC_STATUS_INTERNAL, nullptr,
-                                                            nullptr, 0));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_finish_with_details_async(
+                                              nullptr, GRPC_STATUS_INTERNAL, nullptr, nullptr, 0));
   TEST_ASSERT_NULL(grpc_call_metadata(nullptr, "key", nullptr));
   size_t idx = 0;
   TEST_ASSERT_NULL(grpc_call_metadata_next(nullptr, "key", &idx, nullptr));

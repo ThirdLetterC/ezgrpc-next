@@ -21,20 +21,19 @@ GRPC_API GRPC_NODISCARD grpc_err grpc_decompress_limited(grpc_compression_algori
                                                          uint8_t **out, size_t *out_len,
                                                          size_t max_output);
 /** Returns a compressed copy of msg using algorithm and level. */
-GRPC_API GRPC_NODISCARD grpc_message *grpc_message_compress(const grpc_message *msg,
-                                                            grpc_compression_algorithm algorithm,
-                                                            int level);
+GRPC_API GRPC_NODISCARD grpc_message *
+grpc_message_compress(const grpc_message *msg, grpc_compression_algorithm algorithm, int level);
 /** Decompresses msg using algorithm; uncompressed messages are duplicated. */
-GRPC_API GRPC_NODISCARD grpc_message *grpc_message_decompress(
-    const grpc_message *msg, grpc_compression_algorithm algorithm);
+GRPC_API GRPC_NODISCARD grpc_message *grpc_message_decompress(const grpc_message *msg,
+                                                              grpc_compression_algorithm algorithm);
 
 /**
  * Compresses data using gzip (RFC 1952).
  * Allocates ``*out`` with grpc_malloc(). The caller frees it with grpc_free().
  * Returns GRPC_OK on success, or a negative grpc_err on failure.
  */
-GRPC_API GRPC_NODISCARD grpc_err grpc_compress_gzip(const uint8_t *in, size_t in_len,
-                                                    uint8_t **out, size_t *out_len);
+GRPC_API GRPC_NODISCARD grpc_err grpc_compress_gzip(const uint8_t *in, size_t in_len, uint8_t **out,
+                                                    size_t *out_len);
 
 /**
  * Decompresses gzip data (RFC 1952).

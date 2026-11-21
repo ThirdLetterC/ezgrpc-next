@@ -26,8 +26,7 @@
 #ifndef _MSC_VER
 [[gnu::format(printf, 3, 4)]]
 #endif
-void server_log(grpc_server *server, grpc_log_level level,
-                                              const char *fmt, ...);
+void server_log(grpc_server *server, grpc_log_level level, const char *fmt, ...);
 
 #define LOG_ERROR(server, fmt, ...) \
   server_log(server, GRPC_LOG_ERROR, "error: " fmt __VA_OPT__(, ) __VA_ARGS__)
@@ -420,8 +419,8 @@ void server_drop_ready(grpc_server *server);
 /* grpc_server.c */
 grpc_route *server_find_route(grpc_server *server, const char *path, size_t len);
 grpc_err server_add_route(grpc_server *server, const char *path, route_kind kind,
-                             grpc_handler_fn handler, const grpc_stream_handler *stream,
-                             void *userdata);
+                          grpc_handler_fn handler, const grpc_stream_handler *stream,
+                          void *userdata);
 
 /* grpc_interceptor.c */
 /* Run on_call interceptors; return false if one ends the call. */

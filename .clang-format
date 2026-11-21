@@ -1,6 +1,5 @@
 # Formatting for the grpc C sources. Run `cmake --build build --target format` (or `format-check`).
 BasedOnStyle: LLVM
-Language: C
 Standard: Latest
 
 IndentWidth: 2

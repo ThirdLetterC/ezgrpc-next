@@ -30,10 +30,9 @@ static const char *request_name(const Helloworld__HelloRequest *req, const char 
   return req->name != nullptr && req->name[0] != '\0' ? req->name : fallback;
 }
 
-static Helloworld__HelloRequest *unpack_request(grpc_call *call,
-                                                const grpc_message *message) {
-  Helloworld__HelloRequest *req = GRPC_PB_UNPACK(
-      Helloworld__HelloRequest, &helloworld__hello_request__descriptor, message);
+static Helloworld__HelloRequest *unpack_request(grpc_call *call, const grpc_message *message) {
+  Helloworld__HelloRequest *req =
+      GRPC_PB_UNPACK(Helloworld__HelloRequest, &helloworld__hello_request__descriptor, message);
   if (req == nullptr)
     grpc_call_finish(call, GRPC_STATUS_INVALID_ARGUMENT, "invalid HelloRequest");
   return req;
@@ -59,8 +58,7 @@ static void say_hello(grpc_call *call, const grpc_message *request,
   send_reply(call, text);
   GRPC_PB_FREE_UNPACKED(req);
 
-  grpc_call_add_trailers(call, &(grpc_metadata){.key = "x-custom-reply", .value = "pong"},
-                            1);
+  grpc_call_add_trailers(call, &(grpc_metadata){.key = "x-custom-reply", .value = "pong"}, 1);
   grpc_call_finish(call, GRPC_STATUS_OK, nullptr);
 }
 
@@ -147,12 +145,11 @@ static void bidi_on_end(grpc_call *call, [[maybe_unused]] void *userdata) {
 }
 
 /* 6. SayHelloWithError (rich error model) */
-static void say_hello_with_error(grpc_call *call,
-                                 [[maybe_unused]] const grpc_message *request,
+static void say_hello_with_error(grpc_call *call, [[maybe_unused]] const grpc_message *request,
                                  [[maybe_unused]] void *userdata) {
   /* google.rpc.ErrorInfo { reason: "INVALID_NAME", domain: "helloworld" } */
   static const uint8_t error_info[] = {
-      0x0a, 0x0c, 'I', 'N', 'V', 'A', 'L', 'I', 'D', '_', 'N', 'A', 'M',
+      0x0a, 0x0c, 'I',  'N', 'V', 'A', 'L', 'I', 'D', '_', 'N', 'A', 'M',
       'E',  0x12, 0x0a, 'h', 'e', 'l', 'l', 'o', 'w', 'o', 'r', 'l', 'd',
   };
   grpc_status_detail_entry detail = {
@@ -161,7 +158,7 @@ static void say_hello_with_error(grpc_call *call,
       .value_len = sizeof(error_info),
   };
   grpc_call_finish_with_details(call, GRPC_STATUS_INVALID_ARGUMENT,
-                                   "Name validation failed: name cannot be empty", &detail, 1);
+                                "Name validation failed: name cannot be empty", &detail, 1);
 }
 
 /* 7. SayHelloSlow: answered by a worker thread */
@@ -198,7 +195,7 @@ static void say_hello_slow(grpc_call *call, [[maybe_unused]] const grpc_message 
 
 /* an interceptor that logs every call, and refuses those asking for it */
 static grpc_status log_call(grpc_call *call, const char **message,
-                               [[maybe_unused]] void *userdata) {
+                            [[maybe_unused]] void *userdata) {
   if (!g_quiet)
     printf("[interceptor] %s from %s\n", grpc_call_method(call), grpc_call_peer(call));
   const char *reject = grpc_call_metadata(call, "x-reject", nullptr);
@@ -229,28 +226,28 @@ static void *serve(void *arg) {
   grpc_server_handle(server, "/helloworld.Greeter/SayHelloAgain", say_hello_again, nullptr);
   grpc_server_handle(server, "/helloworld.Greeter/SayHelloStream", say_hello_stream, nullptr);
   grpc_server_handle_stream(server, "/helloworld.Greeter/SayHelloClientStream",
-                               &(grpc_stream_handler){
-                                   .on_message = client_stream_on_message,
-                                   .on_end = client_stream_on_end,
-                               },
-                               nullptr);
+                            &(grpc_stream_handler){
+                                .on_message = client_stream_on_message,
+                                .on_end = client_stream_on_end,
+                            },
+                            nullptr);
   grpc_server_handle_stream(server, "/helloworld.Greeter/SayHelloBidiStream",
-                               &(grpc_stream_handler){
-                                   .on_message = bidi_on_message,
-                                   .on_end = bidi_on_end,
-                               },
-                               nullptr);
+                            &(grpc_stream_handler){
+                                .on_message = bidi_on_message,
+                                .on_end = bidi_on_end,
+                            },
+                            nullptr);
   grpc_server_handle(server, "/helloworld.Greeter/SayHelloWithError", say_hello_with_error,
-                        nullptr);
+                     nullptr);
   grpc_server_handle(server, "/helloworld.Greeter/SayHelloSlow", say_hello_slow, nullptr);
 
   grpc_health_enable(server);
   grpc_reflection_enable(server);
   grpc_server_add_interceptor(server, &(grpc_interceptor){
-                                             .name = "log",
-                                             .on_call = log_call,
-                                             .on_done = log_done,
-                                         });
+                                          .name = "log",
+                                          .on_call = log_call,
+                                          .on_done = log_done,
+                                      });
 
   grpc_server_run(server);
   return nullptr;

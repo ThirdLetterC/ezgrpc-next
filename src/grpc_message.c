@@ -10,8 +10,7 @@ grpc_message *message_create(u8 cflag, const void *data, size_t len) {
   if (len > UINT32_MAX)
     return nullptr;
   size_t size = sizeof(grpc_message) + len;
-  grpc_message *message = grpc_aligned_alloc(MESSAGE_ALIGN,
-                                                   grpc_align_up(size, MESSAGE_ALIGN));
+  grpc_message *message = grpc_aligned_alloc(MESSAGE_ALIGN, grpc_align_up(size, MESSAGE_ALIGN));
   if (message == nullptr)
     return nullptr;
   message->len = (uint32_t)len;

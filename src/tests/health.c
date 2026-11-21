@@ -27,13 +27,11 @@ void test_health_status_get_set(void) {
 
   grpc_health_set_status(server, "helloworld.Greeter", GRPC_HEALTH_SERVING);
   grpc_health_set_status(server, "order.OrderService", GRPC_HEALTH_NOT_SERVING);
-  TEST_ASSERT_EQUAL_INT(GRPC_HEALTH_SERVING,
-                        grpc_health_get_status(server, "helloworld.Greeter"));
+  TEST_ASSERT_EQUAL_INT(GRPC_HEALTH_SERVING, grpc_health_get_status(server, "helloworld.Greeter"));
   TEST_ASSERT_EQUAL_INT(GRPC_HEALTH_NOT_SERVING,
                         grpc_health_get_status(server, "order.OrderService"));
   grpc_health_set_status(server, "order.OrderService", GRPC_HEALTH_SERVING);
-  TEST_ASSERT_EQUAL_INT(GRPC_HEALTH_SERVING,
-                        grpc_health_get_status(server, "order.OrderService"));
+  TEST_ASSERT_EQUAL_INT(GRPC_HEALTH_SERVING, grpc_health_get_status(server, "order.OrderService"));
 
   grpc_server_free(server);
 }

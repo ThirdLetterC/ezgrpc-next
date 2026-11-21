@@ -53,8 +53,7 @@ static inline int b64_char_val(char c) {
   return -1;
 }
 
-GRPC_API uint8_t *grpc_metadata_decode_bin(const char *base64_str, size_t in_len,
-                                                 size_t *out_len) {
+GRPC_API uint8_t *grpc_metadata_decode_bin(const char *base64_str, size_t in_len, size_t *out_len) {
   if (base64_str == nullptr) {
     return nullptr;
   }

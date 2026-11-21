@@ -34,9 +34,8 @@ static void win_free(void *ptr) {
 #include <mimalloc.h>
 static const char default_allocator_name[] = "mimalloc";
 static const grpc_allocator default_allocator = {mi_malloc, mi_calloc, mi_realloc, mi_free,
-                                                    mi_aligned_alloc};
-static grpc_allocator current = {mi_malloc, mi_calloc, mi_realloc, mi_free,
-                                    mi_aligned_alloc};
+                                                 mi_aligned_alloc};
+static grpc_allocator current = {mi_malloc, mi_calloc, mi_realloc, mi_free, mi_aligned_alloc};
 #elif defined(GRPC_USE_JEMALLOC)
 /* jemalloc replaces the libc functions when linked */
 static const char default_allocator_name[] = "jemalloc";
@@ -46,8 +45,7 @@ static grpc_allocator current = {malloc, calloc, realloc, free, aligned_alloc};
 static const char default_allocator_name[] = "libc";
 static const grpc_allocator default_allocator = {win_malloc, win_calloc, win_realloc, win_free,
                                                  win_aligned_alloc};
-static grpc_allocator current = {win_malloc, win_calloc, win_realloc, win_free,
-                                 win_aligned_alloc};
+static grpc_allocator current = {win_malloc, win_calloc, win_realloc, win_free, win_aligned_alloc};
 #else
 static const char default_allocator_name[] = "libc";
 static const grpc_allocator default_allocator = {malloc, calloc, realloc, free, aligned_alloc};

@@ -37,8 +37,8 @@ static uint64_t read_varint(const uint8_t *buf, size_t len, size_t *seek) {
 }
 
 GRPC_API char *grpc_status_details_encode(int32_t code, const char *message,
-                                                const grpc_status_detail_entry *details,
-                                                size_t nb_details, size_t *out_len) {
+                                          const grpc_status_detail_entry *details,
+                                          size_t nb_details, size_t *out_len) {
   size_t msg_len = message ? strlen(message) : 0;
 
   // Calculate total protobuf byte size
@@ -126,8 +126,8 @@ GRPC_API char *grpc_status_details_encode(int32_t code, const char *message,
 }
 
 GRPC_API grpc_err grpc_status_details_decode(const char *base64_str, int32_t *out_code,
-                                              char **out_message, char **out_type_url,
-                                              uint8_t **out_detail_value, size_t *out_detail_len) {
+                                             char **out_message, char **out_type_url,
+                                             uint8_t **out_detail_value, size_t *out_detail_len) {
   if (base64_str == nullptr) {
     return GRPC_ERR_INVALID;
   }
@@ -235,8 +235,7 @@ GRPC_API void grpc_status_details_free(grpc_status_details *details) {
   *details = (grpc_status_details){};
 }
 
-GRPC_API grpc_err grpc_status_details_decode_all(const char *base64_str,
-                                                 grpc_status_details *out) {
+GRPC_API grpc_err grpc_status_details_decode_all(const char *base64_str, grpc_status_details *out) {
   if (base64_str == nullptr || out == nullptr)
     return GRPC_ERR_INVALID;
   *out = (grpc_status_details){};
@@ -330,8 +329,7 @@ GRPC_API grpc_err grpc_status_details_decode_all(const char *base64_str,
       seek = any_end;
       if (out->nb_details == cap) {
         size_t next_cap = cap ? cap * 2 : 4;
-        grpc_status_detail_entry *arr =
-            grpc_realloc(out->details, next_cap * sizeof(*arr));
+        grpc_status_detail_entry *arr = grpc_realloc(out->details, next_cap * sizeof(*arr));
         if (arr == nullptr) {
           grpc_free(url);
           grpc_free(val);

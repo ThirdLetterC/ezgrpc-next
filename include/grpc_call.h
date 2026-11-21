@@ -50,23 +50,21 @@ GRPC_API const char *grpc_call_peer_cert_subject(const grpc_call *call);
  * NUL-terminated and valid as long as the call, or nullptr if absent.
  * ``len`` may be nullptr.
  */
-GRPC_API const char *grpc_call_metadata(const grpc_call *call, const char *key,
-                                              size_t *len);
+GRPC_API const char *grpc_call_metadata(const grpc_call *call, const char *key, size_t *len);
 
 /**
  * Iterates over all request metadata values matching ``key`` (case-insensitive).
  * Set ``*index = 0`` before the first call. Each call returns the next matching
  * value and advances ``*index``, or returns nullptr when no more values exist.
  */
-GRPC_API const char *grpc_call_metadata_next(const grpc_call *call, const char *key,
-                                             size_t *index, size_t *len);
+GRPC_API const char *grpc_call_metadata_next(const grpc_call *call, const char *key, size_t *index,
+                                             size_t *len);
 
 /** The number of request headers, including pseudo-headers such as ``:path``. */
 GRPC_API size_t grpc_call_metadata_count(const grpc_call *call);
 
 /** Reads the request header at ``index``. Returns false if out of range. */
-GRPC_API bool grpc_call_metadata_at(const grpc_call *call, size_t index,
-                                          grpc_metadata *out);
+GRPC_API bool grpc_call_metadata_at(const grpc_call *call, size_t index, grpc_metadata *out);
 
 /**
  * Milliseconds left until the client's deadline (``grpc-timeout``), 0 once it
@@ -107,8 +105,7 @@ GRPC_API bool grpc_call_trace_context(const grpc_call *call, grpc_trace_context 
 /**
  * Formats a W3C ``traceparent`` header value into ``buf`` (needs at least 56 bytes).
  */
-GRPC_API grpc_err grpc_traceparent_format(const grpc_trace_context *ctx, char *buf,
-                                          size_t buf_len);
+GRPC_API grpc_err grpc_traceparent_format(const grpc_trace_context *ctx, char *buf, size_t buf_len);
 
 /** The server the call belongs to. */
 GRPC_API grpc_server *grpc_call_server(const grpc_call *call);
@@ -119,8 +116,7 @@ GRPC_API grpc_server *grpc_call_server(const grpc_call *call);
  * Attaches application data to the call, e.g. the state of a streaming call.
  * ``free_fn`` (may be nullptr) is called on it when the call is released.
  */
-GRPC_API void grpc_call_set_userdata(grpc_call *call, void *data,
-                                           void (*free_fn)(void *data));
+GRPC_API void grpc_call_set_userdata(grpc_call *call, void *data, void (*free_fn)(void *data));
 
 /** Returns the data set with grpc_call_set_userdata(), or nullptr. */
 GRPC_API void *grpc_call_userdata(const grpc_call *call);
@@ -129,9 +125,8 @@ GRPC_API void *grpc_call_userdata(const grpc_call *call);
  * Calls ``fn`` if the call is cancelled after this point (see
  * grpc_call_is_cancelled()). Useful for calls answered later.
  */
-GRPC_API void grpc_call_on_cancel(grpc_call *call,
-                                        void (*fn)(grpc_call *call, void *userdata),
-                                        void *userdata);
+GRPC_API void grpc_call_on_cancel(grpc_call *call, void (*fn)(grpc_call *call, void *userdata),
+                                  void *userdata);
 
 /**
  * Returns the number of response payload bytes currently queued for transmission
@@ -149,8 +144,8 @@ GRPC_API bool grpc_call_is_writable(const grpc_call *call);
  * Registers a callback invoked when the stream's send queue drains below
  * ``grpc_config.max_send_queue_bytes`` after experiencing backpressure.
  */
-GRPC_API void grpc_call_on_writable(grpc_call *call,
-                                    void (*fn)(grpc_call *call, void *userdata), void *userdata);
+GRPC_API void grpc_call_on_writable(grpc_call *call, void (*fn)(grpc_call *call, void *userdata),
+                                    void *userdata);
 
 /* ---- answering ---------------------------------------------------------- */
 
@@ -160,15 +155,14 @@ GRPC_API void grpc_call_on_writable(grpc_call *call,
  * against the client's ``grpc-accept-encoding`` header; if the client does not
  * advertise ``algorithm``, responses remain uncompressed.
  */
-GRPC_API grpc_err grpc_call_set_compression(grpc_call *call,
-                                            grpc_compression_algorithm algorithm, int level);
+GRPC_API grpc_err grpc_call_set_compression(grpc_call *call, grpc_compression_algorithm algorithm,
+                                            int level);
 
 /**
  * Sends initial metadata (response headers). Only before the first message.
  */
-GRPC_API grpc_err grpc_call_send_metadata(grpc_call *call,
-                                                   const grpc_metadata *metadata,
-                                                   size_t count);
+GRPC_API grpc_err grpc_call_send_metadata(grpc_call *call, const grpc_metadata *metadata,
+                                          size_t count);
 
 /**
  * Sends a response message. Takes ownership of ``message``, also when it
@@ -179,8 +173,7 @@ GRPC_API grpc_err grpc_call_send(grpc_call *call, grpc_message *message);
 /**
  * Sends a copy of ``len`` bytes of ``data`` as a response message.
  */
-GRPC_API grpc_err grpc_call_send_data(grpc_call *call, const void *data,
-                                               size_t len);
+GRPC_API grpc_err grpc_call_send_data(grpc_call *call, const void *data, size_t len);
 
 /**
  * Sends ``message`` and finishes the call with GRPC_STATUS_OK (unary shortcut).
@@ -196,17 +189,15 @@ GRPC_API grpc_err grpc_call_reply_data(grpc_call *call, const void *data, size_t
 /**
  * Adds trailing metadata, sent by grpc_call_finish().
  */
-GRPC_API grpc_err grpc_call_add_trailers(grpc_call *call,
-                                                  const grpc_metadata *metadata,
-                                                  size_t count);
+GRPC_API grpc_err grpc_call_add_trailers(grpc_call *call, const grpc_metadata *metadata,
+                                         size_t count);
 
 /**
  * Ends the call with a status. ``message`` (may be nullptr) is sent as
  * ``grpc-message``; error statuses without one get the status name.
  * Every call must be finished exactly once, unless it is cancelled.
  */
-GRPC_API grpc_err grpc_call_finish(grpc_call *call, grpc_status status,
-                                            const char *message);
+GRPC_API grpc_err grpc_call_finish(grpc_call *call, grpc_status status, const char *message);
 
 /* ---- references and threads --------------------------------------------- */
 
@@ -250,5 +241,4 @@ GRPC_API grpc_err grpc_call_reply_async(grpc_call *call, grpc_message *message);
 /**
  * Thread-safe grpc_call_finish(). The caller must hold a reference.
  */
-GRPC_API grpc_err grpc_call_finish_async(grpc_call *call, grpc_status status,
-                                                  const char *message);
+GRPC_API grpc_err grpc_call_finish_async(grpc_call *call, grpc_status status, const char *message);

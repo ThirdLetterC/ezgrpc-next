@@ -29,7 +29,6 @@ typedef struct grpc_tls_config {
  */
 GRPC_API grpc_err grpc_server_reload_tls(grpc_server *server, const grpc_tls_config *tls);
 
-
 /**
  * TLS is enabled with grpc_config.tls. The library is built with one of
  * OpenSSL, LibreSSL, BoringSSL, AWS-LC, wolfSSL, GnuTLS or rustls

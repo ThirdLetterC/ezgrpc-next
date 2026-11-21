@@ -122,9 +122,8 @@ int grpc_list_is_empty(grpc_list *ezlist) {
   return !ezlist->count;
 }
 
-void *grpc_list_find(grpc_list *ezlist,
-                                    int (*cmp)(const void *data, const void *userdata),
-                                    void *userdata) {
+void *grpc_list_find(grpc_list *ezlist, int (*cmp)(const void *data, const void *userdata),
+                     void *userdata) {
   eznode_t *node = ezlist->front;
   while (node != nullptr && cmp(node->data, userdata)) {
     node = node->next;
@@ -134,9 +133,8 @@ void *grpc_list_find(grpc_list *ezlist,
 }
 
 /* remove */
-void *grpc_list_remove(grpc_list *ezlist,
-                                      int (*cmp)(const void *data, const void *userdata),
-                                      void *userdata) {
+void *grpc_list_remove(grpc_list *ezlist, int (*cmp)(const void *data, const void *userdata),
+                       void *userdata) {
   eznode_t *node = ezlist->front;
   void *data = nullptr;
   while (node != nullptr && cmp(node->data, userdata)) {
@@ -194,9 +192,8 @@ void grpc_list_concat_and_empty_src(grpc_list *dst, grpc_list *src) {
   src->count = 0;
 }
 
-void grpc_list_foreach(grpc_list *ezlist,
-                                      void (*func)(const void *data, const void *userdata),
-                                      void *userdata) {
+void grpc_list_foreach(grpc_list *ezlist, void (*func)(const void *data, const void *userdata),
+                       void *userdata) {
   for (eznode_t *n = ezlist->front; n != nullptr; n = n->next)
     func(n->data, userdata);
 }

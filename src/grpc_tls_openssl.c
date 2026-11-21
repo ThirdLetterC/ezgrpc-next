@@ -287,8 +287,9 @@ int tls_backend_peer_subject(grpc_tls_session *tls, char *buf, size_t len) {
   if (cert == nullptr)
     return -1;
   X509_NAME *subject = X509_get_subject_name(cert);
-  char *res = subject != nullptr ? X509_NAME_oneline(subject, buf, (int)(len > INT_MAX ? INT_MAX : len))
-                                 : nullptr;
+  char *res = subject != nullptr
+                  ? X509_NAME_oneline(subject, buf, (int)(len > INT_MAX ? INT_MAX : len))
+                  : nullptr;
   X509_free(cert);
   return res != nullptr ? 0 : -1;
 }

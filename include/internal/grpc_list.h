@@ -40,18 +40,18 @@ void grpc_list_concat_and_empty_src(grpc_list *dst, grpc_list *src);
  * following the usual ``strcmp()`` convention. Return nullptr if none matches.
  */
 void *grpc_list_find(grpc_list *list, int (*cmp)(const void *data, const void *userdata),
-                        void *userdata);
+                     void *userdata);
 
 /**
  * Remove and return the first value for which ``cmp(value, userdata)`` returns
  * 0. Return nullptr if none matches.
  */
 void *grpc_list_remove(grpc_list *list, int (*cmp)(const void *data, const void *userdata),
-                          void *userdata);
+                       void *userdata);
 
 /** Return nonzero if ``list`` is empty. */
 int grpc_list_is_empty(grpc_list *list);
 
 /** Call ``func`` for each value in ``list`` from front to back. */
 void grpc_list_foreach(grpc_list *list, void (*func)(const void *data, const void *userdata),
-                          void *userdata);
+                       void *userdata);

@@ -160,8 +160,8 @@ grpc_route *server_find_route(grpc_server *server, const char *path, size_t len)
 }
 
 grpc_err server_add_route(grpc_server *server, const char *path, route_kind kind,
-                             grpc_handler_fn handler, const grpc_stream_handler *stream,
-                             void *userdata) {
+                          grpc_handler_fn handler, const grpc_stream_handler *stream,
+                          void *userdata) {
   if (server == nullptr || path == nullptr || path[0] != '/')
     return GRPC_ERR_INVALID;
 
@@ -200,23 +200,21 @@ grpc_err server_add_route(grpc_server *server, const char *path, route_kind kind
   return GRPC_OK;
 }
 
-GRPC_API grpc_err grpc_server_handle(grpc_server *server, const char *path,
-                                              grpc_handler_fn handler, void *userdata) {
+GRPC_API grpc_err grpc_server_handle(grpc_server *server, const char *path, grpc_handler_fn handler,
+                                     void *userdata) {
   if (handler == nullptr)
     return GRPC_ERR_INVALID;
   return server_add_route(server, path, ROUTE_UNARY, handler, nullptr, userdata);
 }
 
 GRPC_API grpc_err grpc_server_handle_stream(grpc_server *server, const char *path,
-                                                     const grpc_stream_handler *handler,
-                                                     void *userdata) {
+                                            const grpc_stream_handler *handler, void *userdata) {
   if (handler == nullptr || (handler->on_message == nullptr && handler->on_start == nullptr))
     return GRPC_ERR_INVALID;
   return server_add_route(server, path, ROUTE_STREAM, nullptr, handler, userdata);
 }
 
-GRPC_API grpc_err grpc_server_register_path(grpc_server *server, const char *path,
-                                                     void *userdata) {
+GRPC_API grpc_err grpc_server_register_path(grpc_server *server, const char *path, void *userdata) {
   return server_add_route(server, path, ROUTE_EVENTS, nullptr, nullptr, userdata);
 }
 
@@ -231,8 +229,8 @@ GRPC_API grpc_err grpc_server_unregister(grpc_server *server, const char *path) 
   return GRPC_OK;
 }
 
-GRPC_API grpc_err grpc_server_set_fallback(grpc_server *server,
-                                           const grpc_stream_handler *handler, void *userdata) {
+GRPC_API grpc_err grpc_server_set_fallback(grpc_server *server, const grpc_stream_handler *handler,
+                                           void *userdata) {
   if (server == nullptr)
     return GRPC_ERR_INVALID;
   if (handler == nullptr) {
@@ -320,8 +318,8 @@ static uv_os_sock_t open_listener(grpc_server *server, int family, const char *a
 #ifdef _WIN32
   static uv_once_t winsock_once = UV_ONCE_INIT;
   uv_once(&winsock_once, grpc_winsock_init);
-  uv_os_sock_t fd = WSASocketW(family, SOCK_STREAM, 0, NULL, 0,
-                              WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
+  uv_os_sock_t fd =
+      WSASocketW(family, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
 #else
   uv_os_sock_t fd = socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
 #endif
@@ -757,8 +755,7 @@ GRPC_API void grpc_server_free(grpc_server *server) {
   grpc_free(server);
 }
 
-GRPC_API grpc_err grpc_server_set_log_level(grpc_server *server,
-                                                     grpc_log_level level) {
+GRPC_API grpc_err grpc_server_set_log_level(grpc_server *server, grpc_log_level level) {
   if (server == nullptr || level < GRPC_LOG_DEFAULT || level > GRPC_LOG_TRACE)
     return GRPC_ERR_INVALID;
   if (level == GRPC_LOG_DEFAULT)
@@ -895,8 +892,7 @@ GRPC_API grpc_err grpc_server_drain(grpc_server *server, int timeout_ms) {
   return server_active_streams(server) == 0 ? GRPC_OK : GRPC_ERR_TIMEOUT;
 }
 
-GRPC_API grpc_err grpc_server_post(grpc_server *server, void (*fn)(void *arg),
-                                            void *arg) {
+GRPC_API grpc_err grpc_server_post(grpc_server *server, void (*fn)(void *arg), void *arg) {
   if (server == nullptr || fn == nullptr)
     return GRPC_ERR_INVALID;
   post_task *task = grpc_malloc(sizeof(*task));

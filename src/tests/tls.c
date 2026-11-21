@@ -6,7 +6,8 @@
 #endif
 #include "grpc.h"
 #include "unity.h"
-#if defined(GRPC_TLS_OPENSSL) || defined(GRPC_TLS_LIBRESSL) || defined(GRPC_TLS_BORINGSSL) || defined(GRPC_TLS_AWSLC)
+#if defined(GRPC_TLS_OPENSSL) || defined(GRPC_TLS_LIBRESSL) || defined(GRPC_TLS_BORINGSSL) || \
+    defined(GRPC_TLS_AWSLC)
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include "internal_tls.h"
@@ -44,14 +45,14 @@ void test_tls_server(void) {
 
   /* Hot-reload with valid PEMs succeeds and swaps the native context; invalid fails safely. */
   void *old_ctx = grpc_server_tls_native(server);
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_server_reload_tls(server, &(grpc_tls_config){
-                                                           .cert_file = "nonexistent.pem",
-                                                           .key_file = "nonexistent.pem"}));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_ERR_INVALID,
+      grpc_server_reload_tls(server, &(grpc_tls_config){.cert_file = "nonexistent.pem",
+                                                        .key_file = "nonexistent.pem"}));
   TEST_ASSERT_EQUAL_PTR(old_ctx, grpc_server_tls_native(server));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_reload_tls(server, &(grpc_tls_config){
-                                                                    .cert_file = "test_cert.pem",
-                                                                    .key_file = "test_key.pem"}));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_reload_tls(server, &(grpc_tls_config){.cert_file = "test_cert.pem",
+                                                                 .key_file = "test_key.pem"}));
   TEST_ASSERT_NOT_NULL(grpc_server_tls_native(server));
   TEST_ASSERT_TRUE(grpc_server_tls_native(server) != old_ctx);
 
@@ -98,15 +99,16 @@ void test_tls_in_memory_pem_and_mtls(void) {
   grpc_server *server = grpc_server_new(&(grpc_config){
       .port = 0,
       .ipv4_addr = "127.0.0.1",
-      .tls = {
-          .cert_pem = cert_pem,
-          .cert_pem_len = cert_len,
-          .key_pem = key_pem,
-          .key_pem_len = key_len,
-          .ca_pem = cert_pem,
-          .ca_pem_len = cert_len,
-          .require_client_cert = true,
-      },
+      .tls =
+          {
+              .cert_pem = cert_pem,
+              .cert_pem_len = cert_len,
+              .key_pem = key_pem,
+              .key_pem_len = key_len,
+              .ca_pem = cert_pem,
+              .ca_pem_len = cert_len,
+              .require_client_cert = true,
+          },
       .log_level = GRPC_LOG_OFF,
   });
   TEST_ASSERT_NOT_NULL(server);
@@ -114,41 +116,41 @@ void test_tls_in_memory_pem_and_mtls(void) {
 
   /* Hot-reload with valid PEMs succeeds and swaps the native context; invalid fails safely. */
   void *old_ctx = grpc_server_tls_native(server);
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_server_reload_tls(server, &(grpc_tls_config){
-                                                           .cert_file = "nonexistent.pem",
-                                                           .key_file = "nonexistent.pem"}));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_ERR_INVALID,
+      grpc_server_reload_tls(server, &(grpc_tls_config){.cert_file = "nonexistent.pem",
+                                                        .key_file = "nonexistent.pem"}));
   TEST_ASSERT_EQUAL_PTR(old_ctx, grpc_server_tls_native(server));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_reload_tls(server, &(grpc_tls_config){
-                                                                    .cert_file = "test_cert.pem",
-                                                                    .key_file = "test_key.pem"}));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_reload_tls(server, &(grpc_tls_config){.cert_file = "test_cert.pem",
+                                                                 .key_file = "test_key.pem"}));
   TEST_ASSERT_NOT_NULL(grpc_server_tls_native(server));
   TEST_ASSERT_TRUE(grpc_server_tls_native(server) != old_ctx);
 
   /* Reload validation edge cases + auto-strlen in-memory PEM reload */
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_reload_tls(nullptr, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_server_reload_tls(server, &(grpc_tls_config){0}));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_server_reload_tls(server, &(grpc_tls_config){
-                                                           .cert_file = "test_cert.pem",
-                                                           .cert_pem = "x"}));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_server_reload_tls(server, &(grpc_tls_config){
-                                                           .cert_file = "test_cert.pem"}));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_reload_tls(server, &(grpc_tls_config){0}));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_ERR_INVALID,
+      grpc_server_reload_tls(server,
+                             &(grpc_tls_config){.cert_file = "test_cert.pem", .cert_pem = "x"}));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_ERR_INVALID,
+      grpc_server_reload_tls(server, &(grpc_tls_config){.cert_file = "test_cert.pem"}));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
                         grpc_server_reload_tls(server, &(grpc_tls_config){.cert_pem = "x"}));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_reload_tls(server, &(grpc_tls_config){
-                                                                    .cert_pem = cert_pem,
-                                                                    .key_pem = key_pem,
-                                                                    .ca_pem = cert_pem}));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_reload_tls(server, &(grpc_tls_config){.cert_pem = cert_pem,
+                                                                          .key_pem = key_pem,
+                                                                          .ca_pem = cert_pem}));
 
   grpc_server_free(server);
   free(cert_pem);
   free(key_pem);
 }
 
-#if defined(GRPC_TLS_OPENSSL) || defined(GRPC_TLS_LIBRESSL) || defined(GRPC_TLS_BORINGSSL) || defined(GRPC_TLS_AWSLC)
+#if defined(GRPC_TLS_OPENSSL) || defined(GRPC_TLS_LIBRESSL) || defined(GRPC_TLS_BORINGSSL) || \
+    defined(GRPC_TLS_AWSLC)
 #include "internal/grpc_threads.h"
 
 static void *run_mtls_server(void *arg) {
@@ -169,16 +171,18 @@ void test_client_server_mtls_end_to_end(void) {
   grpc_server *server = grpc_server_new(&(grpc_config){
       .port = 0,
       .ipv4_addr = "127.0.0.1",
-      .tls = {
-          .cert_file = "test_cert.pem",
-          .key_file = "test_key.pem",
-          .ca_file = "test_cert.pem",
-          .require_client_cert = true,
-      },
+      .tls =
+          {
+              .cert_file = "test_cert.pem",
+              .key_file = "test_key.pem",
+              .ca_file = "test_cert.pem",
+              .require_client_cert = true,
+          },
       .log_level = GRPC_LOG_OFF,
   });
   TEST_ASSERT_NOT_NULL(server);
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/mtls.Svc/Echo", mtls_echo, seen_subject));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(server, "/mtls.Svc/Echo", mtls_echo, seen_subject));
 
   pthread_t th;
   TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_mtls_server, server));
@@ -189,13 +193,14 @@ void test_client_server_mtls_end_to_end(void) {
           .host = "127.0.0.1",
           .port = grpc_server_port(server),
           .timeout_ms = 3000,
-          .tls = {
-              .enable = true,
-              .ca_file = "test_cert.pem",
-              .cert_file = "test_cert.pem",
-              .key_file = "test_key.pem",
-              .server_name = "localhost",
-          },
+          .tls =
+              {
+                  .enable = true,
+                  .ca_file = "test_cert.pem",
+                  .cert_file = "test_cert.pem",
+                  .key_file = "test_key.pem",
+                  .server_name = "localhost",
+              },
       },
       &err);
   TEST_ASSERT_NOT_NULL(client);
@@ -221,19 +226,20 @@ void test_client_server_mtls_end_to_end(void) {
           .host = "127.0.0.1",
           .port = grpc_server_port(server),
           .timeout_ms = 3000,
-          .tls = {
-              .enable = true,
-              .ca_pem = ca_pem,
-              .ca_pem_len = ca_len,
-              .cert_file = "test_cert.pem",
-              .key_file = "test_key.pem",
-              .server_name = "localhost",
-          },
+          .tls =
+              {
+                  .enable = true,
+                  .ca_pem = ca_pem,
+                  .ca_pem_len = ca_len,
+                  .cert_file = "test_cert.pem",
+                  .key_file = "test_key.pem",
+                  .server_name = "localhost",
+              },
       },
       &err);
   TEST_ASSERT_NOT_NULL(c_pem);
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_client_unary(c_pem, "/mtls.Svc/Echo", "pem", 3, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(c_pem, "/mtls.Svc/Echo", "pem", 3, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   grpc_client_response_free(&resp);
   grpc_client_free(c_pem);
@@ -243,12 +249,13 @@ void test_client_server_mtls_end_to_end(void) {
           .host = "127.0.0.1",
           .port = grpc_server_port(server),
           .timeout_ms = 3000,
-          .tls = {
-              .enable = true,
-              .insecure_skip_verify = true,
-              .cert_file = "test_cert.pem",
-              .key_file = "test_key.pem",
-          },
+          .tls =
+              {
+                  .enable = true,
+                  .insecure_skip_verify = true,
+                  .cert_file = "test_cert.pem",
+                  .key_file = "test_key.pem",
+              },
       },
       &err);
   TEST_ASSERT_NOT_NULL(c_insec);
@@ -413,7 +420,8 @@ int main(void) {
   RUN_TEST(test_tls_invalid_files);
   RUN_TEST(test_tls_server);
   RUN_TEST(test_tls_in_memory_pem_and_mtls);
-#if defined(GRPC_TLS_OPENSSL) || defined(GRPC_TLS_LIBRESSL) || defined(GRPC_TLS_BORINGSSL) || defined(GRPC_TLS_AWSLC)
+#if defined(GRPC_TLS_OPENSSL) || defined(GRPC_TLS_LIBRESSL) || defined(GRPC_TLS_BORINGSSL) || \
+    defined(GRPC_TLS_AWSLC)
   RUN_TEST(test_client_server_mtls_end_to_end);
   RUN_TEST(test_tls_error_isolation);
 #endif
