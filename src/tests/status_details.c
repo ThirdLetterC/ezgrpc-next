@@ -102,10 +102,63 @@ void test_status_details_decode_all_multiple(void) {
   grpc_free(b64);
 }
 
+void test_status_details_unknown_fields_and_errors(void) {
+  /* Proto with unknown varint (field 9, wire 0) and length-delimited (field 10, wire 2),
+   * plus an Any (field 3) with unknown varint (field 5, wire 0) and len-delim (field 6, wire 2). */
+  const uint8_t proto[] = {
+      0x08, 0x05,                   /* code = 5 */
+      0x12, 0x02, 'o', 'k',         /* message = "ok" */
+      0x48, 0x7F,                   /* unknown field 9, varint 127 */
+      0x52, 0x02, 'x', 'y',         /* unknown field 10, bytes "xy" */
+      0x1A, 0x0E,                   /* field 3: Any (14 bytes) */
+      0x0A, 0x01, 'u',              /* Any.type_url = "u" */
+      0x12, 0x01, 0x42,             /* Any.value = {0x42} */
+      0x28, 0x01,                   /* Any unknown varint field 5 */
+      0x32, 0x02, 0x00, 0x01,       /* Any unknown bytes field 6 */
+      0x28, 0x02,                   /* another varint */
+  };
+  size_t b64_len = 0;
+  char *b64 = grpc_metadata_encode_bin(proto, sizeof(proto), &b64_len);
+  TEST_ASSERT_NOT_NULL(b64);
+
+  int32_t code = 0;
+  char *msg = nullptr, *url = nullptr;
+  uint8_t *val = nullptr;
+  size_t vlen = 0;
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_status_details_decode(b64, &code, &msg, &url, &val, &vlen));
+  TEST_ASSERT_EQUAL_INT32(5, code);
+  TEST_ASSERT_EQUAL_STRING("ok", msg);
+  grpc_free(msg);
+  grpc_free(url);
+  grpc_free(val);
+
+  grpc_status_details all = {0};
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_status_details_decode_all(b64, &all));
+  TEST_ASSERT_EQUAL_INT32(5, all.code);
+  TEST_ASSERT_EQUAL_UINT64(1, all.nb_details);
+  grpc_status_details_free(&all);
+  grpc_free(b64);
+
+  /* Invalid inputs & truncated length-delimited field */
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
+                        grpc_status_details_decode(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_status_details_decode_all(nullptr, &all));
+  const uint8_t trunc_msg[] = {0x12, 0x50, 'a'};
+  char *b64_trunc = grpc_metadata_encode_bin(trunc_msg, sizeof(trunc_msg), &b64_len);
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_status_details_decode_all(b64_trunc, &all));
+  grpc_free(b64_trunc);
+  const uint8_t trunc_any[] = {0x1A, 0x50, 'a'};
+  b64_trunc = grpc_metadata_encode_bin(trunc_any, sizeof(trunc_any), &b64_len);
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_status_details_decode_all(b64_trunc, &all));
+  grpc_free(b64_trunc);
+  grpc_status_details_free(nullptr);
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_status_details_roundtrip_with_any);
   RUN_TEST(test_status_details_basic_roundtrip);
   RUN_TEST(test_status_details_decode_all_multiple);
+  RUN_TEST(test_status_details_unknown_fields_and_errors);
   return UNITY_END();
 }

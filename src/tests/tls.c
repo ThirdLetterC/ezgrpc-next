@@ -1,6 +1,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <signal.h>
+#endif
 #include "grpc.h"
 #include "unity.h"
 #if defined(GRPC_TLS_OPENSSL) || defined(GRPC_TLS_LIBRESSL) || defined(GRPC_TLS_BORINGSSL) || defined(GRPC_TLS_AWSLC)
@@ -122,8 +125,25 @@ void test_tls_in_memory_pem_and_mtls(void) {
   TEST_ASSERT_NOT_NULL(grpc_server_tls_native(server));
   TEST_ASSERT_TRUE(grpc_server_tls_native(server) != old_ctx);
 
-  grpc_server_free(server);
+  /* Reload validation edge cases + auto-strlen in-memory PEM reload */
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_reload_tls(nullptr, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
+                        grpc_server_reload_tls(server, &(grpc_tls_config){0}));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
+                        grpc_server_reload_tls(server, &(grpc_tls_config){
+                                                           .cert_file = "test_cert.pem",
+                                                           .cert_pem = "x"}));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
+                        grpc_server_reload_tls(server, &(grpc_tls_config){
+                                                           .cert_file = "test_cert.pem"}));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
+                        grpc_server_reload_tls(server, &(grpc_tls_config){.cert_pem = "x"}));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_reload_tls(server, &(grpc_tls_config){
+                                                                    .cert_pem = cert_pem,
+                                                                    .key_pem = key_pem,
+                                                                    .ca_pem = cert_pem}));
 
+  grpc_server_free(server);
   free(cert_pem);
   free(key_pem);
 }
@@ -239,7 +259,7 @@ void test_client_server_mtls_end_to_end(void) {
   grpc_client_free(c_insec);
   free(ca_pem);
 
-  /* Invalid client TLS cert/key config */
+  /* Invalid client TLS cert/key/ca_pem config */
   TEST_ASSERT_NULL(grpc_client_new(
       &(grpc_client_config){
           .host = "127.0.0.1",
@@ -248,6 +268,128 @@ void test_client_server_mtls_end_to_end(void) {
       },
       &err));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
+  TEST_ASSERT_NULL(grpc_client_new(
+      &(grpc_client_config){
+          .host = "127.0.0.1",
+          .port = grpc_server_port(server),
+          .tls = {.enable = true, .cert_file = "test_cert.pem", .key_file = "nonexistent.pem"},
+      },
+      &err));
+  TEST_ASSERT_NULL(grpc_client_new(
+      &(grpc_client_config){
+          .host = "127.0.0.1",
+          .port = grpc_server_port(server),
+          .tls = {.enable = true, .ca_pem = "not-a-pem", .ca_pem_len = 9},
+      },
+      &err));
+
+  /* Client without client cert connecting to require_client_cert=true server -> handshake fail */
+  grpc_client *c_nocert = grpc_client_new(
+      &(grpc_client_config){
+          .host = "127.0.0.1",
+          .port = grpc_server_port(server),
+          .timeout_ms = 1000,
+          .tls = {.enable = true, .insecure_skip_verify = true},
+      },
+      &err);
+  if (c_nocert != nullptr) {
+    /* TLS 1.3 delivers client-cert alert post-handshake on first RPC */
+    (void)grpc_client_unary(c_nocert, "/mtls.Svc/Echo", "x", 1, nullptr, 0, 500, &resp);
+    grpc_client_response_free(&resp);
+    grpc_client_free(c_nocert);
+  }
+
+  /* Invalid in-memory PEMs + multi-cert chain PEM */
+  TEST_ASSERT_NULL(grpc_server_new(&(grpc_config){
+      .port = 0,
+      .ipv4_addr = "127.0.0.1",
+      .tls = {.cert_pem = "not-a-pem", .key_pem = "not-a-key"},
+      .log_level = GRPC_LOG_OFF,
+  }));
+  TEST_ASSERT_NULL(grpc_server_new(&(grpc_config){
+      .port = 0,
+      .ipv4_addr = "127.0.0.1",
+      .tls = {.cert_file = "test_cert.pem", .key_file = "test_key.pem", .ca_pem = "not-a-ca"},
+      .log_level = GRPC_LOG_OFF,
+  }));
+
+  size_t clen = 0, klen = 0;
+  char *c_buf = slurp_file("test_cert.pem", &clen);
+  char *k_buf = slurp_file("test_key.pem", &klen);
+  if (c_buf != nullptr && k_buf != nullptr) {
+    /* Reload TLS validation & null-terminated PEM length auto-detection */
+    TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_reload_tls(nullptr, nullptr));
+    TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
+                          grpc_server_reload_tls(server, &(grpc_tls_config){0}));
+    TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
+                          grpc_server_reload_tls(server, &(grpc_tls_config){.cert_file = "a.pem"}));
+    TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
+                          grpc_server_reload_tls(server, &(grpc_tls_config){.cert_pem = "a"}));
+    TEST_ASSERT_EQUAL_INT(
+        GRPC_OK, grpc_server_reload_tls(
+                     server, &(grpc_tls_config){.cert_pem = c_buf, .key_pem = k_buf, .ca_pem = c_buf}));
+    /* Valid cert_pem with invalid key_pem -> fails key loading */
+    TEST_ASSERT_NULL(grpc_server_new(&(grpc_config){
+        .port = 0,
+        .ipv4_addr = "127.0.0.1",
+        .tls = {.cert_pem = c_buf, .cert_pem_len = clen, .key_pem = "not-a-key", .key_pem_len = 9},
+        .log_level = GRPC_LOG_OFF,
+    }));
+    char *chain = malloc(clen * 2 + 1);
+    memcpy(chain, c_buf, clen);
+    memcpy(chain + clen, c_buf, clen);
+    chain[clen * 2] = '\0';
+    grpc_server *chain_srv = grpc_server_new(&(grpc_config){
+        .port = 0,
+        .ipv4_addr = "127.0.0.1",
+        .tls = {.cert_pem = chain, .cert_pem_len = clen * 2, .key_pem = k_buf, .key_pem_len = klen},
+        .log_level = GRPC_LOG_OFF,
+    });
+    TEST_ASSERT_NOT_NULL(chain_srv);
+    grpc_server_free(chain_srv);
+    free(chain);
+  }
+  free(c_buf);
+  free(k_buf);
+
+#ifndef _WIN32
+  /* Raw OpenSSL client with wrong ALPN ("http/1.1") + clean SSL_shutdown -> NOACK & ZERO_RETURN */
+  {
+    const uint8_t alpn_list[2][10] = {
+        {8, 'h', 't', 't', 'p', '/', '1', '.', '1', 0},
+        {2, 'h', '2', 0, 0, 0, 0, 0, 0, 0},
+    };
+    const unsigned int alpn_lens[2] = {9, 3};
+    for (int k = 0; k < 2; k++) {
+      int fd = socket(AF_INET, SOCK_STREAM, 0);
+      if (fd >= 0) {
+        struct sockaddr_in sin = {0};
+        sin.sin_family = AF_INET;
+        sin.sin_port = htons(grpc_server_port(server));
+        inet_pton(AF_INET, "127.0.0.1", &sin.sin_addr);
+        if (connect(fd, (struct sockaddr *)&sin, sizeof(sin)) == 0) {
+          SSL_CTX *cctx = SSL_CTX_new(TLS_client_method());
+          if (cctx != nullptr) {
+            SSL_CTX_set_verify(cctx, SSL_VERIFY_NONE, nullptr);
+            SSL_CTX_use_certificate_chain_file(cctx, "test_cert.pem");
+            SSL_CTX_use_PrivateKey_file(cctx, "test_key.pem", SSL_FILETYPE_PEM);
+            SSL_CTX_set_alpn_protos(cctx, alpn_list[k], alpn_lens[k]);
+            SSL *ssl = SSL_new(cctx);
+            if (ssl != nullptr) {
+              SSL_set_fd(ssl, fd);
+              if (SSL_connect(ssl) == 1) {
+                SSL_shutdown(ssl);
+              }
+              SSL_free(ssl);
+            }
+            SSL_CTX_free(cctx);
+          }
+        }
+        close(fd);
+      }
+    }
+  }
+#endif
 
   grpc_server_stop(server);
   pthread_join(th, nullptr);
@@ -272,6 +414,9 @@ void test_tls_error_isolation(void) {
 #endif
 
 int main(void) {
+#ifndef _WIN32
+  signal(SIGPIPE, SIG_IGN);
+#endif
   UNITY_BEGIN();
   RUN_TEST(test_tls_backend);
   RUN_TEST(test_tls_invalid_files);

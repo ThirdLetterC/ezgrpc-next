@@ -898,15 +898,17 @@ fail:
 GRPC_API void grpc_client_free(grpc_client *c) {
   if (c == nullptr)
     return;
-  for (size_t i = 0; i < c->nb_subs; i++) {
-    sub_disconnect(&c->subs[i]);
-    buf_free(&c->subs[i].obuf);
-    buf_free(&c->subs[i].wbuf);
-    buf_free(&c->subs[i].tls_obuf);
-    grpc_free(c->subs[i].host);
-    grpc_free(c->subs[i].unix_path);
+  if (c->subs != nullptr) {
+    for (size_t i = 0; i < c->nb_subs; i++) {
+      sub_disconnect(&c->subs[i]);
+      buf_free(&c->subs[i].obuf);
+      buf_free(&c->subs[i].wbuf);
+      buf_free(&c->subs[i].tls_obuf);
+      grpc_free(c->subs[i].host);
+      grpc_free(c->subs[i].unix_path);
+    }
+    grpc_free(c->subs);
   }
-  grpc_free(c->subs);
 #if defined(GRPC_CLIENT_HAS_OPENSSL)
   if (c->ssl_ctx != nullptr)
     SSL_CTX_free(c->ssl_ctx);

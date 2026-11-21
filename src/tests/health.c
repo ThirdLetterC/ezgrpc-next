@@ -57,6 +57,9 @@ void test_health_enable_twice(void) {
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_health_enable(server));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_EXISTS, grpc_health_enable(server));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_health_enable(nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
+                        grpc_health_set_status(nullptr, "svc", GRPC_HEALTH_SERVING));
+  TEST_ASSERT_EQUAL_INT(GRPC_HEALTH_UNKNOWN, grpc_health_get_status(nullptr, "svc"));
   grpc_server_free(server);
 }
 

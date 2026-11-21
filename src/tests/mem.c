@@ -88,7 +88,10 @@ void test_custom_allocator_switch(void) {
 
   grpc_allocator mock_alloc = {
       .malloc = mock_malloc,
+      .calloc = calloc,
+      .realloc = realloc,
       .free = mock_free,
+      .aligned_alloc = aligned_alloc,
   };
 
   grpc_set_allocator(&mock_alloc);

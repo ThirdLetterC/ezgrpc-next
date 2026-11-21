@@ -246,6 +246,26 @@ void test_strings(void) {
   }
   ezdump(sample, sizeof(sample));
   ezdump(sample, 0);
+
+  grpc_header ha = {.name = (char *)"content-type", .namelen = 12};
+  grpc_header hb = {.name = (char *)"CONTENT-TYPE", .namelen = 12};
+  grpc_header hc = {.name = (char *)"x", .namelen = 1};
+  TEST_ASSERT_EQUAL_INT(0, list_cmp_ezheader_name(&ha, &hb));
+  TEST_ASSERT_NOT_EQUAL(0, list_cmp_ezheader_name(&ha, &hc));
+
+  /* Bind failure on non-local address + GRPC_LOG_TRACE + channelz error paths */
+  grpc_err err = GRPC_OK;
+  TEST_ASSERT_NULL(grpc_server_new_ex(
+      &(grpc_config){.port = 19991, .ipv4_addr = "192.0.2.1", .log_level = GRPC_LOG_OFF}, &err));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_IO, err);
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_channelz_enable(nullptr));
+  grpc_server *cz = grpc_server_new(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_TRACE});
+  TEST_ASSERT_NOT_NULL(cz);
+  server_log(cz, GRPC_LOG_TRACE, "trace log line\n");
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_channelz_enable(cz));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_EXISTS, grpc_channelz_enable(cz));
+  grpc_server_free(cz);
 }
 
 void test_messages(void) {

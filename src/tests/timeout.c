@@ -37,6 +37,11 @@ void test_timeout_parsing(void) {
   TEST_ASSERT_EQUAL_INT64(-1, grpc_timeout_parse_ms("0S"));
   TEST_ASSERT_EQUAL_INT64(-1, grpc_timeout_parse_ms("-5S"));
   TEST_ASSERT_EQUAL_INT64(-1, grpc_timeout_parse_ms("10Sextra"));
+  TEST_ASSERT_EQUAL_INT64(-1, grpc_timeout_parse_ms("9999999999999999H"));
+  TEST_ASSERT_EQUAL_INT64(-1, grpc_timeout_parse_ms("9999999999999999M"));
+  TEST_ASSERT_EQUAL_INT64(-1, grpc_timeout_parse_ms("99999999999999999S"));
+  TEST_ASSERT_EQUAL_INT64(-1, grpc_timeout_parse_ms("0u"));
+  TEST_ASSERT_EQUAL_INT64(-1, grpc_timeout_parse_ms("0n"));
 }
 
 void test_time_now_ms(void) {

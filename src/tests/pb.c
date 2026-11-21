@@ -2,7 +2,10 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
-#include "grpc_protobuf_c.h"
+#ifndef _WIN32
+#include <pthread.h>
+#endif
+#include "grpc.h"
 #include "test_msg.pb-c.h"
 #include "unity.h"
 
@@ -57,11 +60,109 @@ void test_pb_null_safety(void) {
   grpc_pb_free_unpacked(nullptr);
 }
 
+#ifndef _WIN32
+static void *pb_server_run(void *arg) {
+  (void)grpc_server_run((grpc_server *)arg);
+  return nullptr;
+}
+
+static void pb_echo_handler(grpc_call *call, const grpc_message *req_msg,
+                            [[maybe_unused]] void *userdata) {
+  Test__Echo *req = GRPC_PB_UNPACK(Test__Echo, &test__echo__descriptor, req_msg);
+  TEST_ASSERT_NOT_NULL(req);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_call_reply_pb(call, &req->base));
+  GRPC_PB_FREE_UNPACKED(req);
+}
+
+void test_pb_live_call(void) {
+  grpc_server *server = grpc_server_new(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
+  TEST_ASSERT_NOT_NULL(server);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/test.Pb/Echo", pb_echo_handler, nullptr));
+  pthread_t th;
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, pb_server_run, server));
+
+  grpc_err err = GRPC_OK;
+  grpc_client *client = grpc_client_new(
+      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(server), .timeout_ms = 2000},
+      &err);
+  TEST_ASSERT_NOT_NULL(client);
+
+  Test__Echo req = TEST__ECHO__INIT;
+  req.text = (char *)"pb-live";
+  req.number = 7;
+  grpc_message *packed = grpc_pb_pack(&req.base);
+  TEST_ASSERT_NOT_NULL(packed);
+
+  grpc_client_response resp = {0};
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_client_unary(client, "/test.Pb/Echo", packed->data, packed->len, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  TEST_ASSERT_NOT_NULL(resp.message);
+  Test__Echo *reply = GRPC_PB_UNPACK(Test__Echo, &test__echo__descriptor, resp.message);
+  TEST_ASSERT_NOT_NULL(reply);
+  TEST_ASSERT_EQUAL_STRING("pb-live", reply->text);
+  TEST_ASSERT_EQUAL_INT32(7, reply->number);
+
+  GRPC_PB_FREE_UNPACKED(reply);
+  grpc_client_response_free(&resp);
+  grpc_message_free(packed);
+  grpc_client_free(client);
+  grpc_server_stop(server);
+  pthread_join(th, nullptr);
+  grpc_server_free(server);
+}
+#endif
+
+static void *pb_fail_malloc([[maybe_unused]] size_t sz) {
+  return nullptr;
+}
+
+static void *pb_fail_calloc([[maybe_unused]] size_t n, [[maybe_unused]] size_t sz) {
+  return nullptr;
+}
+
+static void *pb_fail_realloc([[maybe_unused]] void *p, [[maybe_unused]] size_t sz) {
+  return nullptr;
+}
+
+static void pb_noop_free(void *p) {
+  free(p);
+}
+
+static void *pb_fail_aligned([[maybe_unused]] size_t a, [[maybe_unused]] size_t sz) {
+  return nullptr;
+}
+
+void test_pb_oom_and_errors(void) {
+  Test__Echo req = TEST__ECHO__INIT;
+  req.text = (char *)"oom";
+  req.number = 1;
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_reply_pb(nullptr, &req.base));
+
+  grpc_allocator fail_alloc = {
+      .malloc = pb_fail_malloc,
+      .calloc = pb_fail_calloc,
+      .realloc = pb_fail_realloc,
+      .free = pb_noop_free,
+      .aligned_alloc = pb_fail_aligned,
+  };
+  grpc_set_allocator(&fail_alloc);
+  TEST_ASSERT_NULL(grpc_pb_pack(&req.base));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_NOMEM, grpc_call_send_pb((grpc_call *)&req, &req.base));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_NOMEM, grpc_call_reply_pb((grpc_call *)&req, &req.base));
+  grpc_set_allocator(nullptr);
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_pb_allocator);
   RUN_TEST(test_pb_pack_and_unpack);
   RUN_TEST(test_pb_send_null_safety);
   RUN_TEST(test_pb_null_safety);
+  RUN_TEST(test_pb_oom_and_errors);
+#ifndef _WIN32
+  RUN_TEST(test_pb_live_call);
+#endif
   return UNITY_END();
 }
