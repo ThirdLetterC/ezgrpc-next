@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(grpc VERSION 1.0.0 LANGUAGES C)
+project(ezGRPC-next VERSION 1.0.0 LANGUAGES C)
 
 if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
   set(GRPC_IS_TOP_LEVEL ON)
@@ -479,6 +479,6 @@ if(GRPC_BUILD_DEVELOPER_TARGETS)
   endif()
 endif()
 
-message(STATUS "grpc TLS backend: ${_tls_backend}")
-message(STATUS "grpc IPO: ${GRPC_IPO}")
-message(STATUS "grpc optional features: zlib=${GRPC_ZLIB_ENABLED}, zstd=${GRPC_ZSTD_ENABLED}, snappy=${GRPC_SNAPPY_ENABLED}, protobuf-c=${GRPC_PROTOBUF_C_ENABLED}, flatcc=${GRPC_FLATCC_ENABLED}")
+message(STATUS "ezGRPC-next TLS backend: ${_tls_backend}")
+message(STATUS "ezGRPC-next IPO: ${GRPC_IPO}")
+message(STATUS "ezGRPC-next optional features: zlib=${GRPC_ZLIB_ENABLED}, zstd=${GRPC_ZSTD_ENABLED}, snappy=${GRPC_SNAPPY_ENABLED}, protobuf-c=${GRPC_PROTOBUF_C_ENABLED}, flatcc=${GRPC_FLATCC_ENABLED}")

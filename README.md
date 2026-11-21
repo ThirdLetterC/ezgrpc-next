@@ -1,8 +1,8 @@
-# gRPC
+# ezGRPC-next
 
-[![CI](https://github.com/ThirdLetterC/grpc/actions/workflows/ci.yml/badge.svg)](https://github.com/ThirdLetterC/grpc/actions/workflows/ci.yml)
+[![CI](https://github.com/ThirdLetterC/ezgrpc-next/actions/workflows/ci.yml/badge.svg)](https://github.com/ThirdLetterC/ezgrpc-next/actions/workflows/ci.yml)
 
-**gRPC** is a lightweight, high-performance gRPC server library in C23 for Linux and Windows. It is built on [libuv](https://libuv.org/) and [nghttp2](https://nghttp2.org/), and exposes a simple poll-and-handle API: no hidden threads, no code generator, no callback soup. You decide how requests are scheduled, how memory is allocated, and how many cores to use.
+**ezGRPC-next** is a lightweight, high-performance gRPC server library in C23 for Linux and Windows. It is built on [libuv](https://libuv.org/) and [nghttp2](https://nghttp2.org/), and exposes a simple poll-and-handle API: no hidden threads, no code generator, no callback soup. You decide how requests are scheduled, how memory is allocated, and how many cores to use.
 
 ---
 
@@ -171,7 +171,7 @@ IPO applies to Release, RelWithDebInfo and MinSizeRel. MSVC requires the
 static-only setting because CMake's automatic DLL export scanner cannot read
 `/GL` objects. GCC and Clang can also use IPO with the shared library enabled.
 
-The project can be included with `add_subdirectory(path/to/grpc)` and linked
+The project can be included with `add_subdirectory(path/to/ezgrpc-next)` and linked
 through `grpc::grpc`. In that case, tests, examples and formatting targets
 default to OFF, and the parent project's build type and directory compiler
 options are preserved. Compiler requirements are attached to grpc targets.
@@ -292,7 +292,7 @@ cmake --build build-awslc --parallel
 
 The build fails if the headers it finds don't belong to the selected library, and the TLS unit test checks that the library linked in is the one requested. At runtime, `grpc_tls_backend()` and `grpc_tls_backend_version()` report the library in use.
 
-All backends behave the same way: they load a PEM certificate chain and private key, check that the key matches the certificate, allow TLS 1.2 and 1.3 only, and select `h2` with ALPN. A client that offers no ALPN still connects. For settings grpc doesn't expose, `grpc_tls_ctx_native()` returns the library's own context (`SSL_CTX *`, `WOLFSSL_CTX *`, `gnutls_certificate_credentials_t` or `const struct rustls_server_config *`).
+All backends behave the same way: they load a PEM certificate chain and private key, check that the key matches the certificate, allow TLS 1.2 and 1.3 only, and select `h2` with ALPN. A client that offers no ALPN still connects. For settings ezGRPC-next doesn't expose, `grpc_tls_ctx_native()` returns the library's own context (`SSL_CTX *`, `WOLFSSL_CTX *`, `gnutls_certificate_credentials_t` or `const struct rustls_server_config *`).
 
 ---
 
@@ -315,7 +315,7 @@ static void handle_message(grpc_server *server, grpc_event *event) {
   if (!event->message.end_stream)
     return;
 
-  const char reply[] = "Hello from grpc!";
+  const char reply[] = "Hello from ezGRPC-next!";
   grpc_messages *response = grpc_messages_new(nullptr);
   grpc_messages_push(response, grpc_message_new(0, (void *)reply, strlen(reply)));
 
@@ -323,7 +323,7 @@ static void handle_message(grpc_server *server, grpc_event *event) {
   grpc_server_session_stream_send(server, event->session_uuid, event->message.stream_id,
                                      response);
   grpc_server_session_stream_end(server, event->session_uuid, event->message.stream_id,
-                                    GRPC_GRPC_STATUS_OK);
+                                    GRPC_STATUS_OK);
   grpc_messages_free(response);
 }
 
@@ -367,7 +367,7 @@ int main(void) {
         } else if (event->type == GRPC_EVENT_DATALOSS) {
           grpc_server_session_stream_end(server, event->session_uuid,
                                             event->dataloss.stream_id,
-                                            GRPC_GRPC_STATUS_DATA_LOSS);
+                                            GRPC_STATUS_DATA_LOSS);
         }
 
         /* the application owns the received messages */
@@ -405,7 +405,7 @@ grpc_messages *res_msgs = grpc_pb_create_response((ProtobufCMessage *)&reply);
 
 grpc_server_session_stream_send(server, event->session_uuid, event->message.stream_id, res_msgs);
 grpc_server_session_stream_end(server, event->session_uuid, event->message.stream_id,
-                                  GRPC_GRPC_STATUS_OK);
+                                  GRPC_STATUS_OK);
 
 grpc_messages_free(res_msgs);
 GRPC_PB_FREE_UNPACKED(req);
@@ -427,7 +427,7 @@ grpc_fb_builder_init(&builder); /* once; uses the grpc allocator */
 greeter_HelloRequest_table_t req = GRPC_FB_UNPACK(greeter_HelloRequest, req_msg);
 if (req == nullptr) {
   grpc_server_session_stream_end2(server, event->session_uuid, event->message.stream_id,
-                                     GRPC_GRPC_STATUS_INVALID_ARGUMENT, nullptr, nullptr, 0);
+                                     GRPC_STATUS_INVALID_ARGUMENT, nullptr, nullptr, 0);
   return;
 }
 
@@ -441,7 +441,7 @@ greeter_HelloReply_end_as_root(&builder);
 grpc_messages *res_msgs = grpc_fb_create_response(&builder);
 grpc_server_session_stream_send(server, event->session_uuid, event->message.stream_id, res_msgs);
 grpc_server_session_stream_end(server, event->session_uuid, event->message.stream_id,
-                                  GRPC_GRPC_STATUS_OK);
+                                  GRPC_STATUS_OK);
 grpc_messages_free(res_msgs);
 ```
 
@@ -460,7 +460,7 @@ grpc_metadata_entry trailers[] = {
     {.key = "x-custom-reply", .value = "pong", .key_len = 14, .value_len = 4},
 };
 grpc_server_session_stream_end2(server, event->session_uuid, event->message.stream_id,
-                                   GRPC_GRPC_STATUS_OK, nullptr, trailers, 1);
+                                   GRPC_STATUS_OK, nullptr, trailers, 1);
 ```
 
 Return an error with `google.rpc.Status` details, serialized into `grpc-status-details-bin`:
@@ -474,7 +474,7 @@ grpc_status_detail_entry detail = {
 
 grpc_server_session_stream_end_with_status_details(
     server, event->session_uuid, event->message.stream_id,
-    GRPC_GRPC_STATUS_INVALID_ARGUMENT, "Invalid name provided",
+    GRPC_STATUS_INVALID_ARGUMENT, "Invalid name provided",
     &detail, 1,     /* details */
     nullptr, 0);    /* extra trailers */
 ```

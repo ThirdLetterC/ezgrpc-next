@@ -112,7 +112,7 @@ jobs:
           python3 -m pip install --upgrade pip
           python3 -m pip install grpcio grpcio-tools protobuf
 
-      - name: Build grpc and examples
+      - name: Build ezGRPC-next and examples
         run: |
           cmake -S . -B build \
             -DCMAKE_C_COMPILER=${{ matrix.compiler }} \

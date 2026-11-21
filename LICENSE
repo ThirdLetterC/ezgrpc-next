@@ -1,7 +1,7 @@
-grpc - A lightweight, modular gRPC server in C.
-https://github.com/ThirdLetterC/ezgrpc2
+ezGRPC-next - A lightweight, modular gRPC server in C.
+https://github.com/ThirdLetterC/ezgrpc-next
 
-Copyright (c) 2023-2026 The gRPC Authors
+Copyright (c) 2023-2026 The ezGRPC-next Authors
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions

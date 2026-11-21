@@ -1,7 +1,7 @@
-# Python gRPC Client & C grpc Server Example
+# Python gRPC Client & C ezGRPC-next Server Example
 
 This example demonstrates an end-to-end gRPC service where:
-- The **Server** is written in **C** using `grpc` and `protobuf-c`.
+- The **Server** is written in **C** using `ezGRPC-next` and `protobuf-c`.
 - The **Client** is written in **Python** using standard `grpcio`.
 
 ## Service Definition

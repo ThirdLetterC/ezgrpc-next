@@ -635,7 +635,7 @@ GRPC_API void grpc_server_flush(grpc_server *server) {
 
 GRPC_API const char *grpc_license(void) {
   static const char *license =
-      "grpc - A grpc server without the extra fancy features.\n"
+      "ezGRPC-next - A gRPC server without the extra fancy features.\n"
       "https://github.com/mnyoshie/ezgrpc2\n"
       "\n"
       "Copyright (c) 2023-2025 M. N. Yoshie & Al-buharie Amjari\n"

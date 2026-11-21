@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Comprehensive Python gRPC Client for grpc Greeter Service.
+Comprehensive Python gRPC Client for ezGRPC-next Greeter Service.
 Tests:
   1. Unary RPC (SayHello) with custom binary metadata ('x-custom-bin') and trailing metadata verification.
   2. Unary RPC (SayHelloAgain).

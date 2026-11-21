@@ -1,4 +1,4 @@
-/* gRPC is a gRPC server library in C. */
+/* ezGRPC-next is a gRPC server library in C. */
 #pragma once
 
 #include "grpc_defs.h"
