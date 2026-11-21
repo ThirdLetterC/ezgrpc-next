@@ -60,18 +60,18 @@ static void logger_initialize(void) {
 static ulog_level ulog_level_for(grpc_log_level level) {
   switch (level) {
   case GRPC_LOG_TRACE:
-    return ULOG_LEVEL_TRACE;
+    return (ulog_level)ULOG_LEVEL_TRACE;
   case GRPC_LOG_DEBUG:
-    return ULOG_LEVEL_DEBUG;
+    return (ulog_level)ULOG_LEVEL_DEBUG;
   case GRPC_LOG_INFO:
-    return ULOG_LEVEL_INFO;
+    return (ulog_level)ULOG_LEVEL_INFO;
   case GRPC_LOG_WARNING:
-    return ULOG_LEVEL_WARN;
+    return (ulog_level)ULOG_LEVEL_WARN;
   case GRPC_LOG_ERROR:
   case GRPC_LOG_OFF:
   case GRPC_LOG_DEFAULT:
   default:
-    return ULOG_LEVEL_ERROR;
+    return (ulog_level)ULOG_LEVEL_ERROR;
   }
 }
 
