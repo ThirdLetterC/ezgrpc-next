@@ -417,7 +417,7 @@ GRPC_API grpc_server *grpc_server_new_ex(const grpc_config *config, grpc_err *ou
   /* the copies outlive the caller's strings */
   cfg->ipv4_addr = server->ipv4_addr;
   cfg->ipv6_addr = server->ipv6_addr;
-  cfg->tls = (typeof(cfg->tls)){};
+  memset(&cfg->tls, 0, sizeof(cfg->tls));
 
   bool has_tls_files = config->tls.cert_file != nullptr || config->tls.key_file != nullptr;
   bool has_tls_pems = config->tls.cert_pem != nullptr || config->tls.key_pem != nullptr;
