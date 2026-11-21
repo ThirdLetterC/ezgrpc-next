@@ -17,6 +17,7 @@
 #include "grpc_message.h"
 #include "grpc_metadata.h"
 #include "grpc_status.h"
+#include "grpc_http3.h"
 
 /** A client channel created with grpc_client_new(). Opaque. */
 typedef struct grpc_client grpc_client;
@@ -52,6 +53,10 @@ typedef struct grpc_client_config {
   uint32_t max_retries;
   /** Initial retry backoff in milliseconds (doubles each attempt; default 50 ms). */
   uint32_t retry_backoff_ms;
+  /** Wire protocol (default GRPC_TRANSPORT_HTTP2). GRPC_TRANSPORT_HTTP3 requires ``tls.enable``
+   * and a build with HTTP/3 (else GRPC_ERR_UNSUPPORTED), and rejects Unix-socket targets
+   * (GRPC_ERR_INVALID). See grpc_http3.h. */
+  grpc_transport transport;
   /**
    * Client-side TLS & mTLS configuration. Only available when the library is
    * built with an OpenSSL-compatible TLS backend; otherwise enabling it makes

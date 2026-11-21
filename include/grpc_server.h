@@ -18,6 +18,7 @@
 #include "grpc_error.h"
 #include "grpc_event.h"
 #include "grpc_tls.h"
+#include "grpc_http3.h"
 
 /** A gRPC server. Opaque; created with grpc_server_new(). */
 typedef struct grpc_server grpc_server;
@@ -96,6 +97,8 @@ typedef struct grpc_config {
   /** TLS settings: provide either cert_file+key_file or cert_pem+key_pem.
    * Optionally configure ca_file/ca_pem and require_client_cert for mTLS. */
   grpc_tls_config tls;
+  /** HTTP/3 (QUIC) listener settings; see grpc_http3.h. Off when zeroed. */
+  grpc_http3_config http3;
   /** Initial log threshold. Defaults to GRPC_LOG_INFO. */
   grpc_log_level log_level;
   /** Log output stream. Defaults to stderr. */
@@ -171,6 +174,11 @@ GRPC_API GRPC_NODISCARD grpc_server *grpc_server_new_ex(const grpc_config *confi
  * Useful when configured with ``config.port = 0`` (ephemeral port).
  */
 GRPC_API uint16_t grpc_server_port(const grpc_server *server);
+
+/**
+ * Returns the bound HTTP/3 (UDP) port, or 0 if ``server`` is nullptr or HTTP/3 is not enabled.
+ */
+GRPC_API uint16_t grpc_server_http3_port(const grpc_server *server);
 
 /**
  * Closes every connection and frees the server. Release the references taken

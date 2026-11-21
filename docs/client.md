@@ -51,6 +51,10 @@ int main(void) {
 }
 ```
 
+### HTTP/3
+
+Set `.transport = GRPC_TRANSPORT_HTTP3` (with `tls.enable`) to call over QUIC instead of TCP; see [HTTP/3](http3.md).
+
 ## Server-Streaming Calls
 
 ```c

@@ -28,92 +28,8 @@
 #include "grpc_client.h"
 #include "grpc_compression.h"
 #include "internal_helpers.h"
-
-#if defined(GRPC_TLS_OPENSSL) || defined(GRPC_TLS_LIBRESSL) || defined(GRPC_TLS_BORINGSSL) || \
-    defined(GRPC_TLS_AWSLC)
-#define GRPC_CLIENT_HAS_OPENSSL 1
-#include <openssl/err.h>
-#include <openssl/pem.h>
-#include <openssl/ssl.h>
-#include <openssl/x509.h>
-#endif
-
-typedef struct client_subchannel client_subchannel;
-
-/* One RPC on a subchannel. send_buf holds framed request bytes not yet taken by nghttp2,
- * recv_buf holds response bytes not yet forming a complete message, and resp accumulates
- * headers, trailers and status until grpc_client_stream_finish hands it to the caller. */
-struct grpc_client_stream {
-  client_subchannel *sub;
-  int32_t stream_id;
-  bool send_closed;
-  bool stream_done;
-  bool headers_received;
-  bool timed_out;
-  grpc_err err;
-  grpc_compression_algorithm resp_encoding;
-  grpc_buf send_buf;
-  size_t send_off;
-  grpc_buf recv_buf;
-  grpc_list recv_queue; /* queued grpc_message* from server */
-  grpc_client_response resp;
-  void (*on_message)(const grpc_message *msg, void *userdata);
-  void *on_message_userdata;
-};
-
-/* One connection to one target, with its own loop; obuf collects bytes to write, wbuf is the
- * buffer owned by an in-flight uv_write, and tls_obuf stages nghttp2 output before encryption. */
-struct client_subchannel {
-  grpc_client *parent;
-  char *host;
-  uint16_t port;
-  char *unix_path;
-  char authority[280];
-
-  uv_loop_t loop;
-  bool loop_initialized;
-  union {
-    uv_tcp_t tcp;
-    uv_pipe_t pipe;
-  } handle;
-  bool is_unix;
-  bool handle_initialized;
-  bool connected;
-  bool closed;
-  int connect_status;
-  /* set by the connect/handshake deadline timer (config.timeout_ms) */
-  bool connect_deadline_hit;
-  bool handle_close_done;
-
-  uv_timer_t timer;
-  bool timer_initialized;
-
-  nghttp2_session *ngsession;
-  u8 rbuf[64 * 1024];
-  grpc_buf obuf;
-  grpc_buf wbuf;
-  grpc_buf tls_obuf;
-  uv_write_t write_req;
-  bool is_writing;
-
-#if defined(GRPC_CLIENT_HAS_OPENSSL)
-  SSL *ssl;
-  bool tls_handshake_done;
-#endif
-
-  grpc_client_stream *active_stream;
-};
-
-/* The channel: a copy of the config plus the subchannel pool and its round-robin cursor. */
-struct grpc_client {
-  grpc_client_config config;
-  client_subchannel *subs;
-  size_t nb_subs;
-  size_t rr_next;
-#if defined(GRPC_CLIENT_HAS_OPENSSL)
-  SSL_CTX *ssl_ctx;
-#endif
-};
+#include "internal_client.h"
+#include "internal_http3.h"
 
 /* Returns the subchannel handle as a uv_stream_t, whichever of TCP or pipe it is. */
 static inline uv_stream_t *sub_stream(client_subchannel *s) {
@@ -243,6 +159,10 @@ static void on_sub_write(uv_write_t *req, int status) {
  * mark the active stream done with an error and, for I/O errors, the subchannel closed. Before
  * the TLS handshake completes, only handshake bytes are sent. */
 static void sub_flush(client_subchannel *s) {
+  if (s->h3c != nullptr) {
+    h3c_flush(s);
+    return;
+  }
   if (s->closed || s->is_writing)
     return;
 
@@ -382,7 +302,13 @@ static int client_on_header([[maybe_unused]] nghttp2_session *session, const ngh
   grpc_client_stream *st = s->active_stream;
   if (st == nullptr || frame->hd.type != NGHTTP2_HEADERS || frame->hd.stream_id != st->stream_id)
     return 0;
+  client_resp_header(st, name, namelen, value, valuelen,
+                     st->headers_received || (frame->hd.flags & NGHTTP2_FLAG_END_STREAM));
+  return 0;
+}
 
+void client_resp_header(grpc_client_stream *st, const uint8_t *name, size_t namelen,
+                        const uint8_t *value, size_t valuelen, bool trailer) {
   if (namelen == 11 && memcmp(name, "grpc-status", 11) == 0) {
     char tmp[16];
     size_t n = valuelen < sizeof(tmp) - 1 ? valuelen : sizeof(tmp) - 1;
@@ -405,11 +331,10 @@ static int client_on_header([[maybe_unused]] nghttp2_session *session, const ngh
       st->resp_encoding = GRPC_COMPRESS_IDENTITY;
   }
 
-  if (!st->headers_received && !(frame->hd.flags & NGHTTP2_FLAG_END_STREAM))
+  if (!trailer)
     md_list_append(&st->resp.headers, &st->resp.nb_headers, name, namelen, value, valuelen);
   else
     md_list_append(&st->resp.trailers, &st->resp.nb_trailers, name, namelen, value, valuelen);
-  return 0;
 }
 
 /* Splits complete length-prefixed gRPC messages off the front of recv_buf. Compressed messages
@@ -475,7 +400,13 @@ static int client_on_data_chunk([[maybe_unused]] nghttp2_session *session,
   grpc_client_stream *st = s->active_stream;
   if (st == nullptr || stream_id != st->stream_id)
     return 0;
-  if (st->recv_buf.len + len > s->parent->config.max_message_size + 5) {
+  return client_resp_data(st, data, len) == 0 ? 0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+}
+
+int client_resp_data(grpc_client_stream *st, const uint8_t *data, size_t len) {
+  if (st->stream_done)
+    return 0;
+  if (st->recv_buf.len + len > st->sub->parent->config.max_message_size + 5) {
     st->err = GRPC_ERR_LIMIT;
     st->stream_done = true;
     return 0;
@@ -483,7 +414,7 @@ static int client_on_data_chunk([[maybe_unused]] nghttp2_session *session,
   if (buf_append(&st->recv_buf, data, len)) {
     st->err = GRPC_ERR_NOMEM;
     st->stream_done = true;
-    return NGHTTP2_ERR_CALLBACK_FAILURE;
+    return -1;
   }
   stream_drain_messages(st);
   return 0;
@@ -682,6 +613,8 @@ static void on_sub_timeout(uv_timer_t *timer) {
  * to call on a never-connected or already disconnected subchannel. */
 static void sub_disconnect(client_subchannel *s) {
   s->closed = true;
+  if (s->h3c != nullptr)
+    h3c_disconnect(s);
   if (s->ngsession != nullptr) {
     nghttp2_session_del(s->ngsession);
     s->ngsession = nullptr;
@@ -720,7 +653,7 @@ static void sub_disconnect(client_subchannel *s) {
  * nonzero. Blocks the caller while it runs the private loop. Returns GRPC_OK, or GRPC_ERR_IO /
  * GRPC_ERR_NOMEM / GRPC_ERR_PROTOCOL after disconnecting again. */
 static grpc_err sub_connect(client_subchannel *s) {
-  if (s->connected && !s->closed && s->ngsession != nullptr)
+  if (s->connected && !s->closed && (s->ngsession != nullptr || s->h3c != nullptr))
     return GRPC_OK;
   sub_disconnect(s);
   s->closed = false;
@@ -738,6 +671,14 @@ static grpc_err sub_connect(client_subchannel *s) {
   s->connect_deadline_hit = false;
   if (s->parent->config.timeout_ms > 0)
     uv_timer_start(&s->timer, on_sub_connect_deadline, s->parent->config.timeout_ms, 0);
+
+  if (s->parent->config.transport == GRPC_TRANSPORT_HTTP3) {
+    if (h3c_connect(s) != GRPC_OK)
+      goto fail_io;
+    uv_timer_stop(&s->timer);
+    h3c_flush(s);
+    return GRPC_OK;
+  }
 
   uv_connect_t conn_req = {.data = s};
   s->connect_status = -1;
@@ -971,7 +912,28 @@ GRPC_API grpc_client *grpc_client_new(const grpc_client_config *config, grpc_err
     c->config.retry_backoff_ms = 50;
 
   grpc_err err = GRPC_OK;
-  if (config->tls.enable) {
+  if (config->transport == GRPC_TRANSPORT_HTTP3) {
+    /* QUIC always uses TLS, and never a Unix socket */
+    bool any_unix = config->unix_path != nullptr;
+    for (size_t i = 0; i < config->nb_targets && config->targets != nullptr; i++)
+      any_unix = any_unix || strncmp(config->targets[i], "unix:", 5) == 0;
+    if (!grpc_http3_available()) {
+      err = GRPC_ERR_UNSUPPORTED;
+      goto fail;
+    }
+    if (!config->tls.enable || any_unix) {
+      err = GRPC_ERR_INVALID;
+      goto fail;
+    }
+    c->quic_tls_ctx = h3c_tls_ctx_new(config);
+    if (c->quic_tls_ctx == nullptr) {
+      err = GRPC_ERR_INVALID;
+      goto fail;
+    }
+  } else if (config->transport != GRPC_TRANSPORT_HTTP2) {
+    err = GRPC_ERR_INVALID;
+    goto fail;
+  } else if (config->tls.enable) {
 #if defined(GRPC_CLIENT_HAS_OPENSSL)
     c->ssl_ctx = client_ssl_ctx_new(config);
     if (c->ssl_ctx == nullptr) {
@@ -1054,6 +1016,10 @@ GRPC_API void grpc_client_free(grpc_client *c) {
   if (c->ssl_ctx != nullptr)
     SSL_CTX_free(c->ssl_ctx);
 #endif
+  if (c->quic_tls_ctx != nullptr) {
+    h3c_tls_ctx_free(c->quic_tls_ctx);
+    http3_thread_cleanup();
+  }
   grpc_free(c);
 }
 
@@ -1130,6 +1096,7 @@ static void stream_free_internal(grpc_client_stream *st) {
   grpc_message *m;
   while ((m = grpc_list_pop_front(&st->recv_queue)) != nullptr)
     grpc_message_free(m);
+  h3c_stream_free(st);
   buf_free(&st->send_buf);
   buf_free(&st->recv_buf);
   grpc_client_response_free(&st->resp);
@@ -1190,7 +1157,8 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
   if (eff_timeout > 0)
     snprintf(timeout_str, sizeof(timeout_str), "%um", eff_timeout);
 
-  const char *scheme = c->config.tls.enable ? "https" : "http";
+  const char *scheme =
+      c->config.tls.enable || c->config.transport == GRPC_TRANSPORT_HTTP3 ? "https" : "http";
   nghttp2_nv *nva = grpc_malloc((9 + nb_metadata) * sizeof(*nva));
   if (nva == nullptr) {
     stream_free_internal(st);
@@ -1233,8 +1201,14 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
   }
 
   s->active_stream = st;
-  nghttp2_data_provider dp = {.source.ptr = st, .read_callback = client_data_read};
-  int32_t sid = nghttp2_submit_request(s->ngsession, nullptr, nva, n, &dp, st);
+  int64_t sid;
+  if (s->h3c != nullptr) {
+    static_assert(sizeof(grpc_nv) == sizeof(nghttp2_nv), "grpc_nv must match nghttp2_nv");
+    sid = h3c_submit_request(s, st, (const grpc_nv *)nva, n) == 0 ? st->stream_id : -1;
+  } else {
+    nghttp2_data_provider dp = {.source.ptr = st, .read_callback = client_data_read};
+    sid = nghttp2_submit_request(s->ngsession, nullptr, nva, n, &dp, st);
+  }
   grpc_free(nva);
   if (sid < 0) {
     stream_free_internal(st);
@@ -1249,6 +1223,23 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
   if (out_err != nullptr)
     *out_err = GRPC_OK;
   return st;
+}
+
+/* Wakes the stream's request-body source after send_buf grew or the send side closed. */
+static void sub_resume(grpc_client_stream *st) {
+  if (st->sub->h3c != nullptr)
+    h3c_resume(st->sub, st);
+  else if (st->sub->ngsession != nullptr)
+    (void)nghttp2_session_resume_data(st->sub->ngsession, (int32_t)st->stream_id);
+}
+
+/* Cancels the stream on the wire: RST_STREAM(CANCEL) or RESET_STREAM(H3_REQUEST_CANCELLED). */
+static void sub_reset(grpc_client_stream *st) {
+  if (st->sub->h3c != nullptr)
+    h3c_reset(st->sub, st);
+  else if (st->sub->ngsession != nullptr)
+    (void)nghttp2_submit_rst_stream(st->sub->ngsession, NGHTTP2_FLAG_NONE, (int32_t)st->stream_id,
+                                    NGHTTP2_CANCEL);
 }
 
 /* Validates arguments and opens the stream on the next round-robin subchannel. */
@@ -1282,7 +1273,7 @@ GRPC_API grpc_err grpc_client_stream_send(grpc_client_stream *st, const void *da
   grpc_err err = frame_message_into(st->sub->parent, &st->send_buf, data, len);
   if (err != GRPC_OK)
     return err;
-  (void)nghttp2_session_resume_data(st->sub->ngsession, st->stream_id);
+  sub_resume(st);
   sub_flush(st->sub);
   return st->err;
 }
@@ -1295,8 +1286,8 @@ GRPC_API grpc_err grpc_client_stream_close_send(grpc_client_stream *st) {
   if (st->send_closed)
     return GRPC_OK;
   st->send_closed = true;
-  if (!st->sub->closed && st->sub->ngsession != nullptr) {
-    (void)nghttp2_session_resume_data(st->sub->ngsession, st->stream_id);
+  if (!st->sub->closed && (st->sub->ngsession != nullptr || st->sub->h3c != nullptr)) {
+    sub_resume(st);
     sub_flush(st->sub);
   }
   return st->err;
@@ -1327,9 +1318,8 @@ GRPC_API grpc_err grpc_client_stream_finish(grpc_client_stream *st, grpc_client_
     (void)grpc_client_stream_close_send(st);
   while (!st->stream_done && !st->sub->closed)
     uv_run(&st->sub->loop, UV_RUN_ONCE);
-  if (st->timed_out && !st->sub->closed && st->sub->ngsession != nullptr) {
-    (void)nghttp2_submit_rst_stream(st->sub->ngsession, NGHTTP2_FLAG_NONE, st->stream_id,
-                                    NGHTTP2_CANCEL);
+  if (st->timed_out && !st->sub->closed) {
+    sub_reset(st);
     sub_flush(st->sub);
   }
   /* Move last queued message (if any) into out->message for unary convenience. */
@@ -1350,9 +1340,8 @@ GRPC_API grpc_err grpc_client_stream_finish(grpc_client_stream *st, grpc_client_
 GRPC_API void grpc_client_stream_cancel(grpc_client_stream *st) {
   if (st == nullptr)
     return;
-  if (!st->sub->closed && st->sub->ngsession != nullptr && !st->stream_done) {
-    (void)nghttp2_submit_rst_stream(st->sub->ngsession, NGHTTP2_FLAG_NONE, st->stream_id,
-                                    NGHTTP2_CANCEL);
+  if (!st->sub->closed && !st->stream_done) {
+    sub_reset(st);
     sub_flush(st->sub);
   }
   stream_free_internal(st);

@@ -100,7 +100,7 @@ static u64 expire_deadlines(grpc_server *server, u64 now_ms) {
   u64 next_deadline_ms = UINT64_MAX;
   for (size_t i = 0; i < server->nb_sessions; i++) {
     grpc_session *session = &server->sessions[i];
-    if (!session->is_active || session->is_closing || session->ngsession == nullptr)
+    if (!session->is_active || session->is_closing || session->ops == nullptr)
       continue;
     grpc_stream *stream = session->streams;
     while (stream != nullptr) {

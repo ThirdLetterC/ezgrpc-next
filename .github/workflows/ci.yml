@@ -238,6 +238,73 @@ jobs:
           cmake --build build --parallel 2
           ctest --test-dir build --output-on-failure
 
+  http3:
+    name: HTTP/3 / ${{ matrix.tls }}${{ matrix.asan == '1' && ' / ASAN' || '' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every TLS backend ngtcp2 has a crypto helper for (LibreSSL and rustls have none).
+        # Distribution ngtcp2/nghttp3 packages are pre-1.0, so scripts/build-quic-deps.sh builds
+        # pinned releases; openssl is built at 3.5 (the first release with a QUIC TLS API).
+        tls: [ openssl, boringssl, awslc, wolfssl, gnutls ]
+        asan: [ '0' ]
+        include:
+          - tls: openssl
+            asan: '1'
+
+    env:
+      TLS_PREFIX_DIR: ${{ github.workspace }}/.tls/${{ matrix.tls }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            cmake \
+            ninja-build \
+            libnghttp2-dev \
+            zlib1g-dev \
+            libzstd-dev \
+            libsnappy-dev \
+            libssl-dev \
+            uuid-dev \
+            libuv1-dev \
+            libwolfssl-dev \
+            libgnutls28-dev
+
+      - name: Cache the TLS and QUIC libraries
+        id: quic-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TLS_PREFIX_DIR }}
+          key: quic-${{ matrix.tls }}-${{ runner.os }}-${{ hashFiles('scripts/build-tls-backend.sh', 'scripts/build-quic-deps.sh') }}
+
+      - name: Build the TLS library
+        if: matrix.tls != 'wolfssl' && matrix.tls != 'gnutls' && steps.quic-cache.outputs.cache-hit != 'true'
+        run: scripts/build-tls-backend.sh ${{ matrix.tls }} "$TLS_PREFIX_DIR" "$RUNNER_TEMP/tls-src"
+
+      - name: Build ngtcp2 and nghttp3
+        if: steps.quic-cache.outputs.cache-hit != 'true'
+        run: scripts/build-quic-deps.sh ${{ matrix.tls }} "$TLS_PREFIX_DIR" "$RUNNER_TEMP/quic-src"
+
+      - name: Build and test
+        run: |
+          cmake -S . -B build \
+            -DGRPC_TLS_BACKEND=${{ matrix.tls }} \
+            -DGRPC_TLS_PREFIX="$TLS_PREFIX_DIR" \
+            -DOPENSSL_ROOT_DIR="$TLS_PREFIX_DIR" \
+            -DGRPC_HTTP3=ON \
+            -DGRPC_ASAN=${{ matrix.asan == '1' && 'ON' || 'OFF' }} \
+            -DGRPC_BUILD_INTEGRATION_TESTS=OFF
+          cmake --build build --parallel 2
+          ctest --test-dir build --output-on-failure
+
   flatbuffers:
     name: FlatBuffers / ${{ matrix.compiler }}${{ matrix.asan == '1' && ' / ASAN' || '' }}
     runs-on: ubuntu-24.04

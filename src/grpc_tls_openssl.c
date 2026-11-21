@@ -17,6 +17,7 @@
 #include <openssl/x509.h>
 #include "core.h"
 #include "internal_tls.h"
+#include "internal_tls_openssl.h"
 
 /* make sure the headers in the include path belong to the requested library */
 #if defined(GRPC_TLS_AWSLC)
@@ -151,6 +152,39 @@ static bool load_ca_pem(SSL_CTX *ctx, const char *pem, size_t pem_len) {
   return loaded > 0;
 }
 
+/* Loads the server certificate chain and key from `cfg` (PEM text or files) into ctx, checks
+ * that they match, and, when a CA is configured, enables client certificate verification
+ * (mandatory with require_client_cert). Shared by the TCP context below and the QUIC context in
+ * grpc_quic_tls_openssl.c. Returns false if anything fails to load. */
+bool tls_openssl_load_server_credentials(SSL_CTX *ctx, const grpc_tls_config *cfg) {
+  bool ok = false;
+  if (cfg->cert_pem != nullptr && cfg->key_pem != nullptr) {
+    ok = load_pem_chain(ctx, cfg->cert_pem, cfg->cert_pem_len) &&
+         load_pem_key(ctx, cfg->key_pem, cfg->key_pem_len);
+  } else if (cfg->cert_file != nullptr && cfg->key_file != nullptr) {
+    ok = SSL_CTX_use_certificate_chain_file(ctx, cfg->cert_file) > 0 &&
+         SSL_CTX_use_PrivateKey_file(ctx, cfg->key_file, SSL_FILETYPE_PEM) > 0;
+  }
+  if (!ok || !SSL_CTX_check_private_key(ctx))
+    return false;
+
+  if (cfg->ca_file != nullptr || cfg->ca_pem != nullptr) {
+    if (!tls_openssl_load_ca(ctx, cfg->ca_file, cfg->ca_pem, cfg->ca_pem_len))
+      return false;
+    int mode = SSL_VERIFY_PEER | (cfg->require_client_cert ? SSL_VERIFY_FAIL_IF_NO_PEER_CERT : 0);
+    SSL_CTX_set_verify(ctx, mode, nullptr);
+  }
+  return true;
+}
+
+/* Loads trusted CA certificates from a file, or from PEM text (pem_len 0 = NUL-terminated) when
+ * ca_file is nullptr. Returns false on failure. */
+bool tls_openssl_load_ca(SSL_CTX *ctx, const char *ca_file, const char *ca_pem, size_t pem_len) {
+  if (ca_file != nullptr)
+    return SSL_CTX_load_verify_locations(ctx, ca_file, nullptr) > 0;
+  return ca_pem != nullptr && load_ca_pem(ctx, ca_pem, pem_len ? pem_len : strlen(ca_pem));
+}
+
 /* Creates a server SSL_CTX from `cfg`: TLS 1.2 minimum, the certificate chain and key from PEM
  * buffers (preferred when both are set) or from files, checked to match each other. With a CA
  * file or PEM, client certificates are requested and verified, and required when
@@ -167,31 +201,10 @@ grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg) {
     return nullptr;
   }
 
-  bool ok = false;
-  if (cfg->cert_pem != nullptr && cfg->key_pem != nullptr) {
-    ok = load_pem_chain(ctx, cfg->cert_pem, cfg->cert_pem_len) &&
-         load_pem_key(ctx, cfg->key_pem, cfg->key_pem_len);
-  } else if (cfg->cert_file != nullptr && cfg->key_file != nullptr) {
-    ok = SSL_CTX_use_certificate_chain_file(ctx, cfg->cert_file) > 0 &&
-         SSL_CTX_use_PrivateKey_file(ctx, cfg->key_file, SSL_FILETYPE_PEM) > 0;
-  }
-  if (!ok || !SSL_CTX_check_private_key(ctx)) {
+  if (!tls_openssl_load_server_credentials(ctx, cfg)) {
     SSL_CTX_free(ctx);
     return nullptr;
   }
-
-  if (cfg->ca_file != nullptr || cfg->ca_pem != nullptr) {
-    bool ca_ok = cfg->ca_file != nullptr
-                     ? SSL_CTX_load_verify_locations(ctx, cfg->ca_file, nullptr) > 0
-                     : load_ca_pem(ctx, cfg->ca_pem, cfg->ca_pem_len);
-    if (!ca_ok) {
-      SSL_CTX_free(ctx);
-      return nullptr;
-    }
-    int mode = SSL_VERIFY_PEER | (cfg->require_client_cert ? SSL_VERIFY_FAIL_IF_NO_PEER_CERT : 0);
-    SSL_CTX_set_verify(ctx, mode, nullptr);
-  }
-
   SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, nullptr);
   return (grpc_tls_ctx *)ctx;
 }

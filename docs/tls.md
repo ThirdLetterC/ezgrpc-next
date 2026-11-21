@@ -23,6 +23,8 @@ cmake --build build-awslc --parallel
 
 Query the active backend at runtime with `grpc_tls_backend()` and `grpc_tls_backend_version()`.
 
+HTTP/3 (QUIC) uses the same backend through ngtcp2's crypto helper. It works with OpenSSL 3.5+, BoringSSL, AWS-LC, wolfSSL and GnuTLS, but not with LibreSSL or rustls. QUIC connections use TLS 1.3 with ALPN `h3` and load the same certificates; see [HTTP/3](http3.md).
+
 ---
 
 ## Configuring TLS (Files or In-Memory PEMs)

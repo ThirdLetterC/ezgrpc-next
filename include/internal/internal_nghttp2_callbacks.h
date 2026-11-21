@@ -10,12 +10,9 @@
 #include <nghttp2/nghttp2.h>
 #include "common.h"
 #include "grpc_defs.h"
+#include "core.h"
 
 /* Install the server's nghttp2 callbacks into `ngcallbacks` (shared by all sessions). */
 void server_setup_ngcallbacks(nghttp2_session_callbacks *ngcallbacks);
-/* nghttp2 data source read callback for response bodies: copies up to `buf_len` bytes of the
- * stream's queued messages (5-byte prefix plus payload) into `buf`, frees finished messages, and
- * when the queue is empty either ends the stream or submits the pending trailers. Returns the
- * bytes written or NGHTTP2_ERR_CALLBACK_FAILURE. */
-ssize_t data_source_read_callback2(nghttp2_session *session, i32 stream_id, u8 *buf, size_t buf_len,
-                                   u32 *data_flags, nghttp2_data_source *source, void *user_data);
+/* The HTTP/2 transport ops installed on TCP / Unix-socket sessions. */
+extern const grpc_transport_ops grpc_h2_transport_ops;

@@ -28,6 +28,7 @@
 #include "grpc_timeout.h"
 #include "internal_helpers.h"
 #include "internal_nghttp2_callbacks.h"
+#include "internal_http3.h"
 #include "ulog/ulog.h"
 
 static const int DEFAULT_BACKLOG = 1024;
@@ -457,7 +458,7 @@ static void on_maintenance_timer(uv_timer_t *handle) {
 
   for (size_t i = 0; i < server->nb_sessions; i++) {
     grpc_session *s = &server->sessions[i];
-    if (!s->is_active || s->is_closing || s->ngsession == nullptr)
+    if (!s->is_active || s->is_closing || s->ops == nullptr)
       continue;
 
     /* 1. Keepalive PING timeout */
@@ -476,9 +477,7 @@ static void on_maintenance_timer(uv_timer_t *handle) {
       }
     } else if (cfg->max_connection_age_ms > 0 && now >= s->created_ms &&
                (now - s->created_ms) >= cfg->max_connection_age_ms) {
-      int32_t last_id = nghttp2_session_get_last_proc_stream_id(s->ngsession);
-      (void)nghttp2_submit_goaway(s->ngsession, NGHTTP2_FLAG_NONE, last_id, NGHTTP2_NO_ERROR,
-                                  nullptr, 0);
+      s->ops->goaway(s);
       s->goaway_sent = true;
       s->goaway_sent_ms = now;
       session_schedule_flush(s);
@@ -488,20 +487,17 @@ static void on_maintenance_timer(uv_timer_t *handle) {
     /* 3. Max connection idle (no active streams) */
     if (cfg->max_connection_idle_ms > 0 && s->nb_streams == 0 && now >= s->last_activity_ms &&
         (now - s->last_activity_ms) >= cfg->max_connection_idle_ms) {
-      int32_t last_id = nghttp2_session_get_last_proc_stream_id(s->ngsession);
-      (void)nghttp2_submit_goaway(s->ngsession, NGHTTP2_FLAG_NONE, last_id, NGHTTP2_NO_ERROR,
-                                  nullptr, 0);
+      s->ops->goaway(s);
       s->goaway_sent = true;
       s->goaway_sent_ms = now;
       session_schedule_flush(s);
       continue;
     }
 
-    /* 4. Send HTTP/2 keepalive PING if idle */
-    if (cfg->keepalive_time_ms > 0 && !s->ping_pending && now >= s->last_activity_ms &&
-        (now - s->last_activity_ms) >= cfg->keepalive_time_ms) {
-      static const uint8_t ping_data[8] = {'e', 'z', 'g', 'r', 'p', 'c', 'k', 'a'};
-      if (nghttp2_submit_ping(s->ngsession, NGHTTP2_FLAG_NONE, ping_data) == 0) {
+    /* 4. Send a keepalive PING if idle (QUIC transports keep themselves alive: ping is nullptr) */
+    if (cfg->keepalive_time_ms > 0 && s->ops->ping != nullptr && !s->ping_pending &&
+        now >= s->last_activity_ms && (now - s->last_activity_ms) >= cfg->keepalive_time_ms) {
+      if (s->ops->ping(s) == 0) {
         s->ping_pending = true;
         s->ping_sent_ms = now;
         session_schedule_flush(s);
@@ -634,8 +630,11 @@ GRPC_API grpc_server *grpc_server_new_ex(const grpc_config *config, grpc_err *ou
     err = GRPC_ERR_INVALID;
     goto err;
   }
+  /* the caller's TLS strings are not kept, so HTTP/3 builds its QUIC TLS context from this copy
+   * before grpc_server_new_ex() returns */
+  grpc_tls_config tls_cfg = {0};
   if (has_tls_files || has_tls_pems) {
-    grpc_tls_config tls_cfg = {
+    tls_cfg = (grpc_tls_config){
         .cert_file = config->tls.cert_file,
         .key_file = config->tls.key_file,
         .cert_pem = config->tls.cert_pem,
@@ -747,6 +746,8 @@ GRPC_API grpc_server *grpc_server_new_ex(const grpc_config *config, grpc_err *ou
   if (server->ipv6_addr != nullptr)
     LOG_INFO(server, "listening on [%s]:%u%s\n", server->ipv6_addr, cfg->port,
              server->is_tls ? " (TLS)" : "");
+  if (config->http3.enable && (err = http3_server_start(server, &tls_cfg)) != GRPC_OK)
+    goto err;
   return server;
 
 err:
@@ -764,6 +765,11 @@ GRPC_API grpc_server *grpc_server_new(const grpc_config *config) {
 /* Returns the bound TCP port (resolved when the config asked for port 0), or 0. */
 GRPC_API uint16_t grpc_server_port(const grpc_server *server) {
   return server != nullptr ? server->config.port : 0;
+}
+
+/* Returns the bound HTTP/3 UDP port, or 0 when HTTP/3 is off. */
+GRPC_API uint16_t grpc_server_http3_port(const grpc_server *server) {
+  return server != nullptr ? http3_server_port(server) : 0;
 }
 
 /* Flushes queued output, closes every session (detaching their calls), runs posted tasks so
@@ -795,6 +801,7 @@ GRPC_API void grpc_server_free(grpc_server *server) {
     uv_close((uv_handle_t *)&server->ipv6_listener, nullptr);
   if (server->unix_listener_active)
     uv_close((uv_handle_t *)&server->unix_listener, nullptr);
+  http3_server_close_handles(server);
   if (server->timer_active)
     uv_close((uv_handle_t *)&server->timer, nullptr);
   if (server->deadline_timer_active)
@@ -828,6 +835,9 @@ GRPC_API void grpc_server_free(grpc_server *server) {
   health_free(server);
   reflection_free(server);
   tls_free(server);
+  if (server->h3 != nullptr)
+    http3_thread_cleanup();
+  http3_server_free(server);
 
   if (server->ngcallbacks != nullptr)
     nghttp2_session_callbacks_del(server->ngcallbacks);
@@ -922,6 +932,9 @@ GRPC_API grpc_err grpc_server_run(grpc_server *server) {
   }
   /* the server can be run again */
   atomic_store(&server->stop, false);
+  /* the loop thread may exit now: release its TLS-library caches (wolfSSL FP_ECC) */
+  if (server->h3 != nullptr)
+    http3_thread_cleanup();
   return GRPC_OK;
 }
 
@@ -969,13 +982,13 @@ GRPC_API grpc_err grpc_server_drain(grpc_server *server, int timeout_ms) {
     server->unix_listener_active = false;
   }
 
-  /* Send HTTP/2 GOAWAY on every active session. */
+  http3_server_stop_accepting(server);
+
+  /* Send GOAWAY on every active session. */
   for (size_t i = 0; i < server->nb_sessions; i++) {
     grpc_session *s = &server->sessions[i];
-    if (s->is_active && !s->is_closing && s->ngsession != nullptr) {
-      int32_t last_id = nghttp2_session_get_last_proc_stream_id(s->ngsession);
-      (void)nghttp2_submit_goaway(s->ngsession, NGHTTP2_FLAG_NONE, last_id, NGHTTP2_NO_ERROR,
-                                  nullptr, 0);
+    if (s->is_active && !s->is_closing && s->ops != nullptr) {
+      s->ops->goaway(s);
       session_schedule_flush(s);
     }
   }

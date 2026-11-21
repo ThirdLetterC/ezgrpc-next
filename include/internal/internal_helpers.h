@@ -26,8 +26,14 @@ void on_listener_connection(uv_stream_t *listener, int status);
 
 /* Free an unlinked stream and its buffers and queued messages (not its call). Accepts nullptr. */
 void stream_free(grpc_stream *stream);
+/* Take a free session slot (caller checks nb_free_sessions > 0) and mark it active / return a
+ * closed session's slot to the free stack. */
+grpc_session *session_slot_acquire(grpc_server *server);
+void session_slot_release(grpc_session *session);
+/* Format "a.b.c.d:port" or "[v6]:port" into out. */
+void format_peer(const struct sockaddr *sa, char *out, size_t out_len);
 /* Allocate a zeroed stream for `stream_id`; nullptr when out of memory. */
-grpc_stream *stream_new(i32 stream_id);
+grpc_stream *stream_new(int64_t stream_id, const grpc_transport_ops *ops);
 /* Add `stream` to the session's stream list and bump the stream counters. */
 void stream_link(grpc_session *session, grpc_stream *stream);
 /* Remove `stream` from the session's list and decrement the counters; does not free it. */

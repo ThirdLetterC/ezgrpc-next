@@ -2,15 +2,16 @@
 # Builds a TLS library that is not packaged by most distributions and
 # installs it into a prefix that the grpc build can use:
 #
-#   scripts/build-tls-backend.sh <libressl|boringssl|awslc|rustls> <prefix> [workdir]
+#   scripts/build-tls-backend.sh <openssl|libressl|boringssl|awslc|rustls> <prefix> [workdir]
 #   cmake -S . -B build-<backend> -DGRPC_TLS_BACKEND=<backend> -DGRPC_TLS_PREFIX=<prefix>
 #
 # Sources are pinned to a release and verified against a SHA-256 checksum.
-# OpenSSL, wolfSSL and GnuTLS are taken from the system packages instead.
+# wolfSSL and GnuTLS are taken from the system packages instead. OpenSSL normally is too; the
+# `openssl` entry builds 3.5, which HTTP/3 needs when the system OpenSSL is older.
 set -euo pipefail
 
 if [ $# -lt 2 ]; then
-  echo "usage: $0 <libressl|boringssl|awslc|rustls> <prefix> [workdir]" >&2
+  echo "usage: $0 <openssl|libressl|boringssl|awslc|rustls> <prefix> [workdir]" >&2
   exit 2
 fi
 
@@ -20,6 +21,13 @@ workdir=$(realpath -m "${3:-$(mktemp -d)}")
 jobs=$(nproc 2>/dev/null || echo 4)
 
 case "$backend" in
+  openssl)
+    # 3.5 is the first release with the QUIC TLS API that ngtcp2's ossl helper needs (HTTP/3)
+    version=3.5.9
+    url=https://github.com/openssl/openssl/releases/download/openssl-$version/openssl-$version.tar.gz
+    sha256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+    srcdir=openssl-$version
+    ;;
   libressl)
     version=4.3.3
     url=https://cdn.openbsd.org/pub/OpenBSD/LibreSSL/libressl-$version.tar.gz
@@ -75,6 +83,10 @@ cmake_install() {
 }
 
 case "$backend" in
+  openssl)
+    (cd "$src" && ./Configure --prefix="$prefix" --libdir=lib --openssldir="$prefix/ssl" \
+      shared no-tests no-docs && make -j "$jobs" && make install_sw)
+    ;;
   libressl)
     cmake_install -DLIBRESSL_APPS=OFF -DLIBRESSL_TESTS=OFF
     ;;

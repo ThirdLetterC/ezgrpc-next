@@ -84,6 +84,21 @@ tls backend:
     cmake --build build-{{backend}} --parallel {{jobs}}
     ctest --test-dir build-{{backend}} --output-on-failure -j {{jobs}}
 
+# Build and test with HTTP/3 on a TLS backend: openssl (3.5, built), boringssl, awslc, wolfssl, gnutls (deps fetched to .tls/)
+http3 backend="openssl":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    prefix="$PWD/.tls/{{backend}}"
+    case "{{backend}}" in
+      openssl|boringssl|awslc)
+        [ -f "$prefix/include/openssl/ssl.h" ] || scripts/build-tls-backend.sh {{backend}} "$prefix" .tls/src ;;
+    esac
+    [ -f "$prefix/lib/pkgconfig/libngtcp2.pc" ] || scripts/build-quic-deps.sh {{backend}} "$prefix" .tls/src
+    cmake -S . -B build-h3-{{backend}} -DCMAKE_BUILD_TYPE=Debug -DGRPC_HTTP3=ON \
+      -DGRPC_TLS_BACKEND={{backend}} -DGRPC_TLS_PREFIX="$prefix" -DOPENSSL_ROOT_DIR="$prefix"
+    cmake --build build-h3-{{backend}} --parallel {{jobs}}
+    ctest --test-dir build-h3-{{backend}} --output-on-failure -j {{jobs}}
+
 # Build and test with FlatBuffers support (flatcc fetched into .tls/flatcc on first use)
 flatcc:
     [ -d .tls/flatcc ] || scripts/build-flatcc.sh "$PWD/.tls/flatcc" .tls/src

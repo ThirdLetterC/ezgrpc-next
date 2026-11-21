@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include "core.h"
 #include "internal_tls.h"
+#include "internal_http3.h"
 
 #if defined(GRPC_ENABLE_TLS)
 
@@ -88,7 +89,11 @@ GRPC_API grpc_err grpc_server_reload_tls(grpc_server *server, const grpc_tls_con
     normalized.key_pem_len = strlen(normalized.key_pem);
   if (normalized.ca_pem != nullptr && normalized.ca_pem_len == 0)
     normalized.ca_pem_len = strlen(normalized.ca_pem);
-  return tls_enable(server, &normalized);
+  grpc_err err = tls_enable(server, &normalized);
+  if (err != GRPC_OK)
+    return err;
+  /* HTTP/3 connections use their own QUIC TLS context, built from the same credentials */
+  return http3_server_reload_tls(server, &normalized);
 }
 
 /* Frees the active server context and every retired one, and resets the retired list. Called

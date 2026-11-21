@@ -54,7 +54,7 @@ if(GRPC_BUILD_INTEGRATION_TESTS AND GRPC_BUILD_EXAMPLES)
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
 endif()
 
-foreach(feature IN ITEMS PROTOBUF_C FLATCC ZLIB ZSTD SNAPPY)
+foreach(feature IN ITEMS PROTOBUF_C FLATCC ZLIB ZSTD SNAPPY HTTP3)
   set(GRPC_${feature} "AUTO" CACHE STRING "${feature} support: AUTO, ON, or OFF")
   set_property(CACHE GRPC_${feature} PROPERTY STRINGS AUTO ON OFF)
   string(TOUPPER "${GRPC_${feature}}" feature_value)
@@ -109,6 +109,7 @@ set(GRPC_SOURCES
   src/grpc_client.c
   src/grpc_compression.c
   src/grpc_health.c
+  src/grpc_http3.c
   src/grpc_interceptor.c
   src/grpc_list.c
   src/grpc_mem.c
@@ -118,6 +119,7 @@ set(GRPC_SOURCES
   src/grpc_server.c
   src/grpc_status.c
   src/grpc_status_details.c
+  src/grpc_stream_core.c
   src/grpc_timeout.c
   src/grpc_tls.c
   src/grpc_version.c
@@ -129,6 +131,9 @@ if(GRPC_TLS_SOURCE)
 endif()
 if(GRPC_PROTOBUF_C_ENABLED)
   list(APPEND GRPC_SOURCES src/grpc_protobuf_c.c)
+endif()
+if(GRPC_HTTP3_ENABLED)
+  list(APPEND GRPC_SOURCES src/grpc_http3_server.c src/grpc_http3_client.c "${GRPC_QUIC_TLS_SOURCE}")
 endif()
 if(GRPC_FLATCC_ENABLED)
   list(APPEND GRPC_SOURCES src/grpc_flatcc.c)
@@ -161,7 +166,7 @@ endif()
 if(GRPC_ALLOCATOR_DEFINE)
   list(APPEND GRPC_PUBLIC_COMPILE_DEFINITIONS "${GRPC_ALLOCATOR_DEFINE}")
 endif()
-foreach(feature IN ITEMS ZLIB ZSTD SNAPPY PROTOBUF_C FLATCC)
+foreach(feature IN ITEMS ZLIB ZSTD SNAPPY PROTOBUF_C FLATCC HTTP3)
   if(GRPC_${feature}_ENABLED)
     list(APPEND GRPC_PUBLIC_COMPILE_DEFINITIONS "GRPC_ENABLE_${feature}")
   endif()
@@ -232,6 +237,10 @@ if(GRPC_PROTOBUF_C_ENABLED)
 endif()
 if(GRPC_FLATCC_ENABLED)
   list(APPEND GRPC_LINK_LIBRARIES "${FLATCC_LIBRARY}")
+endif()
+if(GRPC_HTTP3_ENABLED)
+  # the TLS libraries again after the crypto helper, which may be a static archive using them
+  list(APPEND GRPC_LINK_LIBRARIES ${GRPC_HTTP3_TARGETS} ${GRPC_TLS_LIBRARIES})
 endif()
 target_link_libraries(grpc_objects PRIVATE ${GRPC_LINK_LIBRARIES})
 foreach(library_target IN LISTS GRPC_LIBRARY_TARGETS)
@@ -348,6 +357,15 @@ if(GRPC_BUILD_TESTS)
     add_test(NAME tls COMMAND test_tls)
     set_tests_properties(tls PROPERTIES WORKING_DIRECTORY "${tls_test_dir}")
     list(APPEND GRPC_TEST_TARGETS test_tls)
+    if(GRPC_HTTP3_ENABLED)
+      add_executable(test_http3 src/tests/http3.c src/tests/unity/unity.c)
+      target_include_directories(test_http3 PRIVATE src/tests/unity include/internal)
+      target_link_libraries(test_http3 PRIVATE grpc_static)
+      add_dependencies(test_http3 test_tls_certificates)
+      add_test(NAME http3 COMMAND test_http3)
+      set_tests_properties(http3 PROPERTIES WORKING_DIRECTORY "${tls_test_dir}")
+      list(APPEND GRPC_TEST_TARGETS test_http3)
+    endif()
   endif()
 
 endif()
@@ -528,6 +546,9 @@ if(GRPC_INSTALL)
     DESTINATION "${CMAKE_INSTALL_LIBDIR}/pkgconfig")
 endif()
 
+if(GRPC_HTTP3_ENABLED)
+  set(GRPC_QUIC_CRYPTO_SUFFIX " (ngtcp2_crypto_${GRPC_QUIC_CRYPTO})")
+endif()
 message(STATUS "ezGRPC-next TLS backend: ${_tls_backend}")
 message(STATUS "ezGRPC-next IPO: ${GRPC_IPO}")
-message(STATUS "ezGRPC-next optional features: zlib=${GRPC_ZLIB_ENABLED}, zstd=${GRPC_ZSTD_ENABLED}, snappy=${GRPC_SNAPPY_ENABLED}, protobuf-c=${GRPC_PROTOBUF_C_ENABLED}, flatcc=${GRPC_FLATCC_ENABLED}")
+message(STATUS "ezGRPC-next optional features: zlib=${GRPC_ZLIB_ENABLED}, zstd=${GRPC_ZSTD_ENABLED}, snappy=${GRPC_SNAPPY_ENABLED}, protobuf-c=${GRPC_PROTOBUF_C_ENABLED}, flatcc=${GRPC_FLATCC_ENABLED}, http3=${GRPC_HTTP3_ENABLED}${GRPC_QUIC_CRYPTO_SUFFIX}")

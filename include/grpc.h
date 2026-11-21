@@ -26,6 +26,7 @@
 #include "grpc_channelz.h"
 #include "grpc_compression.h"
 #include "grpc_tls.h"
+#include "grpc_http3.h"
 #include "grpc_client.h"
 
 #if defined(GRPC_ENABLE_PROTOBUF_C)

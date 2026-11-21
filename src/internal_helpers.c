@@ -156,12 +156,31 @@ static inline uv_handle_t *session_handle(grpc_session *session) {
                           : (uv_handle_t *)&session->handle.tcp;
 }
 
-/* libuv close callback, invoked once uv_close() on the session handle has completed and any
- * pending write has been cancelled. Frees obuf and wbuf (grpc allocator), resets the per
- * connection state and pushes the slot back onto the free stack; this is the only place a
- * session slot is returned. */
-static void on_session_close(uv_handle_t *handle) {
-  grpc_session *session = handle->data;
+/* Pops the slot on top of the free stack (the caller checked nb_free_sessions > 0), marks it
+ * active and resets the per-connection state and timestamps; counts the connection. Shared by TCP
+ * accept and the HTTP/3 server. */
+grpc_session *session_slot_acquire(grpc_server *server) {
+  size_t ndx = server->free_sessions[--server->nb_free_sessions];
+  grpc_session *session = &server->sessions[ndx];
+  session->server = server;
+  session->index = ndx;
+  session->is_active = true;
+  session->is_closing = false;
+  uint64_t now = grpc_time_now_ms();
+  session->created_ms = now;
+  session->last_activity_ms = now;
+  session->ping_pending = false;
+  session->goaway_sent = false;
+  session->ping_strikes = 0;
+  atomic_fetch_add(&server->stat_active_connections, 1);
+  atomic_fetch_add(&server->stat_total_connections, 1);
+  return session;
+}
+
+/* Returns a closed session's slot: frees obuf and wbuf (grpc allocator), resets the per
+ * connection state and pushes the slot back onto the free stack. The only place a slot is
+ * returned; TCP sessions reach it from the uv_close callback, HTTP/3 sessions from theirs. */
+void session_slot_release(grpc_session *session) {
   grpc_server *server = session->server;
   size_t ndx = session->index;
 
@@ -179,9 +198,15 @@ static void on_session_close(uv_handle_t *handle) {
   session->peer_cert_subject[0] = '\0';
   session->is_closing = false;
   session->is_active = false;
+  session->ops = nullptr;
 
   atomic_fetch_sub(&server->stat_active_connections, 1);
   server->free_sessions[server->nb_free_sessions++] = ndx;
+}
+
+/* uv_close callback of a TCP/pipe session handle: returns the slot. */
+static void on_session_close(uv_handle_t *handle) {
+  session_slot_release(handle->data);
 }
 
 /* Starts closing an open session; does nothing if it is already closing or inactive, so it is
@@ -191,6 +216,10 @@ static void on_session_close(uv_handle_t *handle) {
  * to uv_close(). The slot stays taken (is_active) until on_session_close() runs. */
 void session_close(grpc_session *session) {
   if (session == nullptr || !session->is_active || session->is_closing) {
+    return;
+  }
+  if (session->ops != nullptr && session->ops->close != nullptr) {
+    session->ops->close(session);
     return;
   }
   session->is_closing = true;
@@ -279,6 +308,7 @@ static int session_create(grpc_session *ezsession) {
     ezsession->ngsession = nullptr;
     return 1;
   }
+  ezsession->ops = &grpc_h2_transport_ops;
 
   /* settings */
   nghttp2_settings_entry siv[] = {
@@ -307,17 +337,22 @@ static void session_set_peer(grpc_session *ezsession) {
     return;
   }
   ezsession->socklen = namelen;
+  format_peer((const struct sockaddr *)&ezsession->sockaddr, ezsession->peer,
+              sizeof(ezsession->peer));
+}
+
+void format_peer(const struct sockaddr *sa, char *out, size_t out_len) {
   char addr[INET6_ADDRSTRLEN] = "";
-  switch (ezsession->sockaddr.ss_family) {
+  switch (sa->sa_family) {
   case AF_INET: {
-    struct sockaddr_in *sa = (struct sockaddr_in *)&ezsession->sockaddr;
-    inet_ntop(AF_INET, &sa->sin_addr.s_addr, addr, sizeof(addr));
-    snprintf(ezsession->peer, sizeof(ezsession->peer), "%s:%u", addr, ntohs(sa->sin_port));
+    const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
+    inet_ntop(AF_INET, &sin->sin_addr.s_addr, addr, sizeof(addr));
+    snprintf(out, out_len, "%s:%u", addr, ntohs(sin->sin_port));
   } break;
   case AF_INET6: {
-    struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&ezsession->sockaddr;
-    inet_ntop(AF_INET6, sa6->sin6_addr.s6_addr, addr, sizeof(addr));
-    snprintf(ezsession->peer, sizeof(ezsession->peer), "[%s]:%u", addr, ntohs(sa6->sin6_port));
+    const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)sa;
+    inet_ntop(AF_INET6, sin6->sin6_addr.s6_addr, addr, sizeof(addr));
+    snprintf(out, out_len, "[%s]:%u", addr, ntohs(sin6->sin6_port));
   } break;
   default:
     break;
@@ -475,21 +510,9 @@ void on_listener_connection(uv_stream_t *listener, int status) {
     reject_connection(server, listener, is_unix);
     return;
   }
-  server->nb_free_sessions--;
+  session = session_slot_acquire(server);
   session->is_unix = is_unix;
   session_handle(session)->data = session;
-  session->server = server;
-  session->index = ndx;
-  session->is_active = true;
-  session->is_closing = false;
-  uint64_t now = grpc_time_now_ms();
-  session->created_ms = now;
-  session->last_activity_ms = now;
-  session->ping_pending = false;
-  session->goaway_sent = false;
-  session->ping_strikes = 0;
-  atomic_fetch_add(&server->stat_active_connections, 1);
-  atomic_fetch_add(&server->stat_total_connections, 1);
   /* from here on, session_close() returns the slot */
 
   if (uv_accept(listener, session_stream(session)) != 0) {
@@ -608,6 +631,10 @@ static void on_session_write(uv_write_t *req, int status) {
  * Closes the session on errors, and once nghttp2 wants neither to read nor to write (e.g. after
  * a GOAWAY exchange). */
 void session_flush(grpc_session *ezsession) {
+  if (ezsession->ops != nullptr && ezsession->ops->flush != nullptr) {
+    ezsession->ops->flush(ezsession);
+    return;
+  }
   /* an in-flight write resumes the flush from on_session_write */
   if (!ezsession->is_active || ezsession->is_closing || ezsession->is_writing)
     return;
@@ -661,11 +688,12 @@ void session_flush(grpc_session *ezsession) {
 
 /* Allocates a zeroed stream for stream_id whose receive buffer starts as the inline storage.
  * Returns nullptr when out of memory. The caller links it with stream_link(). */
-grpc_stream *stream_new(i32 stream_id) {
+grpc_stream *stream_new(int64_t stream_id, const grpc_transport_ops *ops) {
   grpc_stream *ezstream = grpc_calloc(1, sizeof(*ezstream));
   if (ezstream == nullptr)
     return nullptr;
   ezstream->stream_id = stream_id;
+  ezstream->ops = ops;
   ezstream->recv_data = ezstream->recv_inline;
   ezstream->recv_cap = sizeof(ezstream->recv_inline);
   grpc_list_init(&ezstream->lqueue_omessages);
@@ -684,8 +712,8 @@ void stream_free(grpc_stream *ezstream) {
   grpc_free(ezstream->pending_trailers);
 
   for (size_t i = 0; i < ezstream->nb_headers; i++) {
-    nghttp2_rcbuf_decref(ezstream->header_rcbufs[i][0]);
-    nghttp2_rcbuf_decref(ezstream->header_rcbufs[i][1]);
+    ezstream->ops->hdr_decref(ezstream->header_refs[i][0]);
+    ezstream->ops->hdr_decref(ezstream->header_refs[i][1]);
   }
 
   grpc_message *msg;

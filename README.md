@@ -8,7 +8,8 @@
 
 ## Highlights
 
-- **Server & Client**: Full gRPC server (`grpc_server`) and lightweight HTTP/2 client (`grpc_client`) over IPv4, IPv6, ephemeral ports, and Unix Domain Sockets / named pipes.
+- **Server & Client**: Full gRPC server (`grpc_server`) and lightweight client (`grpc_client`) over IPv4, IPv6, ephemeral ports, and Unix Domain Sockets / named pipes.
+- **HTTP/2 and HTTP/3**: gRPC over HTTP/3 (QUIC, via ngtcp2 and nghttp3) on the server and the client, side by side with HTTP/2, with Alt-Svc advertisement and Retry address validation. Supported on every QUIC-capable TLS backend; see [HTTP/3](docs/http3.md).
 - **All 4 RPC Modes & gRPC-Web**: Unary, server-streaming, client-streaming, bidirectional streaming, poll-driven events, catch-all fallback routing, and native `application/grpc-web` / `grpc-web-text`.
 - **TLS, mTLS & Hot-Reload**: 7 TLS backends (OpenSSL, LibreSSL, BoringSSL, AWS-LC, wolfSSL, GnuTLS, rustls), file or in-memory PEMs, client cert verification, and zero-downtime `grpc_server_reload_tls()`.
 - **Production HTTP/2 Controls**: Keepalive `PING`, idle & connection-age `GOAWAY`, ping-strike protection (`ENHANCE_YOUR_CALM`), per-stream send backpressure (`max_send_queue_bytes` / `on_writable`), and graceful `grpc_server_drain()`.

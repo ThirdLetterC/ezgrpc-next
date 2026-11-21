@@ -15,6 +15,7 @@
 #include <wolfssl/ssl.h>
 #include "core.h"
 #include "internal_tls.h"
+#include "internal_tls_wolfssl.h"
 
 #if !defined(HAVE_ALPN)
 #error "wolfSSL is built without ALPN, which HTTP/2 requires. Rebuild it with --enable-alpn."
@@ -62,6 +63,48 @@ static int io_send([[maybe_unused]] WOLFSSL *ssl, char *buf, int sz, void *ctx) 
   return tls_io_push(&tls->io, buf, (size_t)sz) ? WOLFSSL_CBIO_ERR_GENERAL : sz;
 }
 
+/* Loads the server certificate chain and key from cfg (PEM text or files), checks that they
+ * match (unless wolfSSL is built without that check), and, when a CA is configured, enables
+ * client certificate verification. Shared with the QUIC context in grpc_quic_tls_wolfssl.c.
+ * Returns false if anything fails to load. */
+bool tls_wolfssl_load_server_credentials(WOLFSSL_CTX *ctx, const grpc_tls_config *cfg) {
+  bool ok = false;
+  if (cfg->cert_pem != nullptr && cfg->key_pem != nullptr) {
+    ok = wolfSSL_CTX_use_certificate_chain_buffer(ctx, (const unsigned char *)cfg->cert_pem,
+                                                  (long)cfg->cert_pem_len) == WOLFSSL_SUCCESS &&
+         wolfSSL_CTX_use_PrivateKey_buffer(ctx, (const unsigned char *)cfg->key_pem,
+                                           (long)cfg->key_pem_len,
+                                           WOLFSSL_FILETYPE_PEM) == WOLFSSL_SUCCESS;
+  } else if (cfg->cert_file != nullptr && cfg->key_file != nullptr) {
+    ok = wolfSSL_CTX_use_certificate_chain_file(ctx, cfg->cert_file) == WOLFSSL_SUCCESS &&
+         wolfSSL_CTX_use_PrivateKey_file(ctx, cfg->key_file, WOLFSSL_FILETYPE_PEM) ==
+             WOLFSSL_SUCCESS;
+  }
+  if (!ok
+#if !defined(NO_CHECK_PRIVATE_KEY)
+      || wolfSSL_CTX_check_private_key(ctx) != WOLFSSL_SUCCESS
+#endif
+  ) {
+    return false;
+  }
+
+  if (cfg->ca_file != nullptr || cfg->ca_pem != nullptr) {
+    bool ca_ok =
+        cfg->ca_file != nullptr
+            ? wolfSSL_CTX_load_verify_locations(ctx, cfg->ca_file, nullptr) == WOLFSSL_SUCCESS
+            : wolfSSL_CTX_load_verify_buffer(ctx, (const unsigned char *)cfg->ca_pem,
+                                             (long)cfg->ca_pem_len,
+                                             WOLFSSL_FILETYPE_PEM) == WOLFSSL_SUCCESS;
+    if (!ca_ok)
+      return false;
+    int mode =
+        WOLFSSL_VERIFY_PEER | (cfg->require_client_cert ? WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT : 0);
+    wolfSSL_CTX_set_verify(ctx, mode, nullptr);
+  }
+
+  return true;
+}
+
 /* Creates a server WOLFSSL_CTX from `cfg`: TLS 1.2 minimum, the certificate chain and key from PEM
  * buffers (preferred when both are set) or from files, checked to match each other unless wolfSSL
  * is built with NO_CHECK_PRIVATE_KEY. With a CA file or PEM, client certificates are verified, and
@@ -83,41 +126,9 @@ grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg) {
     return nullptr;
   }
 
-  bool ok = false;
-  if (cfg->cert_pem != nullptr && cfg->key_pem != nullptr) {
-    ok = wolfSSL_CTX_use_certificate_chain_buffer(ctx, (const unsigned char *)cfg->cert_pem,
-                                                  (long)cfg->cert_pem_len) == WOLFSSL_SUCCESS &&
-         wolfSSL_CTX_use_PrivateKey_buffer(ctx, (const unsigned char *)cfg->key_pem,
-                                           (long)cfg->key_pem_len,
-                                           WOLFSSL_FILETYPE_PEM) == WOLFSSL_SUCCESS;
-  } else if (cfg->cert_file != nullptr && cfg->key_file != nullptr) {
-    ok = wolfSSL_CTX_use_certificate_chain_file(ctx, cfg->cert_file) == WOLFSSL_SUCCESS &&
-         wolfSSL_CTX_use_PrivateKey_file(ctx, cfg->key_file, WOLFSSL_FILETYPE_PEM) ==
-             WOLFSSL_SUCCESS;
-  }
-  if (!ok
-#if !defined(NO_CHECK_PRIVATE_KEY)
-      || wolfSSL_CTX_check_private_key(ctx) != WOLFSSL_SUCCESS
-#endif
-  ) {
+  if (!tls_wolfssl_load_server_credentials(ctx, cfg)) {
     wolfSSL_CTX_free(ctx);
     return nullptr;
-  }
-
-  if (cfg->ca_file != nullptr || cfg->ca_pem != nullptr) {
-    bool ca_ok =
-        cfg->ca_file != nullptr
-            ? wolfSSL_CTX_load_verify_locations(ctx, cfg->ca_file, nullptr) == WOLFSSL_SUCCESS
-            : wolfSSL_CTX_load_verify_buffer(ctx, (const unsigned char *)cfg->ca_pem,
-                                             (long)cfg->ca_pem_len,
-                                             WOLFSSL_FILETYPE_PEM) == WOLFSSL_SUCCESS;
-    if (!ca_ok) {
-      wolfSSL_CTX_free(ctx);
-      return nullptr;
-    }
-    int mode =
-        WOLFSSL_VERIFY_PEER | (cfg->require_client_cert ? WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT : 0);
-    wolfSSL_CTX_set_verify(ctx, mode, nullptr);
   }
 
   wolfSSL_CTX_SetIORecv(ctx, io_recv);

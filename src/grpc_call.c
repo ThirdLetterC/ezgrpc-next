@@ -1,8 +1,8 @@
 /* grpc_call.c - calls: their lifetime, dispatch and the call API
  *
- * A grpc_call is the server-side state of one RPC: the request headers retained from nghttp2,
+ * A grpc_call is the server-side state of one RPC: the request headers retained from the transport,
  * the received messages not yet delivered, the response headers and trailers being built, and
- * the application's userdata. Calls are refcounted. The HTTP/2 stream owns the first reference
+ * the application's userdata. Calls are refcounted. The request stream owns the first reference
  * and drops it in call_detach() when the stream goes away; the ready queue, each grpc_event and
  * each posted async op hold their own. A call can therefore outlive its stream: once detached
  * (call->stream == nullptr) the response functions fail with GRPC_ERR_CLOSED.
@@ -11,11 +11,13 @@
  * grpc_call_unref() and the *_async functions. Those copy their arguments and post a task with
  * grpc_server_post() that replays the synchronous function on the server thread.
  *
- * Dispatch: the nghttp2 callbacks append received messages to call->pending and put the call on
+ * Dispatch: grpc_stream_core.c (fed by the HTTP/2 or HTTP/3 transport) appends received messages
+ * to call->pending and puts the call on
  * the server's ready queue with call_queue(); cancellation does the same. server_dispatch() then
  * delivers each ready call to its route (unary handler, stream handler or grpc_event entries),
- * running the interceptors on the way. Responses are queued on the stream and written by the
- * nghttp2 data provider (data_source_read_callback2) when the session is flushed.
+ * running the interceptors on the way. Responses are queued on the stream and handed to the
+ * transport through session->ops; the transport pulls the body with stream_core_pull() when the
+ * session is flushed.
  *
  * Copyright (c) 2023-2025 M. N. Yoshie & Al-buharie Amjari
  *
@@ -49,7 +51,6 @@
 
 #include "core.h"
 #include "internal_helpers.h"
-#include "internal_nghttp2_callbacks.h"
 #include "grpc_timeout.h"
 
 /* ---- header lists ------------------------------------------------------------ */
@@ -60,7 +61,7 @@ static grpc_err nv_list_add(nv_list *list, const char *name, size_t namelen, con
                             size_t valuelen) {
   if (list->len == list->cap) {
     size_t cap = list->cap ? list->cap * 2 : 4;
-    nghttp2_nv *nva = grpc_realloc(list->nva, cap * sizeof(*nva));
+    grpc_nv *nva = grpc_realloc(list->nva, cap * sizeof(*nva));
     if (nva == nullptr)
       return GRPC_ERR_NOMEM;
     list->nva = nva;
@@ -74,12 +75,12 @@ static grpc_err nv_list_add(nv_list *list, const char *name, size_t namelen, con
   block[namelen] = '\0';
   memcpy(block + namelen + 1, value, valuelen);
   block[namelen + 1 + valuelen] = '\0';
-  list->nva[list->len++] = (nghttp2_nv){
+  list->nva[list->len++] = (grpc_nv){
       .name = block,
       .namelen = namelen,
       .value = block + namelen + 1,
       .valuelen = valuelen,
-      .flags = NGHTTP2_NV_FLAG_NONE,
+      .flags = 0,
   };
   return GRPC_OK;
 }
@@ -117,11 +118,11 @@ static grpc_err nv_list_add_metadata(nv_list *list, const grpc_metadata *metadat
 /* Copies `nva` (the array and every name and value) into a single grpc_malloc() block, so one
  * grpc_free() releases it. Names and values are not NUL-terminated in the copy. Returns nullptr
  * on allocation failure. */
-static nghttp2_nv *nva_dup(const nghttp2_nv *nva, size_t nvlen) {
+static grpc_nv *nva_dup(const grpc_nv *nva, size_t nvlen) {
   size_t size = nvlen * sizeof(*nva);
   for (size_t i = 0; i < nvlen; i++)
     size += nva[i].namelen + nva[i].valuelen;
-  nghttp2_nv *copy = grpc_malloc(size);
+  grpc_nv *copy = grpc_malloc(size);
   if (copy == nullptr)
     return nullptr;
   u8 *p = (u8 *)(copy + nvlen);
@@ -154,8 +155,8 @@ static void call_free(grpc_call *call) {
   nv_list_free(&call->headers);
   nv_list_free(&call->trailers);
   for (size_t i = 0; i < call->nb_req_headers; i++) {
-    nghttp2_rcbuf_decref(call->req_header_rcbufs[i][0]);
-    nghttp2_rcbuf_decref(call->req_header_rcbufs[i][1]);
+    call->ops->hdr_decref(call->req_header_refs[i][0]);
+    call->ops->hdr_decref(call->req_header_refs[i][1]);
   }
   if (call->userdata_free != nullptr)
     call->userdata_free(call->userdata);
@@ -163,16 +164,18 @@ static void call_free(grpc_call *call) {
   grpc_free(call);
 }
 
-/* Copies the stream's header table into the call and takes a reference on each nghttp2 rcbuf,
- * so the names and values stay valid after the stream is freed without copying them. The
- * references are dropped in call_free(). */
+/* Copies the stream's header table into the call and takes a reference on each transport header
+ * buffer (nghttp2/nghttp3 rcbuf), so the names and values stay valid after the stream and its
+ * session are freed without copying them. The references are dropped in call_free() through
+ * call->ops. */
 static void retain_request_headers(grpc_call *call, const grpc_stream *stream) {
+  call->ops = stream->ops;
   for (size_t i = 0; i < stream->nb_headers; i++) {
     call->req_headers[i] = stream->headers[i];
-    call->req_header_rcbufs[i][0] = stream->header_rcbufs[i][0];
-    call->req_header_rcbufs[i][1] = stream->header_rcbufs[i][1];
-    nghttp2_rcbuf_incref(call->req_header_rcbufs[i][0]);
-    nghttp2_rcbuf_incref(call->req_header_rcbufs[i][1]);
+    call->req_header_refs[i][0] = stream->header_refs[i][0];
+    call->req_header_refs[i][1] = stream->header_refs[i][1];
+    stream->ops->hdr_incref(call->req_header_refs[i][0]);
+    stream->ops->hdr_incref(call->req_header_refs[i][1]);
   }
   call->nb_req_headers = stream->nb_headers;
 }
@@ -382,18 +385,16 @@ static char *encode_grpc_message(const char *message, size_t *len) {
   return out;
 }
 
-/* Builds an nghttp2_nv from two string literals, so sizeof() gives their lengths at compile
- * time. */
-#define NGHTTP2_NV(name, value)                                                             \
-  ((nghttp2_nv){(uint8_t *)(name), (uint8_t *)(value), sizeof(name) - 1, sizeof(value) - 1, \
-                NGHTTP2_NV_FLAG_NONE})
+/* Builds a grpc_nv from two string literals, so sizeof() gives their lengths at compile time. */
+#define GRPC_NV(name, value) \
+  ((grpc_nv){(uint8_t *)(name), (uint8_t *)(value), sizeof(name) - 1, sizeof(value) - 1, 0})
 
 /* Submits the response HEADERS: :status, content-type (grpc, grpc-web or grpc-web-text),
  * grpc-accept-encoding with the codecs compiled in, grpc-encoding unless call->compression is
  * identity, the CORS headers for gRPC-Web, the application's metadata and `extra` (the trailers of
- * a Trailers-Only response, sent with NGHTTP2_FLAG_END_STREAM in `flags`). On success marks the
- * headers as sent and frees call->headers. Requires a live stream. */
-static grpc_err submit_response_headers(grpc_call *call, uint8_t flags, const nghttp2_nv *extra,
+ * a Trailers-Only response, sent with `end_stream`). On success marks the headers as sent and
+ * frees call->headers. Requires a live stream. */
+static grpc_err submit_response_headers(grpc_call *call, bool end_stream, const grpc_nv *extra,
                                         size_t nb_extra) {
 #if defined(GRPC_ENABLE_ZLIB)
 #define ACCEPT_ZLIB "gzip,deflate,"
@@ -413,15 +414,15 @@ static grpc_err submit_response_headers(grpc_call *call, uint8_t flags, const ng
   const char *ctype = call->is_grpc_web_text ? "application/grpc-web-text"
                       : call->is_grpc_web    ? "application/grpc-web"
                                              : "application/grpc";
-  nghttp2_nv base[] = {
-      NGHTTP2_NV(":status", "200"),
-      {(uint8_t *)"content-type", (uint8_t *)ctype, 12, strlen(ctype), NGHTTP2_NV_FLAG_NONE},
+  grpc_nv base[] = {
+      GRPC_NV(":status", "200"),
+      {(uint8_t *)"content-type", (uint8_t *)ctype, 12, strlen(ctype), 0},
       {(uint8_t *)"grpc-accept-encoding", (uint8_t *)accepted, sizeof("grpc-accept-encoding") - 1,
-       0, NGHTTP2_NV_FLAG_NONE},
-      NGHTTP2_NV("grpc-encoding", "gzip"),
-      NGHTTP2_NV("access-control-allow-origin", "*"),
-      NGHTTP2_NV("access-control-expose-headers",
-                 "grpc-status, grpc-message, grpc-status-details-bin"),
+       0, 0},
+      GRPC_NV("grpc-encoding", "gzip"),
+      GRPC_NV("access-control-allow-origin", "*"),
+      GRPC_NV("access-control-expose-headers",
+              "grpc-status, grpc-message, grpc-status-details-bin"),
   };
   const char *encoding = "gzip";
   switch (call->compression) {
@@ -442,8 +443,14 @@ static grpc_err submit_response_headers(grpc_call *call, uint8_t flags, const ng
   base[3].valuelen = strlen(encoding);
   size_t nb_base = call->compression != GRPC_COMPRESS_IDENTITY ? 4 : 3;
   size_t nb_cors = call->is_grpc_web ? 2 : 0;
-  size_t total = nb_base + nb_cors + call->headers.len + nb_extra;
-  nghttp2_nv *nva = grpc_malloc(total * sizeof(*nva));
+  /* HTTP/2 responses advertise the HTTP/3 listener when configured (http3.advertise_alt_svc) */
+  const char *alt_svc = call->server->alt_svc;
+  size_t nb_alt = alt_svc[0] != '\0' && call->session->ops->submit_headers != nullptr &&
+                          strcmp(call->session->ops->name, "h2") == 0
+                      ? 1
+                      : 0;
+  size_t total = nb_base + nb_cors + nb_alt + call->headers.len + nb_extra;
+  grpc_nv *nva = grpc_malloc(total * sizeof(*nva));
   if (nva == nullptr)
     return GRPC_ERR_NOMEM;
   size_t off = 0;
@@ -453,6 +460,8 @@ static grpc_err submit_response_headers(grpc_call *call, uint8_t flags, const ng
     memcpy(nva + off, &base[4], nb_cors * sizeof(*nva));
     off += nb_cors;
   }
+  if (nb_alt > 0)
+    nva[off++] = (grpc_nv){(uint8_t *)"alt-svc", (uint8_t *)alt_svc, 7, strlen(alt_svc), 0};
   if (call->headers.len > 0) {
     memcpy(nva + off, call->headers.nva, call->headers.len * sizeof(*nva));
     off += call->headers.len;
@@ -460,8 +469,7 @@ static grpc_err submit_response_headers(grpc_call *call, uint8_t flags, const ng
   if (nb_extra > 0)
     memcpy(nva + off, extra, nb_extra * sizeof(*nva));
 
-  int res = nghttp2_submit_headers(call->session->ngsession, flags, call->stream_id, nullptr, nva,
-                                   total, nullptr);
+  int res = call->session->ops->submit_headers(call->session, call->stream, nva, total, end_stream);
   grpc_free(nva);
   if (res != 0)
     return GRPC_ERR_PROTOCOL;
@@ -470,7 +478,7 @@ static grpc_err submit_response_headers(grpc_call *call, uint8_t flags, const ng
   return GRPC_OK;
 }
 
-#undef NGHTTP2_NV
+#undef GRPC_NV
 
 /* Ends the call: sends grpc-status, grpc-message (defaulting to the status name when `message`
  * is null and the status is not OK) and the application's trailers. Depending on what was sent:
@@ -500,17 +508,15 @@ static grpc_err call_finish_internal(grpc_call *call, grpc_status status, const 
 
   /* grpc-status, grpc-message and the application's trailers */
   size_t total = 1 + (encoded != nullptr) + call->trailers.len;
-  nghttp2_nv *nva = grpc_malloc(total * sizeof(*nva));
+  grpc_nv *nva = grpc_malloc(total * sizeof(*nva));
   if (nva == nullptr) {
     grpc_free(encoded);
     return GRPC_ERR_NOMEM;
   }
   size_t n = 0;
-  nva[n++] = (nghttp2_nv){(uint8_t *)"grpc-status", (uint8_t *)grpc_status, 11, (size_t)status_len,
-                          NGHTTP2_NV_FLAG_NONE};
+  nva[n++] = (grpc_nv){(uint8_t *)"grpc-status", (uint8_t *)grpc_status, 11, (size_t)status_len, 0};
   if (encoded != nullptr)
-    nva[n++] = (nghttp2_nv){(uint8_t *)"grpc-message", (uint8_t *)encoded, 12, message_len,
-                            NGHTTP2_NV_FLAG_NONE};
+    nva[n++] = (grpc_nv){(uint8_t *)"grpc-message", (uint8_t *)encoded, 12, message_len, 0};
   if (call->trailers.len > 0)
     memcpy(nva + n, call->trailers.nva, call->trailers.len * sizeof(*nva));
   n += call->trailers.len;
@@ -520,7 +526,7 @@ static grpc_err call_finish_internal(grpc_call *call, grpc_status status, const 
   if (call->is_grpc_web) {
     /* gRPC-Web encodes trailers inside a DATA frame with flag byte 0x80. */
     if (!call->headers_sent)
-      err = submit_response_headers(call, NGHTTP2_FLAG_NONE, nullptr, 0);
+      err = submit_response_headers(call, false, nullptr, 0);
     if (err == GRPC_OK) {
       grpc_buf tbuf = {0};
       for (size_t i = 0; i < n; i++) {
@@ -566,12 +572,7 @@ static grpc_err call_finish_internal(grpc_call *call, grpc_status status, const 
             grpc_message_free(tmsg);
             err = GRPC_ERR_NOMEM;
           } else if (!stream->is_data_active) {
-            nghttp2_data_provider data_provider = {
-                .source.ptr = stream,
-                .read_callback = data_source_read_callback2,
-            };
-            if (nghttp2_submit_data(call->session->ngsession, NGHTTP2_FLAG_END_STREAM,
-                                    call->stream_id, &data_provider) != 0)
+            if (call->session->ops->start_data(call->session, stream) != 0)
               err = GRPC_ERR_PROTOCOL;
             else
               stream->is_data_active = true;
@@ -582,7 +583,7 @@ static grpc_err call_finish_internal(grpc_call *call, grpc_status status, const 
     }
   } else if (!call->headers_sent) {
     /* nothing was sent: a single Trailers-Only HEADERS */
-    err = submit_response_headers(call, NGHTTP2_FLAG_END_STREAM, nva, n);
+    err = submit_response_headers(call, true, nva, n);
   } else if (stream->is_data_active) {
     /* the trailers must not overtake the queued DATA. the data provider
      * submits them once it has written the last message */
@@ -590,7 +591,7 @@ static grpc_err call_finish_internal(grpc_call *call, grpc_status status, const 
     stream->nb_pending_trailers = n;
     if (stream->pending_trailers == nullptr)
       err = GRPC_ERR_NOMEM;
-  } else if (nghttp2_submit_trailer(call->session->ngsession, call->stream_id, nva, n) != 0) {
+  } else if (call->session->ops->submit_trailers(call->session, stream, nva, n) != 0) {
     err = GRPC_ERR_PROTOCOL;
   }
   grpc_free(nva);
@@ -712,7 +713,7 @@ GRPC_API grpc_err grpc_call_send(grpc_call *call, grpc_message *message) {
 
   if (!call->headers_sent) {
     call->compression = message->cflag ? message->compression : GRPC_COMPRESS_IDENTITY;
-    err = submit_response_headers(call, NGHTTP2_FLAG_NONE, nullptr, 0);
+    err = submit_response_headers(call, false, nullptr, 0);
     if (err != GRPC_OK) {
       grpc_message_free(message);
       return err;
@@ -759,12 +760,7 @@ GRPC_API grpc_err grpc_call_send(grpc_call *call, grpc_message *message) {
 
   /* an active data provider picks up the new message by itself */
   if (!stream->is_data_active) {
-    nghttp2_data_provider data_provider = {
-        .source.ptr = stream,
-        .read_callback = data_source_read_callback2,
-    };
-    if (nghttp2_submit_data(call->session->ngsession, NGHTTP2_FLAG_END_STREAM, call->stream_id,
-                            &data_provider) != 0)
+    if (call->session->ops->start_data(call->session, stream) != 0)
       return GRPC_ERR_PROTOCOL;
     stream->is_data_active = true;
   }

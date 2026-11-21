@@ -14,6 +14,7 @@
 #include <gnutls/x509.h>
 #include "core.h"
 #include "internal_tls.h"
+#include "internal_tls_gnutls.h"
 
 /* Server context. verify_client is set when a CA is configured. */
 struct grpc_tls_ctx {
@@ -69,6 +70,39 @@ static ssize_t io_push(gnutls_transport_ptr_t ptr, const void *buf, size_t len) 
   return (ssize_t)len;
 }
 
+/* Loads the server certificate chain and key from cfg (PEM text or files) into cred, and the CA
+ * used to verify client certificates when one is configured. Shared with the QUIC context in
+ * grpc_quic_tls_gnutls.c. Returns false if anything fails to load. */
+bool tls_gnutls_load_server_credentials(gnutls_certificate_credentials_t cred,
+                                        const grpc_tls_config *cfg) {
+  int key_res = -1;
+  if (cfg->cert_pem != nullptr && cfg->key_pem != nullptr) {
+    gnutls_datum_t c = {.data = (unsigned char *)cfg->cert_pem,
+                        .size = (unsigned int)cfg->cert_pem_len};
+    gnutls_datum_t k = {.data = (unsigned char *)cfg->key_pem,
+                        .size = (unsigned int)cfg->key_pem_len};
+    key_res = gnutls_certificate_set_x509_key_mem(cred, &c, &k, GNUTLS_X509_FMT_PEM);
+  } else if (cfg->cert_file != nullptr && cfg->key_file != nullptr) {
+    key_res = gnutls_certificate_set_x509_key_file(cred, cfg->cert_file, cfg->key_file,
+                                                   GNUTLS_X509_FMT_PEM);
+  }
+  if (key_res < 0)
+    return false;
+  if (cfg->ca_file != nullptr || cfg->ca_pem != nullptr) {
+    int ca_res;
+    if (cfg->ca_file != nullptr) {
+      ca_res = gnutls_certificate_set_x509_trust_file(cred, cfg->ca_file, GNUTLS_X509_FMT_PEM);
+    } else {
+      gnutls_datum_t ca = {.data = (unsigned char *)cfg->ca_pem,
+                           .size = (unsigned int)cfg->ca_pem_len};
+      ca_res = gnutls_certificate_set_x509_trust_mem(cred, &ca, GNUTLS_X509_FMT_PEM);
+    }
+    if (ca_res <= 0)
+      return false;
+  }
+  return true;
+}
+
 /* Creates the server context from `cfg`: the certificate and key from PEM buffers (preferred when
  * both are set) or from files, and a priority cache that allows only TLS 1.2 and 1.3. With a CA
  * file or PEM, the trust list is loaded (at least one certificate is required) and client
@@ -85,36 +119,13 @@ grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg) {
     tls_backend_ctx_free(ctx);
     return nullptr;
   }
-  int key_res = -1;
-  if (cfg->cert_pem != nullptr && cfg->key_pem != nullptr) {
-    gnutls_datum_t c = {.data = (unsigned char *)cfg->cert_pem,
-                        .size = (unsigned int)cfg->cert_pem_len};
-    gnutls_datum_t k = {.data = (unsigned char *)cfg->key_pem,
-                        .size = (unsigned int)cfg->key_pem_len};
-    key_res = gnutls_certificate_set_x509_key_mem(ctx->cred, &c, &k, GNUTLS_X509_FMT_PEM);
-  } else if (cfg->cert_file != nullptr && cfg->key_file != nullptr) {
-    key_res = gnutls_certificate_set_x509_key_file(ctx->cred, cfg->cert_file, cfg->key_file,
-                                                   GNUTLS_X509_FMT_PEM);
-  }
-  if (key_res < 0 ||
+  if (!tls_gnutls_load_server_credentials(ctx->cred, cfg) ||
       gnutls_priority_init(&ctx->priority, "NORMAL:-VERS-ALL:+VERS-TLS1.3:+VERS-TLS1.2", nullptr) <
           0) {
     tls_backend_ctx_free(ctx);
     return nullptr;
   }
   if (cfg->ca_file != nullptr || cfg->ca_pem != nullptr) {
-    int ca_res;
-    if (cfg->ca_file != nullptr) {
-      ca_res = gnutls_certificate_set_x509_trust_file(ctx->cred, cfg->ca_file, GNUTLS_X509_FMT_PEM);
-    } else {
-      gnutls_datum_t ca = {.data = (unsigned char *)cfg->ca_pem,
-                           .size = (unsigned int)cfg->ca_pem_len};
-      ca_res = gnutls_certificate_set_x509_trust_mem(ctx->cred, &ca, GNUTLS_X509_FMT_PEM);
-    }
-    if (ca_res <= 0) {
-      tls_backend_ctx_free(ctx);
-      return nullptr;
-    }
     ctx->verify_client = true;
     ctx->require_client_cert = cfg->require_client_cert;
   }

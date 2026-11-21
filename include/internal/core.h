@@ -3,9 +3,14 @@
 /* core.h - the library's internal data model
  *
  * Defines the private structs behind the public handles (grpc_server, grpc_call) and the
- * transport state under them: grpc_session (one connection) and grpc_stream (one HTTP/2 stream),
- * plus routes, buffers and the internal functions shared between source files. Every source
- * file in src/ includes it.
+ * transport state under them: grpc_session (one connection) and grpc_stream (one HTTP/2 or HTTP/3
+ * request stream), plus routes, buffers and the internal functions shared between source files.
+ * Every source file in src/ includes it.
+ *
+ * Transports: the call layer never calls nghttp2/nghttp3 directly. Each session carries a
+ * grpc_transport_ops table (HTTP/2 in internal_nghttp2_callbacks.c, HTTP/3 in
+ * grpc_http3_server.c) and the transport-independent request handling lives in
+ * grpc_stream_core.c.
  *
  * Threading: everything is owned by the server loop thread, except the atomics (call refcount,
  * stop flag, log level, statistics) and the grpc_server_post() queue guarded by post_mutex.
@@ -97,10 +102,63 @@ struct grpc_route {
 typedef struct grpc_stream grpc_stream;
 typedef struct grpc_session grpc_session;
 
+/* A header field to send, laid out exactly like nghttp2_nv and nghttp3_nv (checked with
+ * static_assert in each transport) so arrays can be passed to either library without copying. */
+typedef struct grpc_nv grpc_nv;
+struct grpc_nv {
+  uint8_t *name;
+  uint8_t *value;
+  size_t namelen;
+  size_t valuelen;
+  uint8_t flags;
+};
+
+/* Why a transport should reset a request stream (mapped to the protocol's error code). */
+typedef enum grpc_reset_reason {
+  GRPC_RESET_PROTOCOL_ERROR,
+  GRPC_RESET_INTERNAL_ERROR,
+} grpc_reset_reason;
+
+/* What the call layer and grpc_stream_core.c need from a transport. Every function runs on the
+ * loop thread; the int-returning ones return 0 on success and nonzero on failure. Frames are only
+ * queued; the session flush sends them. */
+typedef struct grpc_transport_ops grpc_transport_ops;
+struct grpc_transport_ops {
+  /* "h2" or "h3", for logs. */
+  const char *name;
+  /* Queue response headers; end_stream makes them the last frame (trailers-only, 204, 415). */
+  int (*submit_headers)(grpc_session *session, grpc_stream *stream, const grpc_nv *nva,
+                        size_t nvlen, bool end_stream);
+  /* Start sending the stream's queued messages; the transport pulls them with
+   * stream_core_pull() until it reports EOF. Called only while stream->is_data_active is false. */
+  int (*start_data)(grpc_session *session, grpc_stream *stream);
+  /* Queue the trailers, ending the stream. Never called while data is active. */
+  int (*submit_trailers)(grpc_session *session, grpc_stream *stream, const grpc_nv *nva,
+                         size_t nvlen);
+  /* Reset the stream (RST_STREAM / RESET_STREAM). */
+  void (*reset_stream)(grpc_session *session, grpc_stream *stream, grpc_reset_reason reason);
+  /* Take / drop a reference on a received header buffer (nghttp2_rcbuf / nghttp3_rcbuf). The
+   * buffers are NUL-terminated and outlive the session while referenced. */
+  void (*hdr_incref)(void *ref);
+  void (*hdr_decref)(void *ref);
+
+  /* Session-level operations, used by the maintenance timer, drain and the flush/close paths. */
+  /* Queue a graceful shutdown notice (HTTP/2 GOAWAY NO_ERROR / HTTP/3 GOAWAY): no new streams,
+   * running ones may finish. */
+  void (*goaway)(grpc_session *session);
+  /* Queue a keepalive ping; 0 if one was queued. nullptr when the transport keeps the
+   * connection alive by itself (QUIC). */
+  int (*ping)(grpc_session *session);
+  /* Write pending output / tear the connection down. nullptr selects the TCP implementation in
+   * internal_helpers.c (session_flush() / session_close()). */
+  void (*flush)(grpc_session *session);
+  void (*close)(grpc_session *session);
+};
+
 /* An owned list of response headers. */
 typedef struct nv_list nv_list;
 struct nv_list {
-  nghttp2_nv *nva;
+  grpc_nv *nva;
   size_t len;
   size_t cap;
 };
@@ -112,10 +170,12 @@ struct grpc_call {
   grpc_server *server;
   grpc_route *route;
 
-  /* The HTTP/2 stream, until it closes. */
+  /* The request stream, until it closes. */
   grpc_session *session;
   grpc_stream *stream;
-  i32 stream_id;
+  int64_t stream_id;
+  /* The transport that owns the retained header buffers (they outlive the session). */
+  const grpc_transport_ops *ops;
 
   u64 start_ms;
   /* The client's deadline; 0 means there is none. */
@@ -123,9 +183,9 @@ struct grpc_call {
   char peer[INET6_ADDRSTRLEN + 8];
   char peer_cert_subject[256];
 
-  /* Header views and nghttp2 refs retained for the call lifetime. */
+  /* Header views and transport buffer refs retained for the call lifetime. */
   grpc_header req_headers[CONFIG_STREAM_MAX_HEADERS];
-  nghttp2_rcbuf *req_header_rcbufs[CONFIG_STREAM_MAX_HEADERS][2];
+  void *req_header_refs[CONFIG_STREAM_MAX_HEADERS][2];
   size_t nb_req_headers;
 
   /* Received messages not yet delivered to the application. */
@@ -180,19 +240,20 @@ struct grpc_call {
 /* Small request messages are buffered inside the stream. */
 enum { GRPC_STREAM_INLINE_RECV = 256 };
 
-/* Transport state of one HTTP/2 stream: request headers, receive buffer and outgoing message
- * queue. Owned by its session and freed when nghttp2 closes the stream. */
+/* Transport state of one request stream: request headers, receive buffer and outgoing message
+ * queue. Owned by its session and freed when the transport closes the stream. */
 struct grpc_stream {
-  i32 stream_id;
+  int64_t stream_id;
+  const grpc_transport_ops *ops;
 
   /* Intrusive links in grpc_session.streams. */
   grpc_stream *prev;
   grpc_stream *next;
 
   size_t nb_headers;
-  /* Names and values point into the nghttp2 buffers held by header_rcbufs. */
+  /* Names and values point into the transport buffers held by header_refs. */
   grpc_header headers[CONFIG_STREAM_MAX_HEADERS];
-  nghttp2_rcbuf *header_rcbufs[CONFIG_STREAM_MAX_HEADERS][2];
+  void *header_refs[CONFIG_STREAM_MAX_HEADERS][2];
 
   bool is_method_post : 1;
   bool is_method_options : 1;
@@ -241,13 +302,17 @@ struct grpc_stream {
 
   /* Trailers submitted while DATA is queued. They are sent after the data
    * provider reaches EOF so they cannot overtake the DATA. */
-  nghttp2_nv *pending_trailers;
+  grpc_nv *pending_trailers;
   size_t nb_pending_trailers;
+
+  /* Transport-private per-stream state (HTTP/3 send buffers). */
+  void *transport;
 };
 
 /* One client connection: socket handle, optional TLS session, nghttp2 session and its streams.
  * Lives in a slot of grpc_server.sessions that is reused after the connection closes. */
 struct grpc_session {
+  const grpc_transport_ops *ops;
   nghttp2_session *ngsession;
   /* Index in grpc_server.sessions. */
   size_t index;
@@ -268,6 +333,9 @@ struct grpc_session {
   struct grpc_tls_session *tls;
   bool is_tls : 1;
   bool tls_handshake_done : 1;
+
+  /* The QUIC connection of an HTTP/3 session (grpc_http3_server.c); nullptr for TCP sessions. */
+  struct grpc_quic_conn *quic;
 
   union {
     uv_tcp_t tcp;
@@ -422,6 +490,11 @@ struct grpc_server {
   struct grpc_tls_ctx *tls_ctx;
   struct grpc_tls_ctx **retired_tls_ctxs;
   size_t nb_retired_tls_ctxs;
+
+  /* HTTP/3 listener state (grpc_http3_server.c), when config.http3.enable. */
+  struct grpc_h3_server *h3;
+  /* Value of the alt-svc header added to HTTP/2 responses ("" = none). */
+  char alt_svc[24];
 };
 
 /* ---- internal functions ------------------------------------------------------ */

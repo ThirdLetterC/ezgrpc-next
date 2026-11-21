@@ -104,6 +104,7 @@ cc my_app.c $(pkg-config --cflags --libs ezgrpc-next)
 | `-DGRPC_ALLOCATOR=<name>` | `default`, `mimalloc`, or `jemalloc` |
 | `-DGRPC_TLS_BACKEND=<name>` | `AUTO`, `openssl`, `libressl`, `boringssl`, `awslc`, `wolfssl`, `gnutls`, `rustls`, or `none` |
 | `-DGRPC_TLS_PREFIX=<dir>` | Search prefix for a custom TLS backend build |
+| `-DGRPC_HTTP3=AUTO\|ON\|OFF` | HTTP/3 (QUIC) server and client; needs ngtcp2, nghttp3 and a QUIC-capable TLS backend (see [HTTP/3](http3.md)) |
 | `-DGRPC_PROTOBUF_C=AUTO\|ON\|OFF` | Protobuf-C helper support |
 | `-DGRPC_FLATCC=AUTO\|ON\|OFF` | FlatBuffers (`flatcc`) helper support |
 | `-DGRPC_FLATCC_PREFIX=<dir>` | Search prefix for `flatcc` |

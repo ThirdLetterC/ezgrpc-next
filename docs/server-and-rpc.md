@@ -163,6 +163,8 @@ if (grpc_status_details_decode_all(b64_trailer, &decoded) == GRPC_OK) {
 
 ---
 
+HTTP/3 (QUIC) is an additional transport on UDP next to TCP, enabled with `config.http3`; see [HTTP/3](http3.md).
+
 ## HTTP/2 Keepalive, Connection Limits, Backpressure & Graceful Drain
 
 ```c
