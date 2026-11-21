@@ -56,6 +56,9 @@ struct client_subchannel {
   bool connected;
   bool closed;
   int connect_status;
+  /* set by the connect/handshake deadline timer (config.timeout_ms) */
+  bool connect_deadline_hit;
+  bool handle_close_done;
 
   uv_timer_t timer;
   bool timer_initialized;
@@ -577,6 +580,16 @@ static void on_sub_connect(uv_connect_t *req, int status) {
   s->connected = (status == 0);
 }
 
+static void on_sub_handle_closed(uv_handle_t *handle) {
+  client_subchannel *s = handle->data;
+  s->handle_close_done = true;
+}
+
+static void on_sub_connect_deadline(uv_timer_t *timer) {
+  client_subchannel *s = timer->data;
+  s->connect_deadline_hit = true;
+}
+
 static void on_sub_timeout(uv_timer_t *timer) {
   client_subchannel *s = timer->data;
   if (s->active_stream != nullptr) {
@@ -635,6 +648,12 @@ static grpc_err sub_connect(client_subchannel *s) {
   s->timer.data = s;
   s->timer_initialized = true;
 
+  /* Bound connect + TLS handshake by the default deadline so an unresponsive
+   * peer cannot block the caller forever. */
+  s->connect_deadline_hit = false;
+  if (s->parent->config.timeout_ms > 0)
+    uv_timer_start(&s->timer, on_sub_connect_deadline, s->parent->config.timeout_ms, 0);
+
   uv_connect_t conn_req = {.data = s};
   s->connect_status = -1;
   if (s->is_unix) {
@@ -643,7 +662,7 @@ static grpc_err sub_connect(client_subchannel *s) {
     s->handle.pipe.data = s;
     s->handle_initialized = true;
     uv_pipe_connect(&conn_req, &s->handle.pipe, s->unix_path, on_sub_connect);
-    while (!s->connected && s->connect_status == -1)
+    while (!s->connected && s->connect_status == -1 && !s->connect_deadline_hit)
       uv_run(&s->loop, UV_RUN_ONCE);
     if (!s->connected)
       goto fail_io;
@@ -676,14 +695,21 @@ static grpc_err sub_connect(client_subchannel *s) {
       s->handle.tcp.data = s;
       s->handle_initialized = true;
       if (uv_tcp_connect(&conn_req, &s->handle.tcp, ai->ai_addr, on_sub_connect) == 0) {
-        while (!s->connected && s->connect_status == -1)
+        while (!s->connected && s->connect_status == -1 && !s->connect_deadline_hit)
           uv_run(&s->loop, UV_RUN_ONCE);
         if (s->connected)
           break;
       }
-      uv_close((uv_handle_t *)&s->handle.tcp, nullptr);
-      uv_run(&s->loop, UV_RUN_DEFAULT);
+      /* Closing cancels a pending connect; libuv completes conn_req (on our stack)
+       * before the close callback, so wait for that rather than for the loop to go
+       * idle (the deadline timer keeps it alive). */
+      s->handle_close_done = false;
+      uv_close((uv_handle_t *)&s->handle.tcp, on_sub_handle_closed);
+      while (!s->handle_close_done)
+        uv_run(&s->loop, UV_RUN_ONCE);
       s->handle_initialized = false;
+      if (s->connect_deadline_hit)
+        break;
     }
     if (res != nullptr)
       freeaddrinfo(res);
@@ -749,12 +775,13 @@ static grpc_err sub_connect(client_subchannel *s) {
     ERR_clear_error();
     (void)SSL_do_handshake(s->ssl);
     sub_flush(s);
-    while (!s->tls_handshake_done && !s->closed)
+    while (!s->tls_handshake_done && !s->closed && !s->connect_deadline_hit)
       uv_run(&s->loop, UV_RUN_ONCE);
     if (!s->tls_handshake_done || s->closed)
       goto fail_io;
   }
 #endif
+  uv_timer_stop(&s->timer);
   sub_flush(s);
   return GRPC_OK;
 

@@ -403,6 +403,8 @@ void test_tls_error_isolation(void) {
 #endif
 
 int main(void) {
+  /* unbuffered so a CTest timeout still shows which test was running */
+  setvbuf(stdout, nullptr, _IONBF, 0);
 #ifndef _WIN32
   signal(SIGPIPE, SIG_IGN);
 #endif
