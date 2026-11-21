@@ -59,11 +59,11 @@ static int read_file(const char *path, grpc_buf *out) {
 grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg) {
   if (cfg == nullptr)
     return nullptr;
-  grpc_buf cert = {}, key = {}, ca = {};
+  grpc_buf cert = {0}, key = {0}, ca = {0};
   const struct rustls_certified_key *certified_key = nullptr;
   const struct rustls_server_config *config = nullptr;
   const struct rustls_root_cert_store *root_store = nullptr;
-  const struct rustls_client_cert_verifier *client_verifier = nullptr;
+  struct rustls_client_cert_verifier *client_verifier = nullptr;
 
   const uint8_t *cert_data = nullptr;
   size_t cert_len = 0;

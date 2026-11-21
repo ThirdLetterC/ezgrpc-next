@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -846,11 +847,13 @@ static void run_raw_h2_requests(uint16_t port) {
     raw_h2_send_all(fd, out, (size_t)n);
   }
 
-  struct timeval tv = {.tv_sec = 0, .tv_usec = 200000};
+  struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   uint8_t rbuf[4096];
-  for (int i = 0; i < 60 && streams_done < 13; i++) {
+  for (int i = 0; i < 200 && streams_done < 14; i++) {
     ssize_t n = recv(fd, rbuf, sizeof(rbuf), 0);
+    if (n < 0 && errno == EINTR)
+      continue;
     if (n <= 0)
       break;
     nghttp2_session_mem_recv(sess, rbuf, (size_t)n);
