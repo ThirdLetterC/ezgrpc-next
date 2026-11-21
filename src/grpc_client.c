@@ -645,16 +645,22 @@ static grpc_err sub_connect(client_subchannel *s) {
     s->handle.pipe.data = s;
     s->handle_initialized = true;
     uv_pipe_connect(&conn_req, &s->handle.pipe, s->unix_path, on_sub_connect);
-  } else {
-    if (uv_tcp_init(&s->loop, &s->handle.tcp) != 0)
+    while (!s->connected && s->connect_status == -1)
+      uv_run(&s->loop, UV_RUN_ONCE);
+    if (!s->connected)
       goto fail_io;
-    s->handle.tcp.data = s;
-    s->handle_initialized = true;
+  } else {
     struct sockaddr_storage ss = {0};
-    if (uv_ip4_addr(s->host, s->port, (struct sockaddr_in *)&ss) != 0 &&
-        uv_ip6_addr(s->host, s->port, (struct sockaddr_in6 *)&ss) != 0) {
+    struct addrinfo *res = nullptr;
+    struct addrinfo single_ai = {0};
+    if (uv_ip4_addr(s->host, s->port, (struct sockaddr_in *)&ss) == 0) {
+      single_ai.ai_addr = (struct sockaddr *)&ss;
+      single_ai.ai_addrlen = sizeof(struct sockaddr_in);
+    } else if (uv_ip6_addr(s->host, s->port, (struct sockaddr_in6 *)&ss) == 0) {
+      single_ai.ai_addr = (struct sockaddr *)&ss;
+      single_ai.ai_addrlen = sizeof(struct sockaddr_in6);
+    } else {
       struct addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM};
-      struct addrinfo *res = nullptr;
       char port_str[16];
       snprintf(port_str, sizeof(port_str), "%u", s->port);
       if (getaddrinfo(s->host, port_str, &hints, &res) != 0 || res == nullptr) {
@@ -662,18 +668,30 @@ static grpc_err sub_connect(client_subchannel *s) {
           freeaddrinfo(res);
         goto fail_io;
       }
-      memcpy(&ss, res->ai_addr, res->ai_addrlen);
-      freeaddrinfo(res);
     }
-    if (uv_tcp_connect(&conn_req, &s->handle.tcp, (const struct sockaddr *)&ss, on_sub_connect) !=
-        0)
+    struct addrinfo *ai = res != nullptr ? res : &single_ai;
+    for (; ai != nullptr; ai = ai->ai_next) {
+      s->connected = false;
+      s->connect_status = -1;
+      if (uv_tcp_init(&s->loop, &s->handle.tcp) != 0)
+        continue;
+      s->handle.tcp.data = s;
+      s->handle_initialized = true;
+      if (uv_tcp_connect(&conn_req, &s->handle.tcp, ai->ai_addr, on_sub_connect) == 0) {
+        while (!s->connected && s->connect_status == -1)
+          uv_run(&s->loop, UV_RUN_ONCE);
+        if (s->connected)
+          break;
+      }
+      uv_close((uv_handle_t *)&s->handle.tcp, nullptr);
+      uv_run(&s->loop, UV_RUN_DEFAULT);
+      s->handle_initialized = false;
+    }
+    if (res != nullptr)
+      freeaddrinfo(res);
+    if (!s->connected)
       goto fail_io;
   }
-
-  while (!s->connected && s->connect_status == -1)
-    uv_run(&s->loop, UV_RUN_ONCE);
-  if (!s->connected)
-    goto fail_io;
 
   if (!s->is_unix)
     (void)uv_tcp_nodelay(&s->handle.tcp, 1);
