@@ -15,8 +15,10 @@
 #include "grpc_status_details.h"
 #include "grpc_health.h"
 #include "grpc_reflection.h"
+#include "grpc_channelz.h"
 #include "grpc_compression.h"
 #include "grpc_tls.h"
+#include "grpc_client.h"
 
 #if defined(GRPC_ENABLE_PROTOBUF_C)
 #include "grpc_protobuf_c.h"

@@ -87,6 +87,29 @@ GRPC_API bool grpc_call_is_cancelled(const grpc_call *call);
  */
 GRPC_API grpc_status grpc_call_cancel_reason(const grpc_call *call);
 
+/**
+ * Parsed W3C Trace Context (``traceparent`` header:
+ * ``"00-<32-hex-trace-id>-<16-hex-span-id>-<2-hex-flags>"``).
+ */
+typedef struct grpc_trace_context {
+  char trace_id[33];
+  char span_id[17];
+  uint8_t trace_flags;
+  bool valid;
+} grpc_trace_context;
+
+/**
+ * Parses the ``traceparent`` request header into ``out``. Returns true if a
+ * valid W3C traceparent header was present.
+ */
+GRPC_API bool grpc_call_trace_context(const grpc_call *call, grpc_trace_context *out);
+
+/**
+ * Formats a W3C ``traceparent`` header value into ``buf`` (needs at least 56 bytes).
+ */
+GRPC_API grpc_err grpc_traceparent_format(const grpc_trace_context *ctx, char *buf,
+                                          size_t buf_len);
+
 /** The server the call belongs to. */
 GRPC_API grpc_server *grpc_call_server(const grpc_call *call);
 
@@ -109,6 +132,25 @@ GRPC_API void *grpc_call_userdata(const grpc_call *call);
 GRPC_API void grpc_call_on_cancel(grpc_call *call,
                                         void (*fn)(grpc_call *call, void *userdata),
                                         void *userdata);
+
+/**
+ * Returns the number of response payload bytes currently queued for transmission
+ * on this call's stream.
+ */
+GRPC_API size_t grpc_call_send_queue_bytes(const grpc_call *call);
+
+/**
+ * Returns true if the call's send queue is below ``grpc_config.max_send_queue_bytes``
+ * (or if no send queue limit is configured).
+ */
+GRPC_API bool grpc_call_is_writable(const grpc_call *call);
+
+/**
+ * Registers a callback invoked when the stream's send queue drains below
+ * ``grpc_config.max_send_queue_bytes`` after experiencing backpressure.
+ */
+GRPC_API void grpc_call_on_writable(grpc_call *call,
+                                    void (*fn)(grpc_call *call, void *userdata), void *userdata);
 
 /* ---- answering ---------------------------------------------------------- */
 

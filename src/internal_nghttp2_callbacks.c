@@ -82,9 +82,11 @@ ssize_t data_source_read_callback2(nghttp2_session *ngsession, i32 stream_id, u8
   size_t buf_seek = 0;
   while (buf_seek < buf_len && (msg = grpc_list_peek_front(lmessages)) != nullptr) {
     size_t seek = ezstream->trunc_seek;
-    size_t total = 5 + (size_t)msg->len;
+    bool raw_frame = (msg->cflag == 0xFE);
+    size_t prefix_len = raw_frame ? 0 : 5;
+    size_t total = prefix_len + (size_t)msg->len;
 
-    if (seek < 5) {
+    if (!raw_frame && seek < 5) {
       u8 prefix[5];
       prefix[0] = msg->cflag;
       uint32_t len = htonl(msg->len);
@@ -94,33 +96,48 @@ ssize_t data_source_read_callback2(nghttp2_session *ngsession, i32 stream_id, u8
       buf_seek += n;
       seek += n;
     }
-    if (seek >= 5) {
+    if (seek >= prefix_len) {
       size_t n = total - seek < buf_len - buf_seek ? total - seek : buf_len - buf_seek;
-      memcpy(buf + buf_seek, msg->data + (seek - 5), n);
+      memcpy(buf + buf_seek, msg->data + (seek - prefix_len), n);
       buf_seek += n;
       seek += n;
     }
 
     if (seek == total) {
       (void)grpc_list_pop_front(lmessages);
+      if (ezstream->queued_send_bytes >= msg->len)
+        ezstream->queued_send_bytes -= msg->len;
+      else
+        ezstream->queued_send_bytes = 0;
       grpc_message_free(msg);
       seek = 0;
+      if (ezstream->was_backpressured && ezstream->call != nullptr &&
+          grpc_call_is_writable(ezstream->call)) {
+        ezstream->was_backpressured = false;
+        if (ezstream->call->writable_fn != nullptr)
+          ezstream->call->writable_fn(ezstream->call, ezstream->call->writable_userdata);
+      }
     }
     ezstream->trunc_seek = seek;
   }
 
   if (grpc_list_is_empty(lmessages)) {
-    /* the stream stays open for the trailers */
-    *data_flags = NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM;
-    ezstream->is_data_active = false;
-    if (ezstream->pending_trailers != nullptr) {
-      if (nghttp2_submit_trailer(ngsession, stream_id, ezstream->pending_trailers,
-                                 ezstream->nb_pending_trailers) != 0) {
-        return NGHTTP2_ERR_CALLBACK_FAILURE;
+    if (ezstream->send_eof_on_empty) {
+      *data_flags = NGHTTP2_DATA_FLAG_EOF;
+      ezstream->is_data_active = false;
+    } else {
+      /* the stream stays open for the trailers */
+      *data_flags = NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM;
+      ezstream->is_data_active = false;
+      if (ezstream->pending_trailers != nullptr) {
+        if (nghttp2_submit_trailer(ngsession, stream_id, ezstream->pending_trailers,
+                                   ezstream->nb_pending_trailers) != 0) {
+          return NGHTTP2_ERR_CALLBACK_FAILURE;
+        }
+        grpc_free(ezstream->pending_trailers);
+        ezstream->pending_trailers = nullptr;
+        ezstream->nb_pending_trailers = 0;
       }
-      grpc_free(ezstream->pending_trailers);
-      ezstream->pending_trailers = nullptr;
-      ezstream->nb_pending_trailers = 0;
     }
   }
 
@@ -191,10 +208,21 @@ static int on_header_callback2([[maybe_unused]] nghttp2_session *session,
     ezstream->is_scheme_http = header_matches(value, valuelen, "http") ||
                                header_matches(value, valuelen, "https");
   else if (header_matches(name, namelen, path)) {
+    ezstream->hpath = (const char *)value;
+    ezstream->hpath_len = valuelen;
     ezstream->route = server_find_route(ezsession->server, (const char *)value, valuelen);
   } else if (header_matches(name, namelen, "content-type")) {
     ezstream->hcontent_type = (const char *)value;
-    ezstream->is_content_grpc = header_starts_with(value, valuelen, "application/grpc");
+    if (header_starts_with(value, valuelen, "application/grpc-web-text")) {
+      ezstream->is_content_grpc = true;
+      ezstream->is_grpc_web = true;
+      ezstream->is_grpc_web_text = true;
+    } else if (header_starts_with(value, valuelen, "application/grpc-web")) {
+      ezstream->is_content_grpc = true;
+      ezstream->is_grpc_web = true;
+    } else {
+      ezstream->is_content_grpc = header_starts_with(value, valuelen, "application/grpc");
+    }
   } else if (header_matches(name, namelen, "grpc-encoding")) {
     ezstream->hgrpc_encoding = (const char *)value;
     if (header_matches(value, valuelen, "gzip")) ezstream->grpc_encoding = GRPC_COMPRESS_GZIP;
@@ -254,7 +282,8 @@ static inline int on_frame_recv_headers(grpc_session *ezsession, const nghttp2_f
     return 0;
   }
 
-  if (!(ezstream->is_method_post && ezstream->is_scheme_http && ezstream->is_te_trailers)) {
+  if (!(ezstream->is_method_post && ezstream->is_scheme_http &&
+        (ezstream->is_te_trailers || ezstream->is_grpc_web))) {
     LOG_TRACE(server, "is_method_post %d && is_scheme_http %d && is_te_trailers %d. sending rst\n",
               ezstream->is_method_post, ezstream->is_scheme_http, ezstream->is_te_trailers);
     nghttp2_submit_rst_stream(ezsession->ngsession, NGHTTP2_FLAG_NONE, ezstream->stream_id,
@@ -264,10 +293,14 @@ static inline int on_frame_recv_headers(grpc_session *ezsession, const nghttp2_f
   }
 
   if (ezstream->route == nullptr || ezstream->route->disabled) {
-    submit_trailers_only(ezsession, ezstream->stream_id, GRPC_STATUS_UNIMPLEMENTED,
-                         "unknown method");
-    ezstream->is_discarding = true;
-    return 0;
+    if (server->fallback_route != nullptr && !server->fallback_route->disabled) {
+      ezstream->route = server->fallback_route;
+    } else {
+      submit_trailers_only(ezsession, ezstream->stream_id, GRPC_STATUS_UNIMPLEMENTED,
+                           "unknown method");
+      ezstream->is_discarding = true;
+      return 0;
+    }
   }
 
   grpc_call *call = call_new(ezsession, ezstream);
@@ -321,12 +354,53 @@ static inline int on_frame_recv_data(grpc_session *ezsession, const nghttp2_fram
   }
   grpc_call *call = ezstream->call;
 
-  grpc_messages *messages;
+  grpc_messages *messages = nullptr;
   bool too_large = false;
+  size_t max_out = ezsession->server->config.max_message_size > 5
+                       ? ezsession->server->config.max_message_size - 5
+                       : 0;
+  if (ezstream->is_grpc_web_text) {
+    if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) {
+      size_t dec_len = 0;
+      uint8_t *dec = grpc_metadata_decode_bin(
+          (const char *)(ezstream->recv_data + ezstream->recv_start), ezstream->recv_len, &dec_len);
+      if (dec == nullptr && ezstream->recv_len > 0) {
+        ezstream->recv_len = 0;
+        call_abort(call, GRPC_STATUS_INVALID_ARGUMENT, "invalid grpc-web-text base64");
+        return 0;
+      }
+      size_t lseek = dec != nullptr ? parse_grpc_message(dec, dec_len, ezstream->grpc_encoding,
+                                                         &messages, max_out, &too_large)
+                                    : 0;
+      grpc_free(dec);
+      ezstream->recv_len = 0;
+      ezstream->recv_start = 0;
+      if (too_large) {
+        if (messages != nullptr)
+          grpc_messages_free(messages);
+        ezstream->is_discarding = true;
+        call_abort(call, GRPC_STATUS_RESOURCE_EXHAUSTED, "decompressed request exceeds server limit");
+        return 0;
+      }
+      if (messages != nullptr) {
+        atomic_fetch_add(&ezsession->server->stat_messages_received,
+                         grpc_list_count((grpc_list *)messages));
+        grpc_list_concat_and_empty_src(&call->pending, (grpc_list *)messages);
+        grpc_list_free((grpc_list *)messages);
+        call_queue(call);
+      }
+      if (lseek < dec_len) {
+        call_abort(call, GRPC_STATUS_DATA_LOSS, "truncated message");
+      } else {
+        call->half_closed = true;
+        call_queue(call);
+      }
+    }
+    return 0;
+  }
+
   size_t lseek = parse_grpc_message(ezstream->recv_data + ezstream->recv_start, ezstream->recv_len,
-                                    ezstream->grpc_encoding, &messages,
-                                    ezsession->server->config.max_message_size > 5
-                                      ? ezsession->server->config.max_message_size - 5 : 0, &too_large);
+                                    ezstream->grpc_encoding, &messages, max_out, &too_large);
   if (too_large) {
     if (messages != nullptr) grpc_messages_free(messages);
     ezstream->is_discarding = true;
@@ -342,6 +416,8 @@ static inline int on_frame_recv_data(grpc_session *ezsession, const nghttp2_fram
       ezstream->recv_start = 0;
   }
   if (messages != nullptr) {
+    atomic_fetch_add(&ezsession->server->stat_messages_received,
+                     grpc_list_count((grpc_list *)messages));
     grpc_list_concat_and_empty_src(&call->pending, (grpc_list *)messages);
     grpc_list_free((grpc_list *)messages);
     call_queue(call);
@@ -422,6 +498,32 @@ static int on_frame_recv_callback([[maybe_unused]] nghttp2_session *session,
     LOG_TRACE(ezsession->server, "< FRAME[RST_STREAM, sid=%d, error_code=%u]\n",
                       frame->hd.stream_id, frame->rst_stream.error_code);
     /* on_stream_close_callback() cancels the call */
+    return 0;
+  case NGHTTP2_PING:
+    if (frame->hd.flags & NGHTTP2_FLAG_ACK) {
+      ezsession->ping_pending = false;
+    } else if (ezsession->server->config.max_ping_strikes > 0) {
+      uint64_t now = grpc_time_now_ms();
+      uint32_t min_iv = ezsession->server->config.min_ping_interval_ms
+                            ? ezsession->server->config.min_ping_interval_ms
+                            : 5000;
+      if (ezsession->last_client_ping_ms > 0 && now >= ezsession->last_client_ping_ms &&
+          (now - ezsession->last_client_ping_ms) < min_iv) {
+        ezsession->ping_strikes++;
+        if (ezsession->ping_strikes > ezsession->server->config.max_ping_strikes) {
+          int32_t last_id = nghttp2_session_get_last_proc_stream_id(ezsession->ngsession);
+          static const uint8_t msg[] = "too_many_pings";
+          (void)nghttp2_submit_goaway(ezsession->ngsession, NGHTTP2_FLAG_NONE, last_id,
+                                      NGHTTP2_ENHANCE_YOUR_CALM, msg, sizeof(msg) - 1);
+          ezsession->goaway_sent = true;
+          ezsession->goaway_sent_ms = now;
+          session_schedule_flush(ezsession);
+        }
+      } else {
+        ezsession->ping_strikes = 0;
+      }
+      ezsession->last_client_ping_ms = now;
+    }
     return 0;
   case NGHTTP2_WINDOW_UPDATE:
     LOG_TRACE(ezsession->server,

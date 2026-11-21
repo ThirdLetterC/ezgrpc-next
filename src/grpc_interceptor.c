@@ -4,6 +4,16 @@
 #include "core.h"
 #include "grpc_timeout.h"
 
+static bool interceptor_matches_call(const grpc_interceptor *inc, const grpc_call *call) {
+  if (inc->path_prefix == nullptr)
+    return true;
+  const char *method = grpc_call_method(call);
+  if (method == nullptr)
+    return false;
+  size_t plen = strlen(inc->path_prefix);
+  return strncmp(method, inc->path_prefix, plen) == 0;
+}
+
 GRPC_API grpc_err grpc_server_add_interceptor(grpc_server *server,
                                                        const grpc_interceptor *interceptor) {
   if (server == nullptr || interceptor == nullptr) {
@@ -17,8 +27,17 @@ GRPC_API grpc_err grpc_server_add_interceptor(grpc_server *server,
     return GRPC_ERR_NOMEM;
   }
 
+  grpc_interceptor copy = *interceptor;
+  if (interceptor->path_prefix != nullptr) {
+    copy.path_prefix = grpc_strdup(interceptor->path_prefix);
+    if (copy.path_prefix == nullptr) {
+      server->interceptors = new_arr;
+      return GRPC_ERR_NOMEM;
+    }
+  }
+
   server->interceptors = new_arr;
-  server->interceptors[server->nb_interceptors] = *interceptor;
+  server->interceptors[server->nb_interceptors] = copy;
   server->nb_interceptors = new_nb;
   return GRPC_OK;
 }
@@ -27,12 +46,44 @@ bool interceptors_run_on_call(grpc_call *call) {
   grpc_server *server = call->server;
   for (size_t i = 0; i < server->nb_interceptors; i++) {
     const grpc_interceptor *inc = &server->interceptors[i];
-    if (inc->on_call == nullptr)
+    if (inc->on_call == nullptr || !interceptor_matches_call(inc, call))
       continue;
     const char *message = nullptr;
     grpc_status status = inc->on_call(call, &message, inc->userdata);
     if (status != GRPC_STATUS_OK) {
       (void)grpc_call_finish(call, status, message);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool interceptors_run_on_recv(grpc_call *call, const grpc_message *message) {
+  grpc_server *server = call->server;
+  for (size_t i = 0; i < server->nb_interceptors; i++) {
+    const grpc_interceptor *inc = &server->interceptors[i];
+    if (inc->on_recv_message == nullptr || !interceptor_matches_call(inc, call))
+      continue;
+    const char *err_msg = nullptr;
+    grpc_status status = inc->on_recv_message(call, message, &err_msg, inc->userdata);
+    if (status != GRPC_STATUS_OK) {
+      (void)grpc_call_finish(call, status, err_msg);
+      return false;
+    }
+  }
+  return true;
+}
+
+bool interceptors_run_on_send(grpc_call *call, const grpc_message *message) {
+  grpc_server *server = call->server;
+  for (size_t i = 0; i < server->nb_interceptors; i++) {
+    const grpc_interceptor *inc = &server->interceptors[i];
+    if (inc->on_send_message == nullptr || !interceptor_matches_call(inc, call))
+      continue;
+    const char *err_msg = nullptr;
+    grpc_status status = inc->on_send_message(call, message, &err_msg, inc->userdata);
+    if (status != GRPC_STATUS_OK) {
+      (void)grpc_call_finish(call, status, err_msg);
       return false;
     }
   }
@@ -49,7 +100,7 @@ void interceptors_run_on_done(grpc_call *call, grpc_status status) {
   uint64_t duration_ms = grpc_time_now_ms() - call->start_ms;
   for (size_t i = 0; i < server->nb_interceptors; i++) {
     const grpc_interceptor *inc = &server->interceptors[i];
-    if (inc->on_done != nullptr)
+    if (inc->on_done != nullptr && interceptor_matches_call(inc, call))
       inc->on_done(call, status, duration_ms, inc->userdata);
   }
 }
@@ -57,6 +108,7 @@ void interceptors_run_on_done(grpc_call *call, grpc_status status) {
 void interceptors_free(grpc_server *server) {
   for (size_t i = 0; i < server->nb_interceptors; i++) {
     const grpc_interceptor *inc = &server->interceptors[i];
+    grpc_free((void *)inc->path_prefix);
     if (inc->userdata_free != nullptr)
       inc->userdata_free(inc->userdata);
   }
@@ -112,5 +164,65 @@ GRPC_API grpc_interceptor grpc_interceptor_bearer_auth(grpc_token_validator_fn v
       .on_call = bearer_auth_on_call,
       .userdata = data,
       .userdata_free = grpc_free,
+  };
+}
+
+typedef struct rate_limit_data {
+  pthread_mutex_t lock;
+  double rate_per_ms;
+  double burst;
+  double tokens;
+  uint64_t last_ms;
+} rate_limit_data;
+
+static void rate_limit_free(void *userdata) {
+  rate_limit_data *rl = userdata;
+  if (rl == nullptr)
+    return;
+  pthread_mutex_destroy(&rl->lock);
+  grpc_free(rl);
+}
+
+static grpc_status rate_limit_on_call([[maybe_unused]] grpc_call *call, const char **message,
+                                      void *userdata) {
+  rate_limit_data *rl = userdata;
+  if (rl == nullptr)
+    return GRPC_STATUS_OK;
+
+  pthread_mutex_lock(&rl->lock);
+  uint64_t now = grpc_time_now_ms();
+  if (now > rl->last_ms) {
+    double elapsed = (double)(now - rl->last_ms);
+    rl->tokens += elapsed * rl->rate_per_ms;
+    if (rl->tokens > rl->burst)
+      rl->tokens = rl->burst;
+    rl->last_ms = now;
+  }
+  bool allowed = rl->tokens >= 1.0;
+  if (allowed)
+    rl->tokens -= 1.0;
+  pthread_mutex_unlock(&rl->lock);
+
+  if (!allowed) {
+    *message = "rate limit exceeded";
+    return GRPC_STATUS_RESOURCE_EXHAUSTED;
+  }
+  return GRPC_STATUS_OK;
+}
+
+GRPC_API grpc_interceptor grpc_interceptor_rate_limit(double requests_per_sec, size_t burst) {
+  rate_limit_data *rl = grpc_calloc(1, sizeof(*rl));
+  if (rl != nullptr) {
+    pthread_mutex_init(&rl->lock, nullptr);
+    rl->rate_per_ms = requests_per_sec > 0.0 ? requests_per_sec / 1000.0 : 0.0;
+    rl->burst = burst > 0 ? (double)burst : 1.0;
+    rl->tokens = rl->burst;
+    rl->last_ms = grpc_time_now_ms();
+  }
+  return (grpc_interceptor){
+      .name = "rate_limit",
+      .on_call = rate_limit_on_call,
+      .userdata = rl,
+      .userdata_free = rate_limit_free,
   };
 }

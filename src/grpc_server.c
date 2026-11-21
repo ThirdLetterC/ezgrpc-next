@@ -231,6 +231,54 @@ GRPC_API grpc_err grpc_server_unregister(grpc_server *server, const char *path) 
   return GRPC_OK;
 }
 
+GRPC_API grpc_err grpc_server_set_fallback(grpc_server *server,
+                                           const grpc_stream_handler *handler, void *userdata) {
+  if (server == nullptr)
+    return GRPC_ERR_INVALID;
+  if (handler == nullptr) {
+    if (server->fallback_route != nullptr)
+      server->fallback_route->disabled = true;
+    return GRPC_OK;
+  }
+  if (handler->on_message == nullptr && handler->on_start == nullptr)
+    return GRPC_ERR_INVALID;
+  if (server->fallback_route == nullptr) {
+    grpc_route *route = grpc_calloc(1, sizeof(*route));
+    if (route == nullptr)
+      return GRPC_ERR_NOMEM;
+    route->path = grpc_strdup("/*");
+    if (route->path == nullptr) {
+      grpc_free(route);
+      return GRPC_ERR_NOMEM;
+    }
+    route->path_len = 2;
+    route->kind = ROUTE_STREAM;
+    server->fallback_route = route;
+  }
+  server->fallback_route->stream = *handler;
+  server->fallback_route->userdata = userdata;
+  server->fallback_route->disabled = false;
+  return GRPC_OK;
+}
+
+GRPC_API grpc_err grpc_server_get_stats(const grpc_server *server, grpc_server_stats *out) {
+  if (server == nullptr || out == nullptr)
+    return GRPC_ERR_INVALID;
+  *out = (grpc_server_stats){
+      .active_connections = atomic_load(&server->stat_active_connections),
+      .total_connections = atomic_load(&server->stat_total_connections),
+      .active_streams = atomic_load(&server->stat_active_streams),
+      .total_calls = atomic_load(&server->stat_total_calls),
+      .calls_ok = atomic_load(&server->stat_calls_ok),
+      .calls_error = atomic_load(&server->stat_calls_error),
+      .bytes_received = atomic_load(&server->stat_bytes_received),
+      .bytes_sent = atomic_load(&server->stat_bytes_sent),
+      .messages_received = atomic_load(&server->stat_messages_received),
+      .messages_sent = atomic_load(&server->stat_messages_sent),
+  };
+  return GRPC_OK;
+}
+
 /* ---- setup ---------------------------------------------------------------------- */
 
 #ifdef _WIN32
@@ -329,6 +377,69 @@ static bool start_listener(grpc_server *server, uv_tcp_t *listener, uv_os_sock_t
 
 static void on_poll_timer([[maybe_unused]] uv_timer_t *handle) {}
 
+static void on_maintenance_timer(uv_timer_t *handle) {
+  grpc_server *server = handle->data;
+  const grpc_config *cfg = &server->config;
+  uint64_t now = grpc_time_now_ms();
+  uint32_t ka_timeout = cfg->keepalive_timeout_ms ? cfg->keepalive_timeout_ms : 20000;
+  uint32_t age_grace = cfg->max_connection_age_grace_ms ? cfg->max_connection_age_grace_ms : 5000;
+
+  for (size_t i = 0; i < server->nb_sessions; i++) {
+    grpc_session *s = &server->sessions[i];
+    if (!s->is_active || s->is_closing || s->ngsession == nullptr)
+      continue;
+
+    /* 1. Keepalive PING timeout */
+    if (s->ping_pending && now >= s->ping_sent_ms && (now - s->ping_sent_ms) >= ka_timeout) {
+      LOG_DEBUG(server, "keepalive timeout on %s, closing\n", s->peer);
+      session_close(s);
+      continue;
+    }
+
+    /* 2. Max connection age / grace period */
+    if (s->goaway_sent) {
+      if (s->nb_streams == 0 ||
+          (now >= s->goaway_sent_ms && (now - s->goaway_sent_ms) >= age_grace)) {
+        session_close(s);
+        continue;
+      }
+    } else if (cfg->max_connection_age_ms > 0 && now >= s->created_ms &&
+               (now - s->created_ms) >= cfg->max_connection_age_ms) {
+      int32_t last_id = nghttp2_session_get_last_proc_stream_id(s->ngsession);
+      (void)nghttp2_submit_goaway(s->ngsession, NGHTTP2_FLAG_NONE, last_id, NGHTTP2_NO_ERROR,
+                                  nullptr, 0);
+      s->goaway_sent = true;
+      s->goaway_sent_ms = now;
+      session_schedule_flush(s);
+      continue;
+    }
+
+    /* 3. Max connection idle (no active streams) */
+    if (cfg->max_connection_idle_ms > 0 && s->nb_streams == 0 && now >= s->last_activity_ms &&
+        (now - s->last_activity_ms) >= cfg->max_connection_idle_ms) {
+      int32_t last_id = nghttp2_session_get_last_proc_stream_id(s->ngsession);
+      (void)nghttp2_submit_goaway(s->ngsession, NGHTTP2_FLAG_NONE, last_id, NGHTTP2_NO_ERROR,
+                                  nullptr, 0);
+      s->goaway_sent = true;
+      s->goaway_sent_ms = now;
+      session_schedule_flush(s);
+      continue;
+    }
+
+    /* 4. Send HTTP/2 keepalive PING if idle */
+    if (cfg->keepalive_time_ms > 0 && !s->ping_pending && now >= s->last_activity_ms &&
+        (now - s->last_activity_ms) >= cfg->keepalive_time_ms) {
+      static const uint8_t ping_data[8] = {'e', 'z', 'g', 'r', 'p', 'c', 'k', 'a'};
+      if (nghttp2_submit_ping(s->ngsession, NGHTTP2_FLAG_NONE, ping_data) == 0) {
+        s->ping_pending = true;
+        s->ping_sent_ms = now;
+        session_schedule_flush(s);
+      }
+    }
+  }
+  server_flush_sessions(server);
+}
+
 static void run_posted(grpc_server *server) {
   pthread_mutex_lock(&server->post_mutex);
   post_task *task = server->post_head;
@@ -405,18 +516,21 @@ GRPC_API grpc_server *grpc_server_new_ex(const grpc_config *config, grpc_err *ou
   }
 
   const char *ipv4_addr = cfg->ipv4_addr, *ipv6_addr = cfg->ipv6_addr;
-  if (ipv4_addr == nullptr && ipv6_addr == nullptr) {
+  const char *unix_path = cfg->unix_path;
+  if (ipv4_addr == nullptr && ipv6_addr == nullptr && unix_path == nullptr) {
     ipv4_addr = "0.0.0.0";
     ipv6_addr = "::";
   }
   if ((ipv4_addr != nullptr && (server->ipv4_addr = grpc_strdup(ipv4_addr)) == nullptr) ||
-      (ipv6_addr != nullptr && (server->ipv6_addr = grpc_strdup(ipv6_addr)) == nullptr)) {
+      (ipv6_addr != nullptr && (server->ipv6_addr = grpc_strdup(ipv6_addr)) == nullptr) ||
+      (unix_path != nullptr && (server->unix_path = grpc_strdup(unix_path)) == nullptr)) {
     err = GRPC_ERR_NOMEM;
     goto err;
   }
   /* the copies outlive the caller's strings */
   cfg->ipv4_addr = server->ipv4_addr;
   cfg->ipv6_addr = server->ipv6_addr;
+  cfg->unix_path = server->unix_path;
   memset(&cfg->tls, 0, sizeof(cfg->tls));
 
   bool has_tls_files = config->tls.cert_file != nullptr || config->tls.key_file != nullptr;
@@ -501,6 +615,27 @@ GRPC_API grpc_server *grpc_server_new_ex(const grpc_config *config, grpc_err *ou
     if (!start_listener(server, &server->ipv6_listener, &server->ipv6_sockfd))
       goto err;
   }
+  if (server->unix_path != nullptr) {
+#ifndef _WIN32
+    (void)unlink(server->unix_path);
+#endif
+    if (uv_pipe_init(&server->loop, &server->unix_listener, 0) != 0)
+      goto err;
+    server->unix_listener.data = server;
+    server->unix_listener_active = true;
+    if (uv_pipe_bind(&server->unix_listener, server->unix_path) != 0 ||
+        uv_listen((uv_stream_t *)&server->unix_listener, cfg->backlog, on_listener_connection) != 0)
+      goto err;
+  }
+  if (cfg->keepalive_time_ms > 0 || cfg->max_connection_idle_ms > 0 ||
+      cfg->max_connection_age_ms > 0) {
+    if (uv_timer_init(&server->loop, &server->maintenance_timer) != 0)
+      goto err;
+    server->maintenance_timer.data = server;
+    server->maintenance_timer_active = true;
+    uv_unref((uv_handle_t *)&server->maintenance_timer);
+    (void)uv_timer_start(&server->maintenance_timer, on_maintenance_timer, 250, 250);
+  }
 
   err = GRPC_ERR_NOMEM;
   if (nghttp2_session_callbacks_new(&server->ngcallbacks) != 0)
@@ -566,10 +701,14 @@ GRPC_API void grpc_server_free(grpc_server *server) {
     uv_close((uv_handle_t *)&server->ipv4_listener, nullptr);
   if (server->ipv6_listener_active)
     uv_close((uv_handle_t *)&server->ipv6_listener, nullptr);
+  if (server->unix_listener_active)
+    uv_close((uv_handle_t *)&server->unix_listener, nullptr);
   if (server->timer_active)
     uv_close((uv_handle_t *)&server->timer, nullptr);
   if (server->deadline_timer_active)
     uv_close((uv_handle_t *)&server->deadline_timer, nullptr);
+  if (server->maintenance_timer_active)
+    uv_close((uv_handle_t *)&server->maintenance_timer, nullptr);
   if (server->async_active)
     uv_close((uv_handle_t *)&server->async, nullptr);
   if (server->ipv4_sockfd != GRPC_INVALID_SOCKET)
@@ -589,6 +728,10 @@ GRPC_API void grpc_server_free(grpc_server *server) {
     grpc_free(server->routes[i]);
   }
   grpc_free(server->routes);
+  if (server->fallback_route != nullptr) {
+    grpc_free(server->fallback_route->path);
+    grpc_free(server->fallback_route);
+  }
   interceptors_free(server);
   health_free(server);
   reflection_free(server);
@@ -601,6 +744,12 @@ GRPC_API void grpc_server_free(grpc_server *server) {
   grpc_free(server->tls_obuf.data);
   grpc_free(server->ipv4_addr);
   grpc_free(server->ipv6_addr);
+  if (server->unix_path != nullptr) {
+#ifndef _WIN32
+    (void)unlink(server->unix_path);
+#endif
+    grpc_free(server->unix_path);
+  }
   grpc_free(server->sessions);
   grpc_free(server->free_sessions);
   logger_server_remove(server);
@@ -704,6 +853,10 @@ GRPC_API grpc_err grpc_server_drain(grpc_server *server, int timeout_ms) {
   if (server->ipv6_listener_active) {
     uv_close((uv_handle_t *)&server->ipv6_listener, nullptr);
     server->ipv6_listener_active = false;
+  }
+  if (server->unix_listener_active) {
+    uv_close((uv_handle_t *)&server->unix_listener, nullptr);
+    server->unix_listener_active = false;
   }
 
   /* Send HTTP/2 GOAWAY on every active session. */

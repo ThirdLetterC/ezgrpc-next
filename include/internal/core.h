@@ -128,6 +128,8 @@ struct grpc_call {
   /* Automatic compression configured for uncompressed response messages. */
   grpc_compression_algorithm auto_compression;
   int auto_compression_level;
+  bool is_grpc_web : 1;
+  bool is_grpc_web_text : 1;
   bool finished : 1;
   bool closed : 1;
   bool cancelled : 1;
@@ -142,11 +144,15 @@ struct grpc_call {
   /* Interceptors' on_done callbacks ran. */
   bool done_reported : 1;
   bool queued : 1;
+  bool stats_done : 1;
 
+  char *method_override;
   void *userdata;
   void (*userdata_free)(void *);
   void (*cancel_fn)(grpc_call *, void *);
   void *cancel_userdata;
+  void (*writable_fn)(grpc_call *, void *);
+  void *writable_userdata;
 
   /* Link in grpc_server.ready_head. */
   grpc_call *ready_next;
@@ -175,15 +181,20 @@ struct grpc_stream {
   bool is_te_trailers : 1;
   /* True when the content type starts with application/grpc. */
   bool is_content_grpc : 1;
+  bool is_grpc_web : 1;
+  bool is_grpc_web_text : 1;
   bool is_deadline_set : 1;
   /* A data provider was submitted and has not returned EOF. */
   bool is_data_active : 1;
   /* The request was rejected; ignore any remaining client data. */
   bool is_discarding : 1;
+  bool was_backpressured : 1;
   uint64_t deadline_ms;
 
   /* These values point into headers. */
   const char *hcontent_type;
+  const char *hpath;
+  size_t hpath_len;
   const char *hgrpc_encoding;
   grpc_compression_algorithm grpc_encoding;
   const char *hgrpc_accept_encoding;
@@ -204,7 +215,9 @@ struct grpc_stream {
   /* Bytes from the front message already handed to nghttp2, including its
    * five-byte prefix. */
   size_t trunc_seek;
+  size_t queued_send_bytes;
   grpc_list lqueue_omessages;
+  bool send_eof_on_empty : 1;
 
   /* Trailers submitted while DATA is queued. They are sent after the data
    * provider reaches EOF so they cannot overtake the DATA. */
@@ -234,9 +247,23 @@ struct grpc_session {
   bool is_tls : 1;
   bool tls_handshake_done : 1;
 
-  uv_tcp_t tcp;
+  union {
+    uv_tcp_t tcp;
+    uv_pipe_t pipe;
+  } handle;
+  bool is_unix : 1;
   bool is_active : 1;
   bool is_closing : 1;
+
+  /* Keepalive, idle, age, and ping-strike tracking (monotonic ms). */
+  u64 created_ms;
+  u64 last_activity_ms;
+  u64 ping_sent_ms;
+  u64 last_client_ping_ms;
+  u64 goaway_sent_ms;
+  uint32_t ping_strikes;
+  bool ping_pending : 1;
+  bool goaway_sent : 1;
 
   /* Bytes serialized by nghttp2 (and encrypted, if TLS) but not yet accepted
    * by the kernel. */
@@ -269,6 +296,7 @@ struct grpc_server {
   grpc_config config;
   char *ipv4_addr;
   char *ipv6_addr;
+  char *unix_path;
 
   atomic_int log_level; /* Current per-server threshold. */
   FILE *log_file;       /* Non-owned log stream. */
@@ -280,6 +308,7 @@ struct grpc_server {
   grpc_route **routes;
   size_t nb_routes;
   size_t cap_routes;
+  grpc_route *fallback_route;
 
   nghttp2_session_callbacks *ngcallbacks;
 
@@ -289,22 +318,39 @@ struct grpc_server {
   uv_loop_t loop;
   uv_tcp_t ipv4_listener;
   uv_tcp_t ipv6_listener;
+  uv_pipe_t unix_listener;
   /* Timeout used by grpc_server_poll(). */
   uv_timer_t timer;
   /* Fires at the earliest stream deadline. */
   uv_timer_t deadline_timer;
+  /* Periodic timer for HTTP/2 keepalive, idle, and connection age checks. */
+  uv_timer_t maintenance_timer;
   /* Wakes the loop for grpc_server_post() and grpc_server_stop(). */
   uv_async_t async;
 
   bool loop_initialized : 1;
   bool ipv4_listener_active : 1;
   bool ipv6_listener_active : 1;
+  bool unix_listener_active : 1;
   bool timer_active : 1;
   bool deadline_timer_active : 1;
+  bool maintenance_timer_active : 1;
   bool async_active : 1;
   bool is_tls : 1;
 
   atomic_bool stop;
+
+  /* Runtime metrics (updated on the event-loop thread, readable from any thread). */
+  atomic_uint_fast64_t stat_active_connections;
+  atomic_uint_fast64_t stat_total_connections;
+  atomic_uint_fast64_t stat_active_streams;
+  atomic_uint_fast64_t stat_total_calls;
+  atomic_uint_fast64_t stat_calls_ok;
+  atomic_uint_fast64_t stat_calls_error;
+  atomic_uint_fast64_t stat_bytes_received;
+  atomic_uint_fast64_t stat_bytes_sent;
+  atomic_uint_fast64_t stat_messages_received;
+  atomic_uint_fast64_t stat_messages_sent;
 
   int ready_events;
 
@@ -349,6 +395,8 @@ struct grpc_server {
   struct reflection_state *reflection;
 
   struct grpc_tls_ctx *tls_ctx;
+  struct grpc_tls_ctx **retired_tls_ctxs;
+  size_t nb_retired_tls_ctxs;
 };
 
 /* ---- internal functions ------------------------------------------------------ */
@@ -377,6 +425,8 @@ grpc_err server_add_route(grpc_server *server, const char *path, route_kind kind
 /* grpc_interceptor.c */
 /* Run on_call interceptors; return false if one ends the call. */
 bool interceptors_run_on_call(grpc_call *call);
+bool interceptors_run_on_recv(grpc_call *call, const grpc_message *message);
+bool interceptors_run_on_send(grpc_call *call, const grpc_message *message);
 void interceptors_run_on_done(grpc_call *call, grpc_status status);
 void interceptors_free(grpc_server *server);
 
@@ -385,19 +435,6 @@ void health_free(grpc_server *server);
 void reflection_free(grpc_server *server);
 
 /* grpc_tls.c */
-typedef struct grpc_tls_config {
-  const char *cert_file;
-  const char *key_file;
-  const char *cert_pem;
-  size_t cert_pem_len;
-  const char *key_pem;
-  size_t key_pem_len;
-  const char *ca_file;
-  const char *ca_pem;
-  size_t ca_pem_len;
-  bool require_client_cert;
-} grpc_tls_config;
-
 grpc_err tls_enable(grpc_server *server, const grpc_tls_config *cfg);
 void tls_free(grpc_server *server);
 

@@ -133,6 +133,7 @@ static void call_free(grpc_call *call) {
   }
   if (call->userdata_free != nullptr)
     call->userdata_free(call->userdata);
+  grpc_free(call->method_override);
   grpc_free(call);
 }
 
@@ -231,9 +232,14 @@ grpc_call *call_new(grpc_session *session, grpc_stream *stream) {
   call->stream = stream;
   call->stream_id = stream->stream_id;
   call->start_ms = grpc_time_now_ms();
+  call->is_grpc_web = stream->is_grpc_web;
+  call->is_grpc_web_text = stream->is_grpc_web_text;
+  if (stream->route == session->server->fallback_route && stream->hpath != nullptr)
+    call->method_override = grpc_strndup(stream->hpath, stream->hpath_len);
   memcpy(call->peer, session->peer, sizeof(call->peer));
   memcpy(call->peer_cert_subject, session->peer_cert_subject, sizeof(call->peer_cert_subject));
   grpc_list_init(&call->pending);
+  atomic_fetch_add(&session->server->stat_total_calls, 1);
   grpc_compression_algorithm def_alg = session->server->config.default_compression;
   if (def_alg != GRPC_COMPRESS_IDENTITY && codec_is_supported(def_alg) &&
       client_accepts_encoding(call, def_alg)) {
@@ -270,11 +276,22 @@ void call_queue(grpc_call *call) {
   server->ready_tail = call;
 }
 
+static void call_record_done_stat(grpc_call *call, grpc_status status) {
+  if (call->stats_done)
+    return;
+  call->stats_done = true;
+  if (status == GRPC_STATUS_OK)
+    atomic_fetch_add(&call->server->stat_calls_ok, 1);
+  else
+    atomic_fetch_add(&call->server->stat_calls_error, 1);
+}
+
 static void call_cancel(grpc_call *call, grpc_status reason) {
   if (call->cancelled)
     return;
   call->cancelled = true;
   call->cancel_reason = reason;
+  call_record_done_stat(call, reason);
   interceptors_run_on_done(call, reason);
   call_queue(call);
 }
@@ -340,10 +357,14 @@ static grpc_err submit_response_headers(grpc_call *call, uint8_t flags,
   const char *accepted = ACCEPT_ZLIB "identity";
 #endif
 #undef ACCEPT_ZLIB
+  const char *ctype = call->is_grpc_web_text ? "application/grpc-web-text"
+                      : call->is_grpc_web    ? "application/grpc-web"
+                                             : "application/grpc";
   nghttp2_nv base[] = {
       NGHTTP2_NV(":status", "200"),
-      NGHTTP2_NV("content-type", "application/grpc"),
-      { (uint8_t *)"grpc-accept-encoding", (uint8_t *)accepted, sizeof("grpc-accept-encoding") - 1, 0, NGHTTP2_NV_FLAG_NONE },
+      {(uint8_t *)"content-type", (uint8_t *)ctype, 12, strlen(ctype), NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)"grpc-accept-encoding", (uint8_t *)accepted, sizeof("grpc-accept-encoding") - 1,
+       0, NGHTTP2_NV_FLAG_NONE},
       NGHTTP2_NV("grpc-encoding", "gzip"),
   };
   const char *encoding = "gzip";
@@ -415,7 +436,72 @@ static grpc_err call_finish_internal(grpc_call *call, grpc_status status,
 
   grpc_err err = GRPC_OK;
   grpc_stream *stream = call->stream;
-  if (!call->headers_sent) {
+  if (call->is_grpc_web) {
+    /* gRPC-Web encodes trailers inside a DATA frame with flag byte 0x80. */
+    if (!call->headers_sent)
+      err = submit_response_headers(call, NGHTTP2_FLAG_NONE, nullptr, 0);
+    if (err == GRPC_OK) {
+      grpc_buf tbuf = {0};
+      for (size_t i = 0; i < n; i++) {
+        if (buf_append(&tbuf, nva[i].name, nva[i].namelen) ||
+            buf_append(&tbuf, ": ", 2) ||
+            buf_append(&tbuf, nva[i].value, nva[i].valuelen) ||
+            buf_append(&tbuf, "\r\n", 2)) {
+          err = GRPC_ERR_NOMEM;
+          break;
+        }
+      }
+      if (err == GRPC_OK) {
+        grpc_message *tmsg = nullptr;
+        if (call->is_grpc_web_text) {
+          size_t raw_len = 5 + tbuf.len;
+          uint8_t *raw = grpc_malloc(raw_len);
+          if (raw == nullptr) {
+            err = GRPC_ERR_NOMEM;
+          } else {
+            raw[0] = 0x80;
+            uint32_t blen = htonl((uint32_t)tbuf.len);
+            memcpy(raw + 1, &blen, 4);
+            if (tbuf.len > 0)
+              memcpy(raw + 5, tbuf.data, tbuf.len);
+            size_t b64_len = 0;
+            char *b64 = grpc_metadata_encode_bin(raw, raw_len, &b64_len);
+            grpc_free(raw);
+            if (b64 == nullptr)
+              err = GRPC_ERR_NOMEM;
+            else {
+              tmsg = message_create(0xFE, b64, b64_len);
+              grpc_free(b64);
+              if (tmsg == nullptr)
+                err = GRPC_ERR_NOMEM;
+            }
+          }
+        } else {
+          tmsg = message_create(0x80, tbuf.data, tbuf.len);
+          if (tmsg == nullptr)
+            err = GRPC_ERR_NOMEM;
+        }
+        if (tmsg != nullptr) {
+          stream->send_eof_on_empty = true;
+          if (grpc_list_push_back(&stream->lqueue_omessages, tmsg) != 0) {
+            grpc_message_free(tmsg);
+            err = GRPC_ERR_NOMEM;
+          } else if (!stream->is_data_active) {
+            nghttp2_data_provider data_provider = {
+                .source.ptr = stream,
+                .read_callback = data_source_read_callback2,
+            };
+            if (nghttp2_submit_data(call->session->ngsession, NGHTTP2_FLAG_NONE, call->stream_id,
+                                    &data_provider) != 0)
+              err = GRPC_ERR_PROTOCOL;
+            else
+              stream->is_data_active = true;
+          }
+        }
+      }
+      buf_free(&tbuf);
+    }
+  } else if (!call->headers_sent) {
     /* nothing was sent: a single Trailers-Only HEADERS */
     err = submit_response_headers(call, NGHTTP2_FLAG_END_STREAM, nva, n);
   } else if (stream->is_data_active) {
@@ -437,6 +523,7 @@ static grpc_err call_finish_internal(grpc_call *call, grpc_status status,
   stream->is_deadline_set = false;
   nv_list_free(&call->trailers);
   session_schedule_flush(call->session);
+  call_record_done_stat(call, status);
   interceptors_run_on_done(call, status);
   return GRPC_OK;
 }
@@ -505,6 +592,20 @@ GRPC_API grpc_err grpc_call_send(grpc_call *call, grpc_message *message) {
     return err;
   }
 
+  grpc_stream *stream = call->stream;
+  size_t max_q = call->server->config.max_send_queue_bytes;
+  if (max_q > 0 && stream->queued_send_bytes > 0 &&
+      stream->queued_send_bytes + message->len > max_q) {
+    stream->was_backpressured = true;
+    grpc_message_free(message);
+    return GRPC_ERR_LIMIT;
+  }
+
+  if (!interceptors_run_on_send(call, message)) {
+    grpc_message_free(message);
+    return GRPC_ERR_FINISHED;
+  }
+
   if (message->cflag == 0 && call->auto_compression != GRPC_COMPRESS_IDENTITY) {
     grpc_message *compressed =
         grpc_message_compress(message, call->auto_compression, call->auto_compression_level);
@@ -528,11 +629,38 @@ GRPC_API grpc_err grpc_call_send(grpc_call *call, grpc_message *message) {
     return GRPC_ERR_STATE;
   }
 
-  grpc_stream *stream = call->stream;
+  if (call->is_grpc_web_text) {
+    size_t raw_len = 5 + (size_t)message->len;
+    uint8_t *raw = grpc_malloc(raw_len);
+    if (raw == nullptr) {
+      grpc_message_free(message);
+      return GRPC_ERR_NOMEM;
+    }
+    raw[0] = message->cflag;
+    uint32_t blen = htonl(message->len);
+    memcpy(raw + 1, &blen, 4);
+    if (message->len > 0)
+      memcpy(raw + 5, message->data, message->len);
+    size_t b64_len = 0;
+    char *b64 = grpc_metadata_encode_bin(raw, raw_len, &b64_len);
+    grpc_free(raw);
+    grpc_message_free(message);
+    if (b64 == nullptr)
+      return GRPC_ERR_NOMEM;
+    message = message_create(0xFE, b64, b64_len);
+    grpc_free(b64);
+    if (message == nullptr)
+      return GRPC_ERR_NOMEM;
+  }
+
   if (grpc_list_push_back(&stream->lqueue_omessages, message) != 0) {
     grpc_message_free(message);
     return GRPC_ERR_NOMEM;
   }
+  stream->queued_send_bytes += message->len;
+  if (max_q > 0 && stream->queued_send_bytes >= max_q)
+    stream->was_backpressured = true;
+  atomic_fetch_add(&call->server->stat_messages_sent, 1);
 
   /* an active data provider picks up the new message by itself */
   if (!stream->is_data_active) {
@@ -588,7 +716,9 @@ GRPC_API const grpc_message *grpc_call_request(const grpc_call *call) {
 }
 
 GRPC_API const char *grpc_call_method(const grpc_call *call) {
-  return call != nullptr ? call->route->path : nullptr;
+  if (call == nullptr)
+    return nullptr;
+  return call->method_override != nullptr ? call->method_override : call->route->path;
 }
 
 GRPC_API const char *grpc_call_peer(const grpc_call *call) {
@@ -681,6 +811,87 @@ GRPC_API void grpc_call_on_cancel(grpc_call *call,
     return;
   call->cancel_fn = fn;
   call->cancel_userdata = userdata;
+}
+
+GRPC_API size_t grpc_call_send_queue_bytes(const grpc_call *call) {
+  return call != nullptr && call->stream != nullptr ? call->stream->queued_send_bytes : 0;
+}
+
+GRPC_API bool grpc_call_is_writable(const grpc_call *call) {
+  if (call == nullptr || call->stream == nullptr || call->finished || call->closed)
+    return false;
+  size_t max_q = call->server->config.max_send_queue_bytes;
+  return max_q == 0 || call->stream->queued_send_bytes < max_q;
+}
+
+GRPC_API void grpc_call_on_writable(grpc_call *call,
+                                    void (*fn)(grpc_call *call, void *userdata), void *userdata) {
+  if (call == nullptr)
+    return;
+  call->writable_fn = fn;
+  call->writable_userdata = userdata;
+}
+
+static bool is_hex_lower_or_digit(char c) {
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+}
+
+static int hex_val(char c) {
+  if (c >= '0' && c <= '9')
+    return c - '0';
+  if (c >= 'a' && c <= 'f')
+    return 10 + (c - 'a');
+  return -1;
+}
+
+GRPC_API bool grpc_call_trace_context(const grpc_call *call, grpc_trace_context *out) {
+  if (out != nullptr)
+    memset(out, 0, sizeof(*out));
+  if (call == nullptr || out == nullptr)
+    return false;
+  size_t len = 0;
+  const char *tp = grpc_call_metadata(call, "traceparent", &len);
+  /* W3C traceparent: "00-<32 hex>-<16 hex>-<2 hex>" = 55 chars */
+  if (tp == nullptr || len != 55 || tp[0] != '0' || tp[1] != '0' || tp[2] != '-' ||
+      tp[35] != '-' || tp[52] != '-')
+    return false;
+  bool trace_nonzero = false, span_nonzero = false;
+  for (size_t i = 0; i < 32; i++) {
+    char c = tp[3 + i];
+    if (!is_hex_lower_or_digit(c))
+      return false;
+    if (c != '0')
+      trace_nonzero = true;
+    out->trace_id[i] = c;
+  }
+  out->trace_id[32] = '\0';
+  for (size_t i = 0; i < 16; i++) {
+    char c = tp[36 + i];
+    if (!is_hex_lower_or_digit(c))
+      return false;
+    if (c != '0')
+      span_nonzero = true;
+    out->span_id[i] = c;
+  }
+  out->span_id[16] = '\0';
+  int hi = hex_val(tp[53]), lo = hex_val(tp[54]);
+  if (!trace_nonzero || !span_nonzero || hi < 0 || lo < 0) {
+    memset(out, 0, sizeof(*out));
+    return false;
+  }
+  out->trace_flags = (uint8_t)((hi << 4) | lo);
+  out->valid = true;
+  return true;
+}
+
+GRPC_API grpc_err grpc_traceparent_format(const grpc_trace_context *ctx, char *buf,
+                                          size_t buf_len) {
+  if (ctx == nullptr || buf == nullptr || buf_len < 56 || !ctx->valid)
+    return GRPC_ERR_INVALID;
+  if (strlen(ctx->trace_id) != 32 || strlen(ctx->span_id) != 16)
+    return GRPC_ERR_INVALID;
+  snprintf(buf, buf_len, "00-%s-%s-%02x", ctx->trace_id, ctx->span_id, ctx->trace_flags);
+  return GRPC_OK;
 }
 
 /* ---- from other threads -------------------------------------------------------- */
@@ -913,6 +1124,8 @@ static void dispatch_unary(grpc_call *call) {
   }
   call->request = grpc_list_pop_front(&call->pending);
   call->request_delivered = true;
+  if (!interceptors_run_on_recv(call, call->request))
+    return;
   call->route->handler(call, call->request, call->route->userdata);
 }
 
@@ -920,6 +1133,10 @@ static void dispatch_stream(grpc_call *call) {
   const grpc_stream_handler *handler = &call->route->stream;
   grpc_message *msg;
   while (!call->finished && (msg = grpc_list_pop_front(&call->pending)) != nullptr) {
+    if (!interceptors_run_on_recv(call, msg)) {
+      grpc_message_free(msg);
+      break;
+    }
     if (handler->on_message != nullptr)
       handler->on_message(call, msg, call->route->userdata);
     grpc_message_free(msg);
@@ -936,8 +1153,13 @@ static void dispatch_stream(grpc_call *call) {
 static void dispatch_events(grpc_call *call) {
   grpc_server *server = call->server;
   grpc_message *msg;
-  while (!call->finished && (msg = grpc_list_pop_front(&call->pending)) != nullptr)
+  while (!call->finished && (msg = grpc_list_pop_front(&call->pending)) != nullptr) {
+    if (!interceptors_run_on_recv(call, msg)) {
+      grpc_message_free(msg);
+      break;
+    }
     push_event(server, GRPC_EVENT_MESSAGE, call, msg);
+  }
   drop_pending(call);
   if (call->half_closed && !call->end_delivered && !call->finished) {
     call->end_delivered = true;

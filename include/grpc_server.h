@@ -5,6 +5,7 @@
 #include "grpc_defs.h"
 #include "grpc_error.h"
 #include "grpc_event.h"
+#include "grpc_tls.h"
 
 typedef struct grpc_server grpc_server;
 
@@ -30,13 +31,15 @@ typedef enum grpc_log_level {
  */
 typedef struct grpc_config {
   /** Port for both address families. 0 requests an OS-assigned ephemeral port
-   * (query it with grpc_server_port()). */
+   * (query it with grpc_server_port()). Ignored when only unix_path is set. */
   uint16_t port;
-  /** IPv4 address to listen on. When both addresses are nullptr, the server
-   * listens on "0.0.0.0" and "::". When only one is set, only that one. */
+  /** IPv4 address to listen on. When ipv4_addr, ipv6_addr and unix_path are all
+   * nullptr, the server listens on "0.0.0.0" and "::". */
   const char *ipv4_addr;
   /** IPv6 address to listen on; see ipv4_addr. */
   const char *ipv6_addr;
+  /** Optional Unix Domain Socket path (or Windows named pipe) to listen on. */
+  const char *unix_path;
   /** listen() backlog. Default 1024. */
   int backlog;
   /** Concurrent connections. Default 1024. */
@@ -47,29 +50,48 @@ typedef struct grpc_config {
   uint32_t max_message_size;
   /** Largest HTTP/2 frame, in bytes. Default 16 KiB. */
   uint32_t max_frame_size;
+  /** Maximum queued outbound bytes per stream for streaming backpressure. 0 = unlimited. */
+  size_t max_send_queue_bytes;
+  /** HTTP/2 keepalive PING interval on idle connections (ms). 0 = disabled. */
+  uint32_t keepalive_time_ms;
+  /** Time to wait for a keepalive PING ACK before closing (ms). Default 20000 when keepalive enabled. */
+  uint32_t keepalive_timeout_ms;
+  /** Close idle connections with no active streams after this many ms. 0 = unlimited. */
+  uint32_t max_connection_idle_ms;
+  /** Send GOAWAY after a connection has lived this many ms. 0 = unlimited. */
+  uint32_t max_connection_age_ms;
+  /** Grace period after max_connection_age GOAWAY before closing (ms). Default 5000. */
+  uint32_t max_connection_age_grace_ms;
+  /** Max unsolicited client PINGs faster than min_ping_interval_ms before ENHANCE_YOUR_CALM. 0 = unlimited. */
+  uint32_t max_ping_strikes;
+  /** Minimum interval between client PINGs (ms). Default 5000 when max_ping_strikes > 0. */
+  uint32_t min_ping_interval_ms;
   /** Default response compression when accepted by the client. Default GRPC_COMPRESS_IDENTITY. */
   grpc_compression_algorithm default_compression;
   /** Default response compression level (0 or GRPC_COMPRESSION_LEVEL_DEFAULT for codec default). */
   int default_compression_level;
   /** TLS settings: provide either cert_file+key_file or cert_pem+key_pem.
    * Optionally configure ca_file/ca_pem and require_client_cert for mTLS. */
-  struct {
-    const char *cert_file;
-    const char *key_file;
-    const char *cert_pem;
-    size_t cert_pem_len;
-    const char *key_pem;
-    size_t key_pem_len;
-    const char *ca_file;
-    const char *ca_pem;
-    size_t ca_pem_len;
-    bool require_client_cert;
-  } tls;
+  grpc_tls_config tls;
   /** Initial log threshold. Defaults to GRPC_LOG_INFO. */
   grpc_log_level log_level;
   /** Log output stream. Defaults to stderr. */
   FILE *log_file;
 } grpc_config;
+
+/** Snapshot of server-wide runtime metrics. */
+typedef struct grpc_server_stats {
+  uint64_t active_connections;
+  uint64_t total_connections;
+  uint64_t active_streams;
+  uint64_t total_calls;
+  uint64_t calls_ok;
+  uint64_t calls_error;
+  uint64_t bytes_received;
+  uint64_t bytes_sent;
+  uint64_t messages_received;
+  uint64_t messages_sent;
+} grpc_server_stats;
 
 /**
  * Handles a method whose client sends a single request: unary and
@@ -151,6 +173,19 @@ GRPC_API grpc_err grpc_server_register_path(grpc_server *server, const char *pat
  * Stops accepting new calls to a method. Calls in progress are unaffected.
  */
 GRPC_API grpc_err grpc_server_unregister(grpc_server *server, const char *path);
+
+/**
+ * Sets a fallback / wildcard stream handler for any unregistered method path
+ * (enabling proxies, gateways, and dynamic routing). Pass nullptr to clear it
+ * and restore automatic UNIMPLEMENTED responses.
+ */
+GRPC_API grpc_err grpc_server_set_fallback(grpc_server *server,
+                                           const grpc_stream_handler *handler, void *userdata);
+
+/**
+ * Copies a snapshot of runtime metrics into ``out``. Thread-safe.
+ */
+GRPC_API grpc_err grpc_server_get_stats(const grpc_server *server, grpc_server_stats *out);
 
 /**
  * Serves until grpc_server_stop() is called.

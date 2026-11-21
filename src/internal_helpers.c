@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include "core.h"
 #include "grpc_header.h"
+#include "grpc_timeout.h"
 #include "internal_nghttp2_callbacks.h"
 #include "internal_helpers.h"
 #include "internal_tls.h"
@@ -122,6 +123,16 @@ void ezflog(FILE *fp, const char *fmt, ...) {
 /* stop pulling frames out of nghttp2 once this many bytes wait for the kernel */
 static const size_t GRPC_OBUF_HIGH_WATER = 256 * 1024;
 
+static inline uv_stream_t *session_stream(grpc_session *session) {
+  return session->is_unix ? (uv_stream_t *)&session->handle.pipe
+                          : (uv_stream_t *)&session->handle.tcp;
+}
+
+static inline uv_handle_t *session_handle(grpc_session *session) {
+  return session->is_unix ? (uv_handle_t *)&session->handle.pipe
+                          : (uv_handle_t *)&session->handle.tcp;
+}
+
 static void on_session_close(uv_handle_t *handle) {
   grpc_session *session = handle->data;
   grpc_server *server = session->server;
@@ -132,12 +143,17 @@ static void on_session_close(uv_handle_t *handle) {
   session->nb_streams = 0;
   session->tls_handshake_done = false;
   session->is_writing = false;
+  session->is_unix = false;
+  session->ping_pending = false;
+  session->goaway_sent = false;
+  session->ping_strikes = 0;
   memset(&session->sockaddr, 0, sizeof(session->sockaddr));
   session->peer[0] = '\0';
   session->peer_cert_subject[0] = '\0';
   session->is_closing = false;
   session->is_active = false;
 
+  atomic_fetch_sub(&server->stat_active_connections, 1);
   server->free_sessions[server->nb_free_sessions++] = ndx;
 }
 
@@ -148,7 +164,7 @@ void session_close(grpc_session *session) {
   session->is_closing = true;
   LOG_DEBUG(session->server, "closing connection from %s\n", session->peer);
 
-  uv_read_stop((uv_stream_t *)&session->tcp);
+  uv_read_stop(session_stream(session));
 
   /* before nghttp2_session_del(): the streams hold nghttp2 buffers that are
    * released through the session */
@@ -173,7 +189,7 @@ void session_close(grpc_session *session) {
       grpc_tls_close_notify(session);
       if (!grpc_tls_drain(session, &session->obuf) && session->obuf.len > 0) {
         uv_buf_t buf = uv_buf_init((char *)session->obuf.data, (unsigned int)session->obuf.len);
-        (void)uv_try_write((uv_stream_t *)&session->tcp, &buf, 1);
+        (void)uv_try_write(session_stream(session), &buf, 1);
       }
     }
     grpc_tls_session_free(session);
@@ -181,7 +197,7 @@ void session_close(grpc_session *session) {
   }
 
   /* pending writes are cancelled before on_session_close runs */
-  uv_close((uv_handle_t *)&session->tcp, on_session_close);
+  uv_close(session_handle(session), on_session_close);
 }
 
 static void *nghttp2_mem_malloc(size_t size, [[maybe_unused]] void *user_data) {
@@ -239,8 +255,13 @@ static int session_create(grpc_session *ezsession) {
 }
 
 static void session_set_peer(grpc_session *ezsession) {
+  if (ezsession->is_unix) {
+    snprintf(ezsession->peer, sizeof(ezsession->peer), "unix");
+    return;
+  }
   int namelen = sizeof(ezsession->sockaddr);
-  if (uv_tcp_getpeername(&ezsession->tcp, (struct sockaddr *)&ezsession->sockaddr, &namelen) != 0) {
+  if (uv_tcp_getpeername(&ezsession->handle.tcp, (struct sockaddr *)&ezsession->sockaddr,
+                         &namelen) != 0) {
     return;
   }
   ezsession->socklen = namelen;
@@ -325,6 +346,8 @@ static void on_session_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *
     session_close(ezsession);
     return;
   }
+  atomic_fetch_add(&ezsession->server->stat_bytes_received, (uint64_t)nread);
+  ezsession->last_activity_ms = grpc_time_now_ms();
 
   int res = ezsession->is_tls ? session_recv_tls(ezsession, (const u8 *)buf->base, (size_t)nread)
                               : session_recv(ezsession, (const u8 *)buf->base, (size_t)nread);
@@ -342,7 +365,19 @@ static void on_reject_close(uv_handle_t *handle) {
 }
 
 /* libuv stops accepting until the pending connection is taken, so take it and drop it */
-static void reject_connection(grpc_server *server, uv_stream_t *listener) {
+static void reject_connection(grpc_server *server, uv_stream_t *listener, bool is_unix) {
+  if (is_unix) {
+    uv_pipe_t *pipe = grpc_malloc(sizeof(*pipe));
+    if (pipe == nullptr)
+      return;
+    if (uv_pipe_init(&server->loop, pipe, 0) != 0) {
+      grpc_free(pipe);
+      return;
+    }
+    (void)uv_accept(listener, (uv_stream_t *)pipe);
+    uv_close((uv_handle_t *)pipe, on_reject_close);
+    return;
+  }
   uv_tcp_t *tcp = grpc_malloc(sizeof(*tcp));
   if (tcp == nullptr) {
     return;
@@ -361,39 +396,53 @@ void on_listener_connection(uv_stream_t *listener, int status) {
     LOG_ERROR(server, "accept: %s\n", uv_strerror(status));
     return;
   }
+  bool is_unix = server->unix_listener_active && listener == (uv_stream_t *)&server->unix_listener;
 
   if (server->nb_free_sessions == 0) {
     LOG_WARNING(server, "max_connections (%zu) reached, rejecting a connection\n",
                 server->nb_sessions);
-    reject_connection(server, listener);
+    reject_connection(server, listener, is_unix);
     return;
   }
 
   size_t ndx = server->free_sessions[server->nb_free_sessions - 1];
   grpc_session *session = &server->sessions[ndx];
-  if (uv_tcp_init(&server->loop, &session->tcp) != 0) {
-    reject_connection(server, listener);
+  int init_rc = is_unix ? uv_pipe_init(&server->loop, &session->handle.pipe, 0)
+                        : uv_tcp_init(&server->loop, &session->handle.tcp);
+  if (init_rc != 0) {
+    reject_connection(server, listener, is_unix);
     return;
   }
   server->nb_free_sessions--;
-  session->tcp.data = session;
+  session->is_unix = is_unix;
+  session_handle(session)->data = session;
   session->server = server;
   session->index = ndx;
   session->is_active = true;
   session->is_closing = false;
+  uint64_t now = grpc_time_now_ms();
+  session->created_ms = now;
+  session->last_activity_ms = now;
+  session->ping_pending = false;
+  session->goaway_sent = false;
+  session->ping_strikes = 0;
+  atomic_fetch_add(&server->stat_active_connections, 1);
+  atomic_fetch_add(&server->stat_total_connections, 1);
   /* from here on, session_close() returns the slot */
 
-  if (uv_accept(listener, (uv_stream_t *)&session->tcp) != 0) {
+  if (uv_accept(listener, session_stream(session)) != 0) {
     session_close(session);
     return;
   }
   server->ready_events++;
 
-  uv_os_fd_t fd;
-  if (uv_fileno((uv_handle_t *)&session->tcp, &fd) == 0)
-    (void)setsockopt((uv_os_sock_t)(uintptr_t)fd, SOL_SOCKET, SO_KEEPALIVE, (const char *)&(int){1},
-                     sizeof(int));
-  (void)uv_tcp_nodelay(&session->tcp, 1);
+  if (!is_unix) {
+    uv_os_fd_t fd;
+    if (uv_fileno((uv_handle_t *)&session->handle.tcp, &fd) == 0)
+      (void)setsockopt((uv_os_sock_t)(uintptr_t)fd, SOL_SOCKET, SO_KEEPALIVE,
+                       (const char *)&(int){1}, sizeof(int));
+    (void)uv_tcp_nodelay(&session->handle.tcp, 1);
+  }
   session_set_peer(session);
   LOG_DEBUG(server, "connection from %s\n", session->peer);
 
@@ -403,7 +452,7 @@ void on_listener_connection(uv_stream_t *listener, int status) {
     return;
   }
 
-  if (uv_read_start((uv_stream_t *)&session->tcp, on_session_alloc, on_session_read) != 0) {
+  if (uv_read_start(session_stream(session), on_session_alloc, on_session_read) != 0) {
     session_close(session);
     return;
   }
@@ -491,7 +540,7 @@ void session_flush(grpc_session *ezsession) {
       break;
 
     uv_buf_t buf = uv_buf_init((char *)ezsession->obuf.data, (unsigned int)ezsession->obuf.len);
-    int n = uv_try_write((uv_stream_t *)&ezsession->tcp, &buf, 1);
+    int n = uv_try_write(session_stream(ezsession), &buf, 1);
     if (n == UV_EAGAIN)
       n = 0;
     if (n < 0) {
@@ -499,6 +548,8 @@ void session_flush(grpc_session *ezsession) {
       session_close(ezsession);
       return;
     }
+    if (n > 0)
+      atomic_fetch_add(&ezsession->server->stat_bytes_sent, (uint64_t)n);
     if ((size_t)n == ezsession->obuf.len) {
       ezsession->obuf.len = 0;
       continue;
@@ -509,11 +560,11 @@ void session_flush(grpc_session *ezsession) {
     ezsession->wbuf = ezsession->obuf;
     ezsession->obuf = tmp;
     ezsession->obuf.len = 0;
-    buf = uv_buf_init((char *)ezsession->wbuf.data + n,
-                      (unsigned int)(ezsession->wbuf.len - (size_t)n));
+    size_t rem = ezsession->wbuf.len - (size_t)n;
+    atomic_fetch_add(&ezsession->server->stat_bytes_sent, (uint64_t)rem);
+    buf = uv_buf_init((char *)ezsession->wbuf.data + n, (unsigned int)rem);
     ezsession->write_req.data = ezsession;
-    if (uv_write(&ezsession->write_req, (uv_stream_t *)&ezsession->tcp, &buf, 1,
-                 on_session_write) != 0) {
+    if (uv_write(&ezsession->write_req, session_stream(ezsession), &buf, 1, on_session_write) != 0) {
       session_close(ezsession);
       return;
     }
@@ -564,6 +615,7 @@ void stream_link(grpc_session *session, grpc_stream *stream) {
     session->streams->prev = stream;
   session->streams = stream;
   session->nb_streams++;
+  atomic_fetch_add(&session->server->stat_active_streams, 1);
 }
 
 void stream_unlink(grpc_session *session, grpc_stream *stream) {
@@ -575,4 +627,5 @@ void stream_unlink(grpc_session *session, grpc_stream *stream) {
     stream->next->prev = stream->prev;
   stream->prev = stream->next = nullptr;
   session->nb_streams--;
+  atomic_fetch_sub(&session->server->stat_active_streams, 1);
 }

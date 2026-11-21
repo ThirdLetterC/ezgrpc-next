@@ -19,7 +19,15 @@ typedef struct grpc_server grpc_server;
  */
 typedef struct grpc_interceptor {
   const char *name;
+  /** Optional path prefix filter (e.g. "/helloworld.Greeter/"). nullptr matches all methods. */
+  const char *path_prefix;
   grpc_status (*on_call)(grpc_call *call, const char **message, void *userdata);
+  /** Optional hook called before each received message is delivered to the handler. */
+  grpc_status (*on_recv_message)(grpc_call *call, const grpc_message *message,
+                                 const char **error_msg, void *userdata);
+  /** Optional hook called before each response message is queued for sending. */
+  grpc_status (*on_send_message)(grpc_call *call, const grpc_message *message,
+                                 const char **error_msg, void *userdata);
   void (*on_done)(grpc_call *call, grpc_status status, uint64_t duration_ms,
                   void *userdata);
   void *userdata;
@@ -42,3 +50,9 @@ typedef bool (*grpc_token_validator_fn)(const char *token, void *userdata);
  */
 GRPC_API grpc_interceptor grpc_interceptor_bearer_auth(grpc_token_validator_fn validator,
                                                                 void *userdata);
+
+/**
+ * A token-bucket rate limiter interceptor. Ends calls with RESOURCE_EXHAUSTED
+ * once ``burst`` tokens are consumed faster than ``requests_per_sec``.
+ */
+GRPC_API grpc_interceptor grpc_interceptor_rate_limit(double requests_per_sec, size_t burst);

@@ -27,11 +27,40 @@ grpc_err tls_enable(grpc_server *server, const grpc_tls_config *cfg) {
     LOG_ERROR(server, "cannot load the TLS certificate/key configuration\n");
     return GRPC_ERR_INVALID;
   }
-  if (server->tls_ctx != nullptr)
-    tls_backend_ctx_free(server->tls_ctx);
+  if (server->tls_ctx != nullptr) {
+    grpc_tls_ctx **retired = grpc_realloc(
+        server->retired_tls_ctxs, (server->nb_retired_tls_ctxs + 1) * sizeof(*retired));
+    if (retired != nullptr) {
+      server->retired_tls_ctxs = retired;
+      server->retired_tls_ctxs[server->nb_retired_tls_ctxs++] = server->tls_ctx;
+    } else {
+      tls_backend_ctx_free(server->tls_ctx);
+    }
+  }
   server->tls_ctx = ctx;
   server->is_tls = 1;
   return GRPC_OK;
+}
+
+GRPC_API grpc_err grpc_server_reload_tls(grpc_server *server, const grpc_tls_config *tls) {
+  if (server == nullptr || tls == nullptr)
+    return GRPC_ERR_INVALID;
+  bool has_files = tls->cert_file != nullptr || tls->key_file != nullptr;
+  bool has_pems = tls->cert_pem != nullptr || tls->key_pem != nullptr;
+  if ((has_files && has_pems) || (!has_files && !has_pems))
+    return GRPC_ERR_INVALID;
+  if (has_files && (tls->cert_file == nullptr || tls->key_file == nullptr))
+    return GRPC_ERR_INVALID;
+  if (has_pems && (tls->cert_pem == nullptr || tls->key_pem == nullptr))
+    return GRPC_ERR_INVALID;
+  grpc_tls_config normalized = *tls;
+  if (normalized.cert_pem != nullptr && normalized.cert_pem_len == 0)
+    normalized.cert_pem_len = strlen(normalized.cert_pem);
+  if (normalized.key_pem != nullptr && normalized.key_pem_len == 0)
+    normalized.key_pem_len = strlen(normalized.key_pem);
+  if (normalized.ca_pem != nullptr && normalized.ca_pem_len == 0)
+    normalized.ca_pem_len = strlen(normalized.ca_pem);
+  return tls_enable(server, &normalized);
 }
 
 void tls_free(grpc_server *server) {
@@ -39,6 +68,11 @@ void tls_free(grpc_server *server) {
     tls_backend_ctx_free(server->tls_ctx);
     server->tls_ctx = nullptr;
   }
+  for (size_t i = 0; i < server->nb_retired_tls_ctxs; i++)
+    tls_backend_ctx_free(server->retired_tls_ctxs[i]);
+  grpc_free(server->retired_tls_ctxs);
+  server->retired_tls_ctxs = nullptr;
+  server->nb_retired_tls_ctxs = 0;
 }
 
 int grpc_tls_session_init(grpc_session *session) {
@@ -138,6 +172,12 @@ GRPC_API void *grpc_server_tls_native([[maybe_unused]] grpc_server *server) {
 
 grpc_err tls_enable(grpc_server *server, [[maybe_unused]] const grpc_tls_config *cfg) {
   LOG_ERROR(server, "TLS is configured, but grpc is built without TLS (TLS=none)\n");
+  return GRPC_ERR_UNSUPPORTED;
+}
+
+GRPC_API grpc_err grpc_server_reload_tls(grpc_server *server, const grpc_tls_config *tls) {
+  if (server == nullptr || tls == nullptr)
+    return GRPC_ERR_INVALID;
   return GRPC_ERR_UNSUPPORTED;
 }
 

@@ -105,6 +105,8 @@ configure_file(include/grpc_version_config.h.in
 
 set(GRPC_SOURCES
   src/grpc_call.c
+  src/grpc_channelz.c
+  src/grpc_client.c
   src/grpc_compression.c
   src/grpc_health.c
   src/grpc_interceptor.c
@@ -273,7 +275,7 @@ if(GRPC_BUILD_TESTS)
     set(GRPC_TEST_TARGETS "${GRPC_TEST_TARGETS}" PARENT_SCOPE)
   endfunction()
 
-  foreach(name IN ITEMS api list mem metadata timeout compression health interceptor status_details reflection version)
+  foreach(name IN ITEMS api list mem metadata timeout compression health interceptor status_details reflection version client)
     grpc_add_unit_test(${name} "src/tests/${name}.c")
   endforeach()
 

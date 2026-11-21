@@ -38,6 +38,20 @@ void test_tls_server(void) {
   grpc_server *server = new_tls_server("test_cert.pem", "test_key.pem");
   TEST_ASSERT_NOT_NULL(server);
   TEST_ASSERT_NOT_NULL(grpc_server_tls_native(server));
+
+  /* Hot-reload with valid PEMs succeeds and swaps the native context; invalid fails safely. */
+  void *old_ctx = grpc_server_tls_native(server);
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
+                        grpc_server_reload_tls(server, &(grpc_tls_config){
+                                                           .cert_file = "nonexistent.pem",
+                                                           .key_file = "nonexistent.pem"}));
+  TEST_ASSERT_EQUAL_PTR(old_ctx, grpc_server_tls_native(server));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_reload_tls(server, &(grpc_tls_config){
+                                                                    .cert_file = "test_cert.pem",
+                                                                    .key_file = "test_key.pem"}));
+  TEST_ASSERT_NOT_NULL(grpc_server_tls_native(server));
+  TEST_ASSERT_TRUE(grpc_server_tls_native(server) != old_ctx);
+
   grpc_server_free(server);
 
   server = grpc_server_new(
@@ -94,6 +108,20 @@ void test_tls_in_memory_pem_and_mtls(void) {
   });
   TEST_ASSERT_NOT_NULL(server);
   TEST_ASSERT_NOT_NULL(grpc_server_tls_native(server));
+
+  /* Hot-reload with valid PEMs succeeds and swaps the native context; invalid fails safely. */
+  void *old_ctx = grpc_server_tls_native(server);
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
+                        grpc_server_reload_tls(server, &(grpc_tls_config){
+                                                           .cert_file = "nonexistent.pem",
+                                                           .key_file = "nonexistent.pem"}));
+  TEST_ASSERT_EQUAL_PTR(old_ctx, grpc_server_tls_native(server));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_reload_tls(server, &(grpc_tls_config){
+                                                                    .cert_file = "test_cert.pem",
+                                                                    .key_file = "test_key.pem"}));
+  TEST_ASSERT_NOT_NULL(grpc_server_tls_native(server));
+  TEST_ASSERT_TRUE(grpc_server_tls_native(server) != old_ctx);
+
   grpc_server_free(server);
 
   free(cert_pem);
