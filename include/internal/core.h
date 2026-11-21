@@ -176,6 +176,7 @@ struct grpc_stream {
   nghttp2_rcbuf *header_rcbufs[CONFIG_STREAM_MAX_HEADERS][2];
 
   bool is_method_post : 1;
+  bool is_method_options : 1;
   bool is_scheme_http : 1;
   /* True when the te header contains trailers. */
   bool is_te_trailers : 1;

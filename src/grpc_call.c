@@ -366,6 +366,9 @@ static grpc_err submit_response_headers(grpc_call *call, uint8_t flags,
       {(uint8_t *)"grpc-accept-encoding", (uint8_t *)accepted, sizeof("grpc-accept-encoding") - 1,
        0, NGHTTP2_NV_FLAG_NONE},
       NGHTTP2_NV("grpc-encoding", "gzip"),
+      NGHTTP2_NV("access-control-allow-origin", "*"),
+      NGHTTP2_NV("access-control-expose-headers",
+                 "grpc-status, grpc-message, grpc-status-details-bin"),
   };
   const char *encoding = "gzip";
   switch (call->compression) {
@@ -378,15 +381,24 @@ static grpc_err submit_response_headers(grpc_call *call, uint8_t flags,
   base[3].value = (uint8_t *)encoding;
   base[3].valuelen = strlen(encoding);
   size_t nb_base = call->compression != GRPC_COMPRESS_IDENTITY ? 4 : 3;
-  size_t total = nb_base + call->headers.len + nb_extra;
+  size_t nb_cors = call->is_grpc_web ? 2 : 0;
+  size_t total = nb_base + nb_cors + call->headers.len + nb_extra;
   nghttp2_nv *nva = grpc_malloc(total * sizeof(*nva));
   if (nva == nullptr)
     return GRPC_ERR_NOMEM;
-  memcpy(nva, base, nb_base * sizeof(*nva));
-  if (call->headers.len > 0)
-    memcpy(nva + nb_base, call->headers.nva, call->headers.len * sizeof(*nva));
+  size_t off = 0;
+  memcpy(nva + off, base, nb_base * sizeof(*nva));
+  off += nb_base;
+  if (nb_cors > 0) {
+    memcpy(nva + off, &base[4], nb_cors * sizeof(*nva));
+    off += nb_cors;
+  }
+  if (call->headers.len > 0) {
+    memcpy(nva + off, call->headers.nva, call->headers.len * sizeof(*nva));
+    off += call->headers.len;
+  }
   if (nb_extra > 0)
-    memcpy(nva + nb_base + call->headers.len, extra, nb_extra * sizeof(*nva));
+    memcpy(nva + off, extra, nb_extra * sizeof(*nva));
 
   int res = nghttp2_submit_headers(call->session->ngsession, flags, call->stream_id, nullptr, nva,
                                    total, nullptr);

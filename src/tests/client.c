@@ -253,9 +253,166 @@ void test_unix_domain_socket(void) {
 }
 #endif
 
+static void bidi_on_msg(grpc_call *call, const grpc_message *msg, [[maybe_unused]] void *userdata) {
+  (void)grpc_call_send_data(call, msg->data, msg->len);
+}
+
+static void bidi_on_end(grpc_call *call, [[maybe_unused]] void *userdata) {
+  (void)grpc_call_finish(call, GRPC_STATUS_OK, nullptr);
+}
+
+static void cstream_on_start(grpc_call *call, [[maybe_unused]] void *userdata) {
+  int *sum = grpc_calloc(1, sizeof(*sum));
+  grpc_call_set_userdata(call, sum, grpc_free);
+}
+
+static void cstream_on_msg(grpc_call *call, const grpc_message *msg,
+                           [[maybe_unused]] void *userdata) {
+  int *sum = grpc_call_userdata(call);
+  *sum += (int)msg->len;
+}
+
+static void cstream_on_end(grpc_call *call, [[maybe_unused]] void *userdata) {
+  int *sum = grpc_call_userdata(call);
+  char out[32];
+  int n = snprintf(out, sizeof(out), "%d", *sum);
+  (void)grpc_call_reply_data(call, out, (size_t)n);
+}
+
+static void flaky_unary(grpc_call *call, const grpc_message *req, void *userdata) {
+  int *attempts = userdata;
+  (*attempts)++;
+  if (*attempts == 1) {
+    (void)grpc_call_finish(call, GRPC_STATUS_UNAVAILABLE, "transient error");
+    return;
+  }
+  (void)grpc_call_reply_data(call, req->data, req->len);
+}
+
+static void count_hits_unary(grpc_call *call, const grpc_message *req, void *userdata) {
+  int *hits = userdata;
+  (*hits)++;
+  (void)grpc_call_reply_data(call, req->data, req->len);
+}
+
+void test_client_streaming_bidi_retries_and_lb(void) {
+  int flaky_attempts = 0;
+  int hits_a = 0, hits_b = 0;
+
+  grpc_server *srv_a = grpc_server_new(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
+  grpc_server *srv_b = grpc_server_new(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
+  TEST_ASSERT_NOT_NULL(srv_a);
+  TEST_ASSERT_NOT_NULL(srv_b);
+
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_handle_stream(
+                   srv_a, "/stream.Svc/Bidi",
+                   &(grpc_stream_handler){.on_message = bidi_on_msg, .on_end = bidi_on_end},
+                   nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle_stream(srv_a, "/stream.Svc/Sum",
+                                                  &(grpc_stream_handler){
+                                                      .on_start = cstream_on_start,
+                                                      .on_message = cstream_on_msg,
+                                                      .on_end = cstream_on_end,
+                                                  },
+                                                  nullptr));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_handle(srv_a, "/retry.Svc/Flaky", flaky_unary, &flaky_attempts));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(srv_a, "/lb.Svc/Ping", count_hits_unary, &hits_a));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(srv_b, "/lb.Svc/Ping", count_hits_unary, &hits_b));
+
+  pthread_t th_a, th_b;
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th_a, nullptr, run_server_thread, srv_a));
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th_b, nullptr, run_server_thread, srv_b));
+
+  /* 1. Client-streaming & Bidi-streaming + Retries against srv_a */
+  grpc_err err = GRPC_OK;
+  grpc_client *client = grpc_client_new(
+      &(grpc_client_config){
+          .host = "127.0.0.1",
+          .port = grpc_server_port(srv_a),
+          .timeout_ms = 3000,
+          .max_retries = 2,
+          .retry_backoff_ms = 10,
+      },
+      &err);
+  TEST_ASSERT_NOT_NULL(client);
+
+  /* Client streaming: send 3 chunks (2 + 3 + 4 = 9 bytes), close send, recv "9" */
+  grpc_client_stream *cs =
+      grpc_client_stream_open(client, "/stream.Svc/Sum", nullptr, 0, 3000, &err);
+  TEST_ASSERT_NOT_NULL(cs);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(cs, "ab", 2));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(cs, "cde", 3));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(cs, "fghi", 4));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_close_send(cs));
+  grpc_client_response resp = {0};
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_finish(cs, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  TEST_ASSERT_NOT_NULL(resp.message);
+  TEST_ASSERT_EQUAL_MEMORY("9", resp.message->data, 1);
+  grpc_client_response_free(&resp);
+
+  /* Bidi streaming: interleaved send & recv */
+  grpc_client_stream *bs =
+      grpc_client_stream_open(client, "/stream.Svc/Bidi", nullptr, 0, 3000, &err);
+  TEST_ASSERT_NOT_NULL(bs);
+  for (int i = 0; i < 3; i++) {
+    char msg[16];
+    int n = snprintf(msg, sizeof(msg), "ping-%d", i);
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(bs, msg, (size_t)n));
+    grpc_message *reply = nullptr;
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_recv(bs, &reply));
+    TEST_ASSERT_NOT_NULL(reply);
+    TEST_ASSERT_EQUAL_UINT32((uint32_t)n, reply->len);
+    TEST_ASSERT_EQUAL_MEMORY(msg, reply->data, (size_t)n);
+    grpc_message_free(reply);
+  }
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_finish(bs, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  grpc_client_response_free(&resp);
+
+  /* Retries: first attempt gets UNAVAILABLE, second succeeds */
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_client_unary(client, "/retry.Svc/Flaky", "ok", 2, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  TEST_ASSERT_EQUAL_INT(2, flaky_attempts);
+  grpc_client_response_free(&resp);
+  grpc_client_free(client);
+
+  /* 2. Round-robin load balancing across srv_a and srv_b */
+  char ep_a[64], ep_b[64];
+  snprintf(ep_a, sizeof(ep_a), "127.0.0.1:%u", grpc_server_port(srv_a));
+  snprintf(ep_b, sizeof(ep_b), "127.0.0.1:%u", grpc_server_port(srv_b));
+  const char *targets[] = {ep_a, ep_b};
+  grpc_client *lb = grpc_client_new(
+      &(grpc_client_config){.targets = targets, .nb_targets = 2, .timeout_ms = 3000}, &err);
+  TEST_ASSERT_NOT_NULL(lb);
+  for (int i = 0; i < 4; i++) {
+    TEST_ASSERT_EQUAL_INT(
+        GRPC_OK, grpc_client_unary(lb, "/lb.Svc/Ping", "p", 1, nullptr, 0, 0, &resp));
+    TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+    grpc_client_response_free(&resp);
+  }
+  TEST_ASSERT_EQUAL_INT(2, hits_a);
+  TEST_ASSERT_EQUAL_INT(2, hits_b);
+  grpc_client_free(lb);
+
+  grpc_server_stop(srv_a);
+  grpc_server_stop(srv_b);
+  pthread_join(th_a, nullptr);
+  pthread_join(th_b, nullptr);
+  grpc_server_free(srv_a);
+  grpc_server_free(srv_b);
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_client_server_tcp_end_to_end);
+  RUN_TEST(test_client_streaming_bidi_retries_and_lb);
 #ifndef _WIN32
   RUN_TEST(test_unix_domain_socket);
 #endif

@@ -129,6 +129,73 @@ void test_tls_in_memory_pem_and_mtls(void) {
 }
 
 #if defined(GRPC_TLS_OPENSSL) || defined(GRPC_TLS_LIBRESSL) || defined(GRPC_TLS_BORINGSSL) || defined(GRPC_TLS_AWSLC)
+#include "internal/grpc_threads.h"
+
+static void *run_mtls_server(void *arg) {
+  (void)grpc_server_run((grpc_server *)arg);
+  return nullptr;
+}
+
+static void mtls_echo(grpc_call *call, const grpc_message *req, void *userdata) {
+  char *subject_out = userdata;
+  const char *subj = grpc_call_peer_cert_subject(call);
+  if (subj != nullptr)
+    snprintf(subject_out, 128, "%s", subj);
+  (void)grpc_call_reply_data(call, req->data, req->len);
+}
+
+void test_client_server_mtls_end_to_end(void) {
+  char seen_subject[128] = {0};
+  grpc_server *server = grpc_server_new(&(grpc_config){
+      .port = 0,
+      .ipv4_addr = "127.0.0.1",
+      .tls = {
+          .cert_file = "test_cert.pem",
+          .key_file = "test_key.pem",
+          .ca_file = "test_cert.pem",
+          .require_client_cert = true,
+      },
+      .log_level = GRPC_LOG_OFF,
+  });
+  TEST_ASSERT_NOT_NULL(server);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/mtls.Svc/Echo", mtls_echo, seen_subject));
+
+  pthread_t th;
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_mtls_server, server));
+
+  grpc_err err = GRPC_OK;
+  grpc_client *client = grpc_client_new(
+      &(grpc_client_config){
+          .host = "127.0.0.1",
+          .port = grpc_server_port(server),
+          .timeout_ms = 3000,
+          .tls = {
+              .enable = true,
+              .ca_file = "test_cert.pem",
+              .cert_file = "test_cert.pem",
+              .key_file = "test_key.pem",
+              .server_name = "localhost",
+          },
+      },
+      &err);
+  TEST_ASSERT_NOT_NULL(client);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, err);
+
+  grpc_client_response resp = {0};
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_client_unary(client, "/mtls.Svc/Echo", "secret", 6, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  TEST_ASSERT_NOT_NULL(resp.message);
+  TEST_ASSERT_EQUAL_MEMORY("secret", resp.message->data, 6);
+  TEST_ASSERT_NOT_NULL(strstr(seen_subject, "localhost"));
+  grpc_client_response_free(&resp);
+
+  grpc_client_free(client);
+  grpc_server_stop(server);
+  pthread_join(th, nullptr);
+  grpc_server_free(server);
+}
+
 void test_tls_error_isolation(void) {
   grpc_tls_config cfg = {.cert_file = "test_cert.pem", .key_file = "test_key.pem"};
   grpc_tls_ctx *ctx = tls_backend_ctx_new(&cfg);
@@ -153,6 +220,7 @@ int main(void) {
   RUN_TEST(test_tls_server);
   RUN_TEST(test_tls_in_memory_pem_and_mtls);
 #if defined(GRPC_TLS_OPENSSL) || defined(GRPC_TLS_LIBRESSL) || defined(GRPC_TLS_BORINGSSL) || defined(GRPC_TLS_AWSLC)
+  RUN_TEST(test_client_server_mtls_end_to_end);
   RUN_TEST(test_tls_error_isolation);
 #endif
   return UNITY_END();

@@ -202,9 +202,10 @@ static int on_header_callback2([[maybe_unused]] nghttp2_session *session,
   const char *method = ":method";
   const char *scheme = ":scheme";
   const char *path = ":path";
-  if (header_matches(name, namelen, method))
+  if (header_matches(name, namelen, method)) {
     ezstream->is_method_post = header_matches(value, valuelen, "POST");
-  else if (header_matches(name, namelen, scheme))
+    ezstream->is_method_options = header_matches(value, valuelen, "OPTIONS");
+  } else if (header_matches(name, namelen, scheme))
     ezstream->is_scheme_http = header_matches(value, valuelen, "http") ||
                                header_matches(value, valuelen, "https");
   else if (header_matches(name, namelen, path)) {
@@ -265,6 +266,28 @@ static inline int on_frame_recv_headers(grpc_session *ezsession, const nghttp2_f
   }
   /* a second HEADERS would be request trailers, which gRPC clients do not send */
   if (ezstream->call != nullptr || ezstream->is_discarding) {
+    return 0;
+  }
+
+  /* Handle gRPC-Web CORS preflight OPTIONS requests. */
+  if (ezstream->is_method_options) {
+    static const nghttp2_nv cors_nva[] = {
+        {(uint8_t *)":status", (uint8_t *)"204", 7, 3, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)"access-control-allow-origin", (uint8_t *)"*", 27, 1, NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)"access-control-allow-methods", (uint8_t *)"POST, OPTIONS", 28, 13,
+         NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)"access-control-allow-headers",
+         (uint8_t *)"content-type, x-grpc-web, x-user-agent, grpc-timeout, authorization", 28, 67,
+         NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)"access-control-expose-headers",
+         (uint8_t *)"grpc-status, grpc-message, grpc-status-details-bin", 29, 50,
+         NGHTTP2_NV_FLAG_NONE},
+        {(uint8_t *)"access-control-max-age", (uint8_t *)"86400", 22, 5, NGHTTP2_NV_FLAG_NONE},
+    };
+    (void)nghttp2_submit_headers(ezsession->ngsession, NGHTTP2_FLAG_END_STREAM,
+                                 ezstream->stream_id, nullptr, cors_nva,
+                                 sizeof(cors_nva) / sizeof(cors_nva[0]), nullptr);
+    ezstream->is_discarding = true;
     return 0;
   }
 

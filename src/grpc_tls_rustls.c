@@ -59,9 +59,11 @@ static int read_file(const char *path, grpc_buf *out) {
 grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg) {
   if (cfg == nullptr)
     return nullptr;
-  grpc_buf cert = {}, key = {};
+  grpc_buf cert = {}, key = {}, ca = {};
   const struct rustls_certified_key *certified_key = nullptr;
   const struct rustls_server_config *config = nullptr;
+  const struct rustls_root_cert_store *root_store = nullptr;
+  const struct rustls_client_cert_verifier *client_verifier = nullptr;
 
   const uint8_t *cert_data = nullptr;
   size_t cert_len = 0;
@@ -91,6 +93,49 @@ grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg) {
   struct rustls_server_config_builder *builder = rustls_server_config_builder_new();
   if (builder == nullptr)
     goto out;
+
+  if (cfg->ca_file != nullptr || cfg->ca_pem != nullptr) {
+    const uint8_t *ca_data = nullptr;
+    size_t ca_len = 0;
+    if (cfg->ca_pem != nullptr) {
+      ca_data = (const uint8_t *)cfg->ca_pem;
+      ca_len = cfg->ca_pem_len;
+    } else {
+      if (read_file(cfg->ca_file, &ca)) {
+        rustls_server_config_builder_free(builder);
+        goto out;
+      }
+      ca_data = ca.data;
+      ca_len = ca.len;
+    }
+    struct rustls_root_cert_store_builder *store_builder = rustls_root_cert_store_builder_new();
+    if (store_builder == nullptr ||
+        rustls_root_cert_store_builder_add_pem(store_builder, ca_data, ca_len, true) !=
+            RUSTLS_RESULT_OK ||
+        rustls_root_cert_store_builder_build(store_builder, &root_store) != RUSTLS_RESULT_OK) {
+      rustls_root_cert_store_builder_free(store_builder);
+      rustls_server_config_builder_free(builder);
+      goto out;
+    }
+    rustls_root_cert_store_builder_free(store_builder);
+    struct rustls_web_pki_client_cert_verifier_builder *vbuilder =
+        rustls_web_pki_client_cert_verifier_builder_new(root_store);
+    if (vbuilder == nullptr) {
+      rustls_server_config_builder_free(builder);
+      goto out;
+    }
+    if (!cfg->require_client_cert)
+      (void)rustls_web_pki_client_cert_verifier_builder_allow_unauthenticated(vbuilder);
+    if (rustls_web_pki_client_cert_verifier_builder_build(vbuilder, &client_verifier) !=
+        RUSTLS_RESULT_OK) {
+      rustls_web_pki_client_cert_verifier_builder_free(vbuilder);
+      rustls_server_config_builder_free(builder);
+      goto out;
+    }
+    rustls_web_pki_client_cert_verifier_builder_free(vbuilder);
+    rustls_server_config_builder_set_client_verifier(builder, client_verifier);
+  }
+
   /* rustls rejects clients that offer ALPN without h2. clients that offer
    * no ALPN at all still connect */
   struct rustls_slice_bytes alpn = {.data = (const uint8_t *)"h2", .len = 2};
@@ -105,8 +150,11 @@ grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg) {
     config = nullptr;
 
 out:
-  /* the config keeps its own reference to the key */
+  /* the config keeps its own reference to the key and verifier */
+  rustls_client_cert_verifier_free(client_verifier);
+  rustls_root_cert_store_free(root_store);
   rustls_certified_key_free(certified_key);
+  buf_free(&ca);
   buf_free(&cert);
   /* do not leave the private key behind in freed memory */
   if (key.data != nullptr)
