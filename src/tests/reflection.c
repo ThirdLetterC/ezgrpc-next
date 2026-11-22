@@ -135,12 +135,15 @@ void test_reflection_long_symbols_and_many_services(void) {
   grpc_message *m = reflect(list_req, sizeof(list_req));
   size_t off = skip_original_request(m);
   TEST_ASSERT_EQUAL_HEX8(0x32, m->data[off++]);
-  size_t end = off + (size_t)varint_at(m->data, m->len, &off);
+  /* the length first: `off + varint_at(..., &off)` leaves unspecified which off is added */
+  size_t list_len = (size_t)varint_at(m->data, m->len, &off);
+  size_t end = off + list_len;
   TEST_ASSERT_EQUAL_size_t(m->len, end);
   size_t services = 0;
   while (off < end) {
     TEST_ASSERT_EQUAL_HEX8(0x0A, m->data[off++]);
-    off += (size_t)varint_at(m->data, m->len, &off);
+    size_t name_len = (size_t)varint_at(m->data, m->len, &off);
+    off += name_len;
     services++;
   }
   TEST_ASSERT_EQUAL_size_t(72, services);
