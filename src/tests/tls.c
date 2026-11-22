@@ -737,10 +737,9 @@ void test_client_verifies_server_name(void) {
 
 #if defined(GRPC_TLS_OPENSSL) || defined(GRPC_TLS_LIBRESSL) || defined(GRPC_TLS_BORINGSSL) || \
     defined(GRPC_TLS_AWSLC)
+/* Milliseconds of the monotonic clock (libuv's, so it works on Windows too). */
 static uint64_t mono_ms(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+  return uv_hrtime() / 1000000u;
 }
 
 /* A reconnect made inside a call is bounded by that call's deadline, even when the client has no
@@ -765,9 +764,10 @@ void test_client_reconnect_bounded_by_call_deadline(void) {
   server_stop_thread();
   grpc_server_free(server);
   fx.server = nullptr;
-  int lfd = socket(AF_INET, SOCK_STREAM, 0);
+  uv_os_sock_t lfd = socket(AF_INET, SOCK_STREAM, 0); /* Winsock is up: a server was created */
+  TEST_ASSERT_TRUE(lfd != GRPC_INVALID_SOCKET);
   int one = 1;
-  setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, (const char *)&one, sizeof(one));
   struct sockaddr_in sin = {.sin_family = AF_INET, .sin_port = htons(port)};
   sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   TEST_ASSERT_EQUAL_INT(0, bind(lfd, (struct sockaddr *)&sin, sizeof(sin)));
@@ -777,7 +777,7 @@ void test_client_reconnect_bounded_by_call_deadline(void) {
   grpc_err rc = grpc_client_unary(fx.client, "/v.Svc/Echo", "x", 1, nullptr, 0, 300, &resp);
   uint64_t took = mono_ms() - start;
   grpc_client_response_free(&resp);
-  close(lfd);
+  grpc_socket_close(lfd);
   TEST_ASSERT_NOT_EQUAL_INT(GRPC_OK, rc);
   TEST_ASSERT_TRUE_MESSAGE(took < 2000, "the reconnect ignored the call's deadline");
 }
