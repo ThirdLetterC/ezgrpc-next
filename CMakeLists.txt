@@ -464,6 +464,17 @@ if(GRPC_BUILD_TESTS)
           WORKING_DIRECTORY "${tls_test_dir}" DEPENDS test_tls_certificates)
         target_link_libraries(test_http3_raw PRIVATE ${GRPC_HTTP3_TARGETS} ${GRPC_TLS_LIBRARIES})
       endif()
+      if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT _grpc_sanitizers)
+        # full UDP socket buffers, simulated by a preloaded sendmsg() shim (not with sanitizers,
+        # whose runtimes must come first in the preload order)
+        add_library(test_udp_eagain MODULE src/tests/shims/udp_eagain.c)
+        target_link_libraries(test_udp_eagain PRIVATE ${CMAKE_DL_LIBS})
+        grpc_add_unit_test(http3_eagain src/tests/http3_eagain.c
+          WORKING_DIRECTORY "${tls_test_dir}" DEPENDS test_tls_certificates test_udp_eagain)
+        target_link_libraries(test_http3_eagain PRIVATE ${GRPC_HTTP3_TARGETS})
+        set_tests_properties(http3_eagain PROPERTIES
+          ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:test_udp_eagain>")
+      endif()
     endif()
   endif()
 endif()

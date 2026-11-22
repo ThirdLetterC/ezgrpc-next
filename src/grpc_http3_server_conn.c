@@ -18,6 +18,19 @@
 
 /* ---- connection lifecycle ---- */
 
+void h3_qc_note_path(grpc_quic_conn *qc) {
+  const ngtcp2_path *path = ngtcp2_conn_get_path(qc->conn);
+  grpc_session *session = qc->session;
+  size_t len = (size_t)path->remote.addrlen;
+  if (len == 0 || len > sizeof(session->sockaddr) ||
+      (len == (size_t)session->socklen && memcmp(&session->sockaddr, path->remote.addr, len) == 0))
+    return;
+  memcpy(&session->sockaddr, path->remote.addr, len);
+  session->socklen = (socklen_t)len;
+  format_peer((const struct sockaddr *)&session->sockaddr, session->peer, sizeof(session->peer));
+  LOG_DEBUG(session->server, "http3: connection moved to %s\n", session->peer);
+}
+
 /* ngtcp2_crypto_conn_ref::get_conn: the TLS callbacks reach the ngtcp2_conn through this. */
 static ngtcp2_conn *get_conn(ngtcp2_crypto_conn_ref *ref) {
   return ((grpc_quic_conn *)ref->user_data)->conn;
@@ -54,38 +67,90 @@ static void on_qc_timer(uv_timer_t *timer) {
   h3_session_flush(qc->session);
 }
 
-/* uv_close callback of the connection timer: the last step of closing; returns the slot. */
+/* uv_close callback of the connection timer: the last step of closing. Returns the session slot,
+ * unless a closing / draining period already did. */
 static void on_qc_timer_closed(uv_handle_t *handle) {
   grpc_quic_conn *qc = handle->data;
   grpc_session *session = qc->session;
+  grpc_free(qc->close_pkt);
   grpc_free(qc->cids);
   grpc_free(qc);
-  session->quic = nullptr;
-  session_slot_release(session);
+  if (session != nullptr) {
+    session->quic = nullptr;
+    session_slot_release(session);
+  }
+}
+
+void h3_linger_end(grpc_quic_conn *qc) {
+  grpc_h3_server *h3s = qc->h3s;
+  if (qc->linger_prev != nullptr)
+    qc->linger_prev->linger_next = qc->linger_next;
+  else
+    h3s->lingering = qc->linger_next;
+  if (qc->linger_next != nullptr)
+    qc->linger_next->linger_prev = qc->linger_prev;
+  qc->linger_prev = qc->linger_next = nullptr;
+  qc->lingering = false;
+  while (qc->nb_cids > 0)
+    h3_cid_remove(qc, &qc->cids[qc->nb_cids - 1]);
+  uv_timer_stop(&qc->timer);
+  uv_close((uv_handle_t *)&qc->timer, on_qc_timer_closed);
+}
+
+/* The closing / draining period elapsed. */
+static void on_qc_linger_timer(uv_timer_t *timer) {
+  h3_linger_end(timer->data);
+}
+
+/* A packet for a connection in its closing / draining period: while closing, answers with the
+ * CONNECTION_CLOSE again (on the 1st, 2nd, 4th, 8th, ... packet, so a flood is not echoed); while
+ * draining, drops it. */
+static void qc_linger_recv(grpc_quic_conn *qc) {
+  if (qc->close_pkt == nullptr)
+    return;
+  uint64_t n = ++qc->linger_rx;
+  if ((n & (n - 1)) == 0)
+    qc_send(qc, nullptr, qc->close_pkt, qc->close_pkt_len);
 }
 
 void h3_session_close(grpc_session *session) {
   grpc_quic_conn *qc = session->quic;
+  grpc_h3_server *h3s = qc->h3s;
   session->is_closing = true;
   LOG_DEBUG(session->server, "http3: closing connection from %s\n", session->peer);
   if (qc->unvalidated) {
     qc->unvalidated = false;
-    qc->h3s->nb_unvalidated--;
+    h3s->nb_unvalidated--;
   }
 
+  /* RFC 9000 section 10.2: after sending CONNECTION_CLOSE (closing) or receiving one (draining)
+   * the connection IDs stay known for at least three PTOs. An idle timeout or a dropped connection
+   * ends it silently. */
+  ngtcp2_duration linger = 0;
+  if (qc->conn != nullptr) {
+    linger = 3 * ngtcp2_conn_get_pto(qc->conn);
+    if (linger < H3_MIN_LINGER)
+      linger = H3_MIN_LINGER;
+  }
   if (qc->conn != nullptr && qc->ccerr.type != NGTCP2_CCERR_TYPE_IDLE_CLOSE &&
       !ngtcp2_conn_in_draining_period(qc->conn) && !ngtcp2_conn_in_closing_period(qc->conn)) {
     ngtcp2_path_storage ps;
     ngtcp2_path_storage_zero(&ps);
     ngtcp2_pkt_info pi;
-    ngtcp2_ssize n = ngtcp2_conn_write_connection_close(
-        qc->conn, &ps.path, &pi, qc->h3s->sbuf, sizeof(qc->h3s->sbuf), &qc->ccerr, h3_now());
-    if (n > 0)
-      qc_send(qc, &ps.path, qc->h3s->sbuf, (size_t)n);
+    ngtcp2_ssize n = ngtcp2_conn_write_connection_close(qc->conn, &ps.path, &pi, h3s->sbuf,
+                                                        sizeof(h3s->sbuf), &qc->ccerr, h3_now());
+    if (n > 0) {
+      qc_send(qc, &ps.path, h3s->sbuf, (size_t)n);
+      /* kept to answer late packets; without memory there is just no closing period */
+      qc->close_pkt = grpc_malloc((size_t)n);
+      if (qc->close_pkt != nullptr) {
+        memcpy(qc->close_pkt, h3s->sbuf, (size_t)n);
+        qc->close_pkt_len = (size_t)n;
+      }
+    }
   }
-
-  while (qc->nb_cids > 0)
-    h3_cid_remove(qc, &qc->cids[qc->nb_cids - 1]);
+  bool linger_ok =
+      (qc->close_pkt != nullptr || qc->peer_closed) && (h3s->udp4_active || h3s->udp6_active);
 
   grpc_stream *stream;
   while ((stream = session->streams) != nullptr) {
@@ -104,43 +169,53 @@ void h3_session_close(grpc_session *session) {
   qc->conn = nullptr;
   quic_tls_session_free(qc->tls);
   qc->tls = nullptr;
-  tls_ctx_pool_release(&qc->h3s->tls_pool, qc->tls_ctx_used);
+  tls_ctx_pool_release(&h3s->tls_pool, qc->tls_ctx_used);
   qc->tls_ctx_used = nullptr;
 
+  if (linger_ok) {
+    /* only the connection IDs and the close packet remain: the slot is free for a new client */
+    qc->lingering = true;
+    qc->linger_next = h3s->lingering;
+    if (h3s->lingering != nullptr)
+      h3s->lingering->linger_prev = qc;
+    h3s->lingering = qc;
+    qc->session = nullptr;
+    session->quic = nullptr;
+    session_slot_release(session);
+    uv_timer_start(&qc->timer, on_qc_linger_timer,
+                   (linger + NGTCP2_MILLISECONDS - 1) / NGTCP2_MILLISECONDS, 0);
+    return;
+  }
+  while (qc->nb_cids > 0)
+    h3_cid_remove(qc, &qc->cids[qc->nb_cids - 1]);
   uv_timer_stop(&qc->timer);
   uv_close((uv_handle_t *)&qc->timer, on_qc_timer_closed);
 }
 
-void h3_session_flush(grpc_session *session) {
-  grpc_quic_conn *qc = session->quic;
-  if (!session->is_active || session->is_closing || qc == nullptr || qc->conn == nullptr)
-    return;
-  ngtcp2_tstamp ts = h3_now();
-  uint8_t *buf = qc->h3s->sbuf;
-
+/* ngtcp2_write_pkt for ngtcp2_conn_write_aggregate_pkt(): writes one packet with whatever
+ * nghttp3 has to send (or only QUIC frames). Returns its length, 0 when there is nothing to send,
+ * or a negative ngtcp2 error (qc->ccerr set) that closes the connection. */
+static ngtcp2_ssize qc_write_pkt(ngtcp2_conn *conn, ngtcp2_path *path, ngtcp2_pkt_info *pi,
+                                 uint8_t *dest, size_t destlen, ngtcp2_tstamp ts, void *user_data) {
+  grpc_quic_conn *qc = user_data;
   for (;;) {
     int64_t stream_id = -1;
     int fin = 0;
     nghttp3_vec vec[16];
     nghttp3_ssize sveccnt = 0;
-    if (qc->h3 != nullptr && ngtcp2_conn_get_max_data_left(qc->conn)) {
+    if (qc->h3 != nullptr && ngtcp2_conn_get_max_data_left(conn)) {
       sveccnt = nghttp3_conn_writev_stream(qc->h3, &stream_id, &fin, vec, 16);
       if (sveccnt < 0) {
         ngtcp2_ccerr_set_application_error(
             &qc->ccerr, nghttp3_err_infer_quic_app_error_code((int)sveccnt), nullptr, 0);
-        session_close(session);
-        return;
+        return NGTCP2_ERR_CALLBACK_FAILURE;
       }
     }
-
     ngtcp2_ssize ndatalen = -1;
-    ngtcp2_path_storage ps;
-    ngtcp2_path_storage_zero(&ps);
-    ngtcp2_pkt_info pi;
     uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_MORE | (fin ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0);
     ngtcp2_ssize nwrite =
-        ngtcp2_conn_writev_stream(qc->conn, &ps.path, &pi, buf, H3_MAX_UDP_PAYLOAD, &ndatalen,
-                                  flags, stream_id, (const ngtcp2_vec *)vec, (size_t)sveccnt, ts);
+        ngtcp2_conn_writev_stream(conn, path, pi, dest, destlen, &ndatalen, flags, stream_id,
+                                  (const ngtcp2_vec *)vec, (size_t)sveccnt, ts);
     if (nwrite < 0) {
       switch (nwrite) {
       case NGTCP2_ERR_STREAM_DATA_BLOCKED:
@@ -150,27 +225,51 @@ void h3_session_flush(grpc_session *session) {
         nghttp3_conn_shutdown_stream_write(qc->h3, stream_id);
         continue;
       case NGTCP2_ERR_WRITE_MORE:
-        if (nghttp3_conn_add_write_offset(qc->h3, stream_id, (size_t)ndatalen) != 0)
-          goto fail;
+        if (nghttp3_conn_add_write_offset(qc->h3, stream_id, (size_t)ndatalen) != 0) {
+          ngtcp2_ccerr_set_liberr(&qc->ccerr, NGTCP2_ERR_INTERNAL, nullptr, 0);
+          return NGTCP2_ERR_CALLBACK_FAILURE;
+        }
         continue;
       default:
         ngtcp2_ccerr_set_liberr(&qc->ccerr, (int)nwrite, nullptr, 0);
-        goto fail;
+        return nwrite;
       }
     }
     if (ndatalen >= 0 && stream_id >= 0 &&
-        nghttp3_conn_add_write_offset(qc->h3, stream_id, (size_t)ndatalen) != 0)
-      goto fail;
-    if (nwrite == 0)
+        nghttp3_conn_add_write_offset(qc->h3, stream_id, (size_t)ndatalen) != 0) {
+      ngtcp2_ccerr_set_liberr(&qc->ccerr, NGTCP2_ERR_INTERNAL, nullptr, 0);
+      return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    return nwrite;
+  }
+}
+
+void h3_session_flush(grpc_session *session) {
+  grpc_quic_conn *qc = session->quic;
+  if (!session->is_active || session->is_closing || qc == nullptr || qc->conn == nullptr)
+    return;
+  ngtcp2_tstamp ts = h3_now();
+  /* each round writes a batch of equal-size packets (as many as pacing allows), sent with one
+   * GSO call where available */
+  uint8_t *buf = qc->h3s->gsobuf;
+  size_t cap = qc->h3s->gso_off ? H3_MAX_UDP_PAYLOAD : sizeof(qc->h3s->gsobuf);
+  for (;;) {
+    ngtcp2_path_storage ps;
+    ngtcp2_path_storage_zero(&ps);
+    ngtcp2_pkt_info pi;
+    size_t gsolen = 0;
+    ngtcp2_ssize n = ngtcp2_conn_write_aggregate_pkt(qc->conn, &ps.path, &pi, buf, cap, &gsolen,
+                                                     qc_write_pkt, ts);
+    if (n < 0) {
+      session_close(session);
+      return;
+    }
+    if (n == 0)
       break;
-    qc_send(qc, &ps.path, buf, (size_t)nwrite);
+    qc_send_batch(qc, &ps.path, buf, (size_t)n, gsolen);
   }
   ngtcp2_conn_update_pkt_tx_time(qc->conn, ts);
   qc_arm_timer(qc);
-  return;
-
-fail:
-  session_close(session);
 }
 
 /* Creates the QUIC connection for the first Initial packet `hd` from `remote`, in a new session
@@ -262,7 +361,8 @@ static grpc_quic_conn *qc_new(grpc_h3_server *h3s, uv_udp_t *udp, const struct s
                                                  : 30000;
   params.max_idle_timeout = (ngtcp2_duration)idle * NGTCP2_MILLISECONDS;
   params.active_connection_id_limit = 7;
-  params.disable_active_migration = 1;
+  /* clients may migrate (RFC 9000 section 9): ngtcp2 validates the new path before using it, and
+   * every connection ID issued for it is in the routing table */
   params.stateless_reset_token_present = 1;
   if (odcid != nullptr) {
     params.original_dcid = *odcid;
@@ -377,19 +477,21 @@ static void on_udp_alloc(uv_handle_t *handle, size_t suggested, uv_buf_t *buf) {
   *buf = uv_buf_init((char *)h3s->rbuf, sizeof(h3s->rbuf));
 }
 
-/* UDP read callback: routes the datagram to its connection by destination CID (creating one for a
- * new client) and feeds it to ngtcp2. Errors close that connection only. */
+/* UDP read callback. Errors close the datagram's connection only. */
 static void on_udp_read(uv_udp_t *udp, ssize_t nread, const uv_buf_t *buf,
                         const struct sockaddr *addr, unsigned flags) {
   (void)flags;
   grpc_h3_server *h3s = udp->data;
   if (nread <= 0 || addr == nullptr)
     return;
+  atomic_fetch_add(&h3s->server->stat_bytes_received, (uint64_t)nread);
+  h3_handle_datagram(h3s, udp, (const uint8_t *)buf->base, (size_t)nread, addr, false);
+}
+
+void h3_handle_datagram(grpc_h3_server *h3s, uv_udp_t *udp, const uint8_t *data, size_t len,
+                        const struct sockaddr *addr, bool forwarded) {
   grpc_server *server = h3s->server;
-  atomic_fetch_add(&server->stat_bytes_received, (uint64_t)nread);
   server->ready_events++;
-  const uint8_t *data = (const uint8_t *)buf->base;
-  size_t len = (size_t)nread;
   socklen_t addrlen =
       addr->sa_family == AF_INET6 ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in);
 
@@ -403,7 +505,16 @@ static void on_udp_read(uv_udp_t *udp, ssize_t nread, const uv_buf_t *buf,
     return;
 
   grpc_quic_conn *qc = h3_cid_lookup(h3s, vc.dcid, vc.dcidlen);
+  if (qc != nullptr && qc->lingering) {
+    qc_linger_recv(qc);
+    return;
+  }
+  if (qc == nullptr && !forwarded && h3s->cluster &&
+      h3_forward_to_owner(h3s, vc.dcid, vc.dcidlen, data, len, addr))
+    return; /* a connection of a server on another loop whose client's address changed */
   if (qc == nullptr) {
+    if (forwarded)
+      return; /* gone meanwhile */
     qc = accept_packet(h3s, udp, data, len, addr, addrlen);
     if (qc == nullptr)
       return;
@@ -422,7 +533,10 @@ static void on_udp_read(uv_udp_t *udp, ssize_t nread, const uv_buf_t *buf,
   rv = ngtcp2_conn_read_pkt(qc->conn, &path, &pi, data, len, h3_now());
   if (rv != 0) {
     switch (rv) {
-    case NGTCP2_ERR_DRAINING:
+    case NGTCP2_ERR_DRAINING: /* the peer closed: drain, sending nothing more */
+      qc->peer_closed = true;
+      qc->ccerr.type = NGTCP2_CCERR_TYPE_IDLE_CLOSE;
+      break;
     case NGTCP2_ERR_DROP_CONN:
       qc->ccerr.type = NGTCP2_CCERR_TYPE_IDLE_CLOSE; /* nothing more to send */
       break;
@@ -439,6 +553,7 @@ static void on_udp_read(uv_udp_t *udp, ssize_t nread, const uv_buf_t *buf,
     session_close(qc->session);
     return;
   }
+  h3_qc_note_path(qc);
   qc->session->last_activity_ms = grpc_time_now_ms();
   session_schedule_flush(qc->session);
 }

@@ -17,6 +17,17 @@
  * program (defined in grpc_http3.c). */
 extern const ngtcp2_mem grpc_quic_mem;
 extern const nghttp3_mem grpc_h3_mem;
+
+/* Largest batch of QUIC packets sent with one generic segmentation offload (GSO) call: whole
+ * packets of at most 1452 bytes, within a UDP datagram's 64 KiB and the kernel's 64 segments. */
+enum { GRPC_H3_GSO_BUF = 44 * 1452 };
+
+/* Sends `len` bytes as UDP datagrams of `gsolen` bytes each (the last may be shorter) with one
+ * sendmsg() and UDP_SEGMENT, to `to` (nullptr on a connected socket). Linux only. Returns 0, a
+ * negative libuv error (UV_EAGAIN / UV_ENOBUFS when the socket buffer is full), or UV_ENOTSUP when
+ * the platform or the route cannot segment, so that the caller sends datagram by datagram. */
+int grpc_h3_send_gso(uv_udp_t *udp, const struct sockaddr *to, const uint8_t *data, size_t len,
+                     size_t gsolen);
 #endif
 
 /* Opens the UDP listener(s) and builds the QUIC TLS context from `tls` (the normalized server TLS
@@ -25,6 +36,11 @@ extern const nghttp3_mem grpc_h3_mem;
  * exist. GRPC_ERR_INVALID without TLS, GRPC_ERR_IO if a socket cannot be bound,
  * GRPC_ERR_UNSUPPORTED without HTTP/3 support. */
 grpc_err http3_server_start(grpc_server *server, const grpc_tls_config *tls);
+
+/* Withdraws the server's connection IDs from the registry shared with servers on other loops
+ * (config.reuse_port), so that nothing is forwarded to it any more. First step of
+ * grpc_server_free(): datagrams forwarded before then are run by its last run_posted(). */
+void http3_server_leave_cluster(grpc_server *server);
 
 /* Stops accepting new QUIC connections (grpc_server_drain); existing ones keep the socket. */
 void http3_server_stop_accepting(grpc_server *server);

@@ -11,14 +11,18 @@
  * maintenance timer, drain, channelz and max_connections treat both transports alike. Request
  * handling is shared with HTTP/2 through grpc_stream_core.c.
  *
- * Everything runs on the server loop thread. Received datagrams are processed in the UDP read
- * callback; output is produced when the session is flushed (server_flush_sessions() after each
- * loop iteration) and when the connection's timer fires (ngtcp2 loss detection, ACK delay, idle
- * timeout, keepalive). Response bodies are pulled with stream_core_pull() into per-stream chunks
- * that stay alive until QUIC acknowledges them, because nghttp3 sends from the caller's memory.
+ * Everything runs on the server loop thread, except the connection ID registry shared by servers
+ * on other loops (config.reuse_port; see h3_forward_to_owner()). Received datagrams are processed
+ * in the UDP read callback; output is produced when the session is flushed (server_flush_sessions()
+ * after each loop iteration) and when the connection's timer fires (ngtcp2 loss detection, ACK
+ * delay, idle timeout, keepalive). Each flush writes batches of packets, sent with one GSO call
+ * on Linux (qc_send_batch()); datagrams the socket cannot take at once wait in libuv's send queue
+ * (h3_udp_send()). Response bodies are pulled with stream_core_pull() into per-stream chunks that
+ * stay alive until QUIC acknowledges them, because nghttp3 sends from the caller's memory.
  *
- * Not implemented: 0-RTT, connection migration (disable_active_migration is advertised), and the
- * closing/draining period (a connection is freed right after its CONNECTION_CLOSE is sent).
+ * Clients may migrate (h3_qc_note_path() follows the current path). A closed connection keeps its
+ * connection IDs for a closing / draining period (h3_session_close()). Not implemented: 0-RTT
+ * (see docs/http3.md).
  */
 #include <inttypes.h>
 #include <stddef.h>
@@ -78,6 +82,118 @@ grpc_quic_conn *h3_cid_lookup(grpc_h3_server *h3s, const uint8_t *data, size_t l
   return nullptr;
 }
 
+/* ---- the process-wide connection ID registry (servers sharing a port with reuse_port) ---- */
+
+typedef struct registry_entry registry_entry;
+struct registry_entry {
+  ngtcp2_cid cid;
+  grpc_server *server;
+  registry_entry *next;
+};
+static pthread_mutex_t registry_lock = PTHREAD_MUTEX_INITIALIZER;
+static registry_entry *registry[H3_CID_BUCKETS];
+
+/* Lists `cid` as owned by `server`. Without memory the connection just cannot be found from other
+ * loops. */
+static void registry_add(grpc_server *server, const ngtcp2_cid *cid) {
+  registry_entry *e = grpc_malloc(sizeof(*e));
+  if (e == nullptr)
+    return;
+  size_t b = cid_hash(cid);
+  pthread_mutex_lock(&registry_lock);
+  *e = (registry_entry){.cid = *cid, .server = server, .next = registry[b]};
+  registry[b] = e;
+  pthread_mutex_unlock(&registry_lock);
+}
+
+static void registry_remove(grpc_server *server, const ngtcp2_cid *cid) {
+  pthread_mutex_lock(&registry_lock);
+  for (registry_entry **p = &registry[cid_hash(cid)]; *p != nullptr; p = &(*p)->next) {
+    if ((*p)->server == server && ngtcp2_cid_eq(&(*p)->cid, cid)) {
+      registry_entry *e = *p;
+      *p = e->next;
+      grpc_free(e);
+      break;
+    }
+  }
+  pthread_mutex_unlock(&registry_lock);
+}
+
+/* A datagram on its way to the loop of the server that owns its connection. */
+typedef struct forwarded_datagram {
+  grpc_server *server;
+  struct sockaddr_storage from;
+  size_t len;
+  uint8_t data[];
+} forwarded_datagram;
+
+/* grpc_server_post() task on the owner's loop. */
+static void run_forwarded(void *arg) {
+  forwarded_datagram *f = arg;
+  grpc_h3_server *h3s = f->server->h3;
+  uv_udp_t *udp = nullptr;
+  if (h3s != nullptr) {
+    if (f->from.ss_family == AF_INET6 && h3s->udp6_active)
+      udp = &h3s->udp6;
+    else if (f->from.ss_family == AF_INET && h3s->udp4_active)
+      udp = &h3s->udp4;
+  }
+  if (udp != nullptr)
+    h3_handle_datagram(h3s, udp, f->data, f->len, (const struct sockaddr *)&f->from, true);
+  grpc_free(f);
+}
+
+bool h3_forward_to_owner(grpc_h3_server *h3s, const uint8_t *dcid, size_t dcidlen,
+                         const uint8_t *data, size_t len, const struct sockaddr *from) {
+  ngtcp2_cid cid;
+  ngtcp2_cid_init(&cid, dcid, dcidlen);
+  bool forwarded = false;
+  /* posting under the lock: an owner leaving the registry (http3_server_leave_cluster()) has
+   * either not been posted to, or runs the posted datagram before it is freed */
+  pthread_mutex_lock(&registry_lock);
+  for (registry_entry *e = registry[cid_hash(&cid)]; e != nullptr; e = e->next) {
+    if (e->server == h3s->server || !ngtcp2_cid_eq(&e->cid, &cid))
+      continue;
+    forwarded_datagram *f = grpc_malloc(sizeof(*f) + len);
+    if (f != nullptr) {
+      f->server = e->server;
+      memset(&f->from, 0, sizeof(f->from));
+      memcpy(&f->from, from,
+             from->sa_family == AF_INET6 ? sizeof(struct sockaddr_in6)
+                                         : sizeof(struct sockaddr_in));
+      f->len = len;
+      memcpy(f->data, data, len);
+      if (grpc_server_post(e->server, run_forwarded, f) == GRPC_OK)
+        forwarded = true;
+      else
+        grpc_free(f);
+    }
+    break;
+  }
+  pthread_mutex_unlock(&registry_lock);
+  return forwarded;
+}
+
+void http3_server_leave_cluster(grpc_server *server) {
+  grpc_h3_server *h3s = server->h3;
+  if (h3s == nullptr || !h3s->cluster)
+    return;
+  h3s->cluster = false;
+  pthread_mutex_lock(&registry_lock);
+  for (size_t b = 0; b < H3_CID_BUCKETS; b++) {
+    for (registry_entry **p = &registry[b]; *p != nullptr;) {
+      if ((*p)->server == server) {
+        registry_entry *e = *p;
+        *p = e->next;
+        grpc_free(e);
+      } else {
+        p = &(*p)->next;
+      }
+    }
+  }
+  pthread_mutex_unlock(&registry_lock);
+}
+
 int h3_cid_add(grpc_quic_conn *qc, const ngtcp2_cid *cid) {
   if (qc->nb_cids == qc->cap_cids) {
     size_t cap = qc->cap_cids ? qc->cap_cids * 2 : 8;
@@ -94,10 +210,14 @@ int h3_cid_add(grpc_quic_conn *qc, const ngtcp2_cid *cid) {
   *e = (cid_entry){.cid = *cid, .qc = qc, .next = qc->h3s->cids[b]};
   qc->h3s->cids[b] = e;
   qc->cids[qc->nb_cids++] = *cid;
+  if (qc->h3s->cluster)
+    registry_add(qc->h3s->server, cid);
   return 0;
 }
 
 void h3_cid_remove(grpc_quic_conn *qc, const ngtcp2_cid *cid) {
+  if (qc->h3s->cluster)
+    registry_remove(qc->h3s->server, cid);
   for (cid_entry **p = &qc->h3s->cids[cid_hash(cid)]; *p != nullptr; p = &(*p)->next) {
     if ((*p)->qc == qc && ngtcp2_cid_eq(&(*p)->cid, cid)) {
       cid_entry *e = *p;
@@ -114,31 +234,100 @@ void h3_cid_remove(grpc_quic_conn *qc, const ngtcp2_cid *cid) {
   }
 }
 
+/* A datagram waiting in libuv's send queue, with its own copy of the bytes. */
+typedef struct h3_send_req {
+  uv_udp_send_t req;
+  grpc_h3_server *h3s;
+  size_t len;
+  uint8_t data[];
+} h3_send_req;
+
+/* uv_udp_send() completion (or cancellation when the socket closes). */
+static void on_h3_send_done(uv_udp_send_t *req, int status) {
+  h3_send_req *sr = (h3_send_req *)req;
+  sr->h3s->send_queued_bytes -= sr->len;
+  if (status == 0)
+    atomic_fetch_add(&sr->h3s->server->stat_bytes_sent, (uint64_t)sr->len);
+  grpc_free(sr);
+}
+
 void h3_udp_send(grpc_server *server, uv_udp_t *udp, const struct sockaddr *to, const uint8_t *data,
                  size_t len) {
   uv_buf_t buf = uv_buf_init(grpc_unconst(data), (unsigned int)len);
   int rv = uv_udp_try_send(udp, &buf, 1, to);
-  if (rv >= 0)
+  if (rv >= 0) {
     atomic_fetch_add(&server->stat_bytes_sent, (uint64_t)len);
-  else
+    return;
+  }
+  if (rv != UV_EAGAIN && rv != UV_ENOBUFS) {
     LOG_DEBUG(server, "http3: udp send: %s\n", uv_strerror(rv));
+    return;
+  }
+  /* the socket buffer is full (or libuv still has queued datagrams): queue a copy rather than
+   * leave it to loss recovery */
+  grpc_h3_server *h3s = server->h3;
+  h3_send_req *sr =
+      len <= H3_SEND_QUEUE_MAX - h3s->send_queued_bytes ? grpc_malloc(sizeof(*sr) + len) : nullptr;
+  if (sr == nullptr) {
+    h3s->stat_send_dropped++;
+    return;
+  }
+  sr->h3s = h3s;
+  sr->len = len;
+  memcpy(sr->data, data, len);
+  buf = uv_buf_init((char *)sr->data, (unsigned int)len);
+  if (uv_udp_send(&sr->req, udp, &buf, 1, to, on_h3_send_done) != 0) {
+    grpc_free(sr);
+    h3s->stat_send_dropped++;
+    return;
+  }
+  h3s->send_queued_bytes += len;
+  h3s->stat_send_queued++;
 }
 
-void qc_send(grpc_quic_conn *qc, const ngtcp2_path *path, const uint8_t *data, size_t len) {
+/* Follows `path` (when given) for a send: its remote address becomes the connection's, and the
+ * socket of its local address's family is returned. */
+static uv_udp_t *qc_route(grpc_quic_conn *qc, const ngtcp2_path *path) {
   grpc_h3_server *h3s = qc->h3s;
   if (path != nullptr && path->remote.addrlen > 0 &&
       (size_t)path->remote.addrlen <= sizeof(qc->remote)) {
     memcpy(&qc->remote, path->remote.addr, (size_t)path->remote.addrlen);
     qc->remotelen = (socklen_t)path->remote.addrlen;
   }
-  uv_udp_t *udp = qc->udp;
   if (path != nullptr && path->local.addrlen > 0) {
     if (path->local.addr->sa_family == AF_INET6 && h3s->udp6_active)
-      udp = &h3s->udp6;
-    else if (path->local.addr->sa_family == AF_INET && h3s->udp4_active)
-      udp = &h3s->udp4;
+      return &h3s->udp6;
+    if (path->local.addr->sa_family == AF_INET && h3s->udp4_active)
+      return &h3s->udp4;
   }
-  h3_udp_send(h3s->server, udp, (const struct sockaddr *)&qc->remote, data, len);
+  return qc->udp;
+}
+
+void qc_send(grpc_quic_conn *qc, const ngtcp2_path *path, const uint8_t *data, size_t len) {
+  uv_udp_t *udp = qc_route(qc, path);
+  h3_udp_send(qc->h3s->server, udp, (const struct sockaddr *)&qc->remote, data, len);
+}
+
+void qc_send_batch(grpc_quic_conn *qc, const ngtcp2_path *path, const uint8_t *data, size_t len,
+                   size_t gsolen) {
+  grpc_h3_server *h3s = qc->h3s;
+  /* one GSO call, unless libuv still holds queued datagrams (they must go first) */
+  if (len > gsolen && !h3s->gso_off && h3s->send_queued_bytes == 0) {
+    uv_udp_t *udp = qc_route(qc, path);
+    int rv = grpc_h3_send_gso(udp, (const struct sockaddr *)&qc->remote, data, len, gsolen);
+    if (rv == 0) {
+      atomic_fetch_add(&h3s->server->stat_bytes_sent, (uint64_t)len);
+      h3s->stat_gso_sends++;
+      return;
+    }
+    if (rv == UV_ENOTSUP)
+      h3s->gso_off = true; /* not on this system or route: packet by packet from now on */
+    else if (rv != UV_EAGAIN && rv != UV_ENOBUFS)
+      return; /* lost like any datagram; loss recovery resends */
+    /* a full socket buffer: packet by packet, which queues them */
+  }
+  for (size_t off = 0; off < len; off += gsolen)
+    qc_send(qc, path, data + off, len - off < gsolen ? len - off : gsolen);
 }
 
 /* ---- transport ops ---- */
@@ -347,6 +536,7 @@ grpc_err http3_server_start(grpc_server *server, const grpc_tls_config *tls) {
     return GRPC_ERR_NOMEM;
   h3s->server = server;
   h3s->accepting = true;
+  h3s->cluster = server->config.reuse_port;
   server->h3 = h3s;
   h3_random(h3s->secret, sizeof(h3s->secret));
 
@@ -392,6 +582,9 @@ void http3_server_close_handles(grpc_server *server) {
   if (h3s == nullptr)
     return;
   h3s->accepting = false;
+  /* closed connections still in their closing / draining period go now, before the sockets */
+  while (h3s->lingering != nullptr)
+    h3_linger_end(h3s->lingering);
   if (h3s->udp4_active)
     uv_close((uv_handle_t *)&h3s->udp4, nullptr);
   if (h3s->udp6_active)

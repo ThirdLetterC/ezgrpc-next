@@ -20,7 +20,9 @@
 #include <ngtcp2/ngtcp2_crypto.h>
 
 #include "grpc.h"
+#include "internal_client.h"
 #include "internal_quic_tls.h"
+#include "internal_http3_server.h"
 #include "test.h"
 
 /* ---- fixture: one server thread, one raw client ---------------------------------------- */
@@ -33,6 +35,12 @@ typedef struct raw_client {
   int fd;      /* the socket ngtcp2 believes it uses */
   int send_fd; /* the socket actually used for sending (differs after a rebinding) */
   struct sockaddr_in local, remote;
+  /* a second local address for active migration: packets go out on the socket of the path ngtcp2
+   * chose, and each socket is read with its own address (-1 when unused) */
+  int alt_fd;
+  struct sockaddr_in alt_local;
+  /* drop every datagram received instead of processing it (a client that misses packets) */
+  bool deaf;
   bool handshake_done;
   /* HTTP/3 on top (h3_request()): nullptr for the QUIC-only tests */
   nghttp3_conn *h3;
@@ -46,6 +54,9 @@ static struct {
   bool running;
   raw_client client;
   int extra_fds[2];
+  /* the peer address the server reported for the last request (ok_handler) */
+  pthread_mutex_t peer_lock;
+  char last_peer[64];
 } fx;
 
 static uint64_t now_ns(void) {
@@ -66,7 +77,23 @@ static void *run_server(void *arg) {
 
 static void ok_handler(grpc_call *call, [[maybe_unused]] const grpc_message *req,
                        [[maybe_unused]] void *ud) {
+  pthread_mutex_lock(&fx.peer_lock);
+  snprintf(fx.last_peer, sizeof(fx.last_peer), "%s", grpc_call_peer(call));
+  pthread_mutex_unlock(&fx.peer_lock);
   (void)grpc_call_reply_data(call, "ok", 2);
+}
+
+static void echo_handler(grpc_call *call, const grpc_message *req, [[maybe_unused]] void *ud) {
+  (void)grpc_call_reply_data(call, req->data, req->len);
+}
+
+/* The port of the peer address the server reported for the last request, or 0. */
+static unsigned last_peer_port(void) {
+  pthread_mutex_lock(&fx.peer_lock);
+  const char *colon = strrchr(fx.last_peer, ':');
+  unsigned port = colon != nullptr ? (unsigned)atoi(colon + 1) : 0;
+  pthread_mutex_unlock(&fx.peer_lock);
+  return port;
 }
 
 /* Starts a TLS + HTTP/3 server on 127.0.0.1 with `cfg`'s limits. */
@@ -79,6 +106,8 @@ static grpc_server *start_server(grpc_config cfg) {
   fx.server = grpc_server_new(&cfg);
   TEST_ASSERT_NOT_NULL(fx.server);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(fx.server, "/raw.Svc/Ok", ok_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(fx.server, "/raw.Svc/Echo", echo_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(0, pthread_create(&fx.thread, nullptr, run_server, fx.server));
   fx.running = true;
   return fx.server;
@@ -103,7 +132,9 @@ static void client_free(raw_client *k) {
     close(k->fd);
   if (k->send_fd >= 0 && k->send_fd != k->fd)
     close(k->send_fd);
-  *k = (raw_client){.fd = -1, .send_fd = -1};
+  if (k->alt_fd >= 0)
+    close(k->alt_fd);
+  *k = (raw_client){.fd = -1, .send_fd = -1, .alt_fd = -1};
 }
 
 /* ---- a minimal HTTP/3 client on top, for requests the library's client never sends ----- */
@@ -160,23 +191,26 @@ static nghttp3_ssize h3_body(nghttp3_conn *conn, int64_t stream_id, nghttp3_vec 
   return 1;
 }
 
-/* Sets up HTTP/3 on the handshaken connection and sends one POST to /raw.Svc/Ok with
- * `content_type` and a one-message body. Returns the response's :status (0 if none). */
+/* Sends a POST to /raw.Svc/Ok with `content_type` and a one-message body, setting up HTTP/3 on
+ * the handshaken connection first if needed. Returns the response's :status (0 if none). */
 static int h3_request(raw_client *k, const char *content_type) {
-  nghttp3_callbacks cb = {
-      .recv_header = h3_on_recv_header,
-      .stream_close = h3_on_stream_close,
-      .deferred_consume = h3_on_deferred_consume,
-  };
-  nghttp3_settings settings;
-  nghttp3_settings_default(&settings);
-  TEST_ASSERT_EQUAL_INT(0, nghttp3_conn_client_new(&k->h3, &cb, &settings, nullptr, k));
-  int64_t ctrl, qenc, qdec, sid;
-  TEST_ASSERT_EQUAL_INT(0, ngtcp2_conn_open_uni_stream(k->conn, &ctrl, nullptr));
-  TEST_ASSERT_EQUAL_INT(0, ngtcp2_conn_open_uni_stream(k->conn, &qenc, nullptr));
-  TEST_ASSERT_EQUAL_INT(0, ngtcp2_conn_open_uni_stream(k->conn, &qdec, nullptr));
-  TEST_ASSERT_EQUAL_INT(0, nghttp3_conn_bind_control_stream(k->h3, ctrl));
-  TEST_ASSERT_EQUAL_INT(0, nghttp3_conn_bind_qpack_streams(k->h3, qenc, qdec));
+  if (k->h3 == nullptr) {
+    nghttp3_callbacks cb = {
+        .recv_header = h3_on_recv_header,
+        .stream_close = h3_on_stream_close,
+        .deferred_consume = h3_on_deferred_consume,
+    };
+    nghttp3_settings settings;
+    nghttp3_settings_default(&settings);
+    TEST_ASSERT_EQUAL_INT(0, nghttp3_conn_client_new(&k->h3, &cb, &settings, nullptr, k));
+    int64_t ctrl, qenc, qdec;
+    TEST_ASSERT_EQUAL_INT(0, ngtcp2_conn_open_uni_stream(k->conn, &ctrl, nullptr));
+    TEST_ASSERT_EQUAL_INT(0, ngtcp2_conn_open_uni_stream(k->conn, &qenc, nullptr));
+    TEST_ASSERT_EQUAL_INT(0, ngtcp2_conn_open_uni_stream(k->conn, &qdec, nullptr));
+    TEST_ASSERT_EQUAL_INT(0, nghttp3_conn_bind_control_stream(k->h3, ctrl));
+    TEST_ASSERT_EQUAL_INT(0, nghttp3_conn_bind_qpack_streams(k->h3, qenc, qdec));
+  }
+  int64_t sid;
   TEST_ASSERT_EQUAL_INT(0, ngtcp2_conn_open_bidi_stream(k->conn, &sid, nullptr));
 #define H3NV(n, v)                                                             \
   {                                                                            \
@@ -203,7 +237,8 @@ static int h3_request(raw_client *k, const char *content_type) {
 
 void setUp(void) {
   memset(&fx, 0, sizeof(fx));
-  fx.client = (raw_client){.fd = -1, .send_fd = -1};
+  pthread_mutex_init(&fx.peer_lock, nullptr);
+  fx.client = (raw_client){.fd = -1, .send_fd = -1, .alt_fd = -1};
   fx.extra_fds[0] = fx.extra_fds[1] = -1;
 }
 
@@ -216,6 +251,7 @@ void tearDown(void) {
   stop_server();
   grpc_server_free(fx.server);
   fx.server = nullptr;
+  pthread_mutex_destroy(&fx.peer_lock);
 }
 
 /* ---- ngtcp2 client callbacks ---------------------------------------------------------- */
@@ -384,24 +420,35 @@ static void client_flush(raw_client *k) {
       (void)nghttp3_conn_add_write_offset(k->h3, stream_id, (size_t)ndatalen);
     if (n == 0)
       break;
-    (void)send(k->send_fd, buf, (size_t)n, 0);
+    bool on_alt = k->alt_fd >= 0 && ps.path.local.addrlen == sizeof(k->alt_local) &&
+                  ((struct sockaddr_in *)ps.path.local.addr)->sin_port == k->alt_local.sin_port;
+    (void)send(on_alt ? k->alt_fd : k->send_fd, buf, (size_t)n, 0);
   }
 }
 
-/* Feeds every datagram waiting on fd to the connection; counts them in *counter. */
-static void client_read(raw_client *k, int fd, int *counter) {
+/* Feeds every datagram waiting on fd to the connection as received at `local`; counts them in
+ * *counter. */
+static void client_read_at(raw_client *k, int fd, struct sockaddr_in *local, int *counter) {
   uint8_t buf[65536];
   for (;;) {
     ssize_t r = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
     if (r <= 0)
       break;
+    if (k->deaf)
+      continue;
     if (counter != nullptr)
       (*counter)++;
-    ngtcp2_path path = {{(ngtcp2_sockaddr *)&k->local, sizeof(k->local)},
+    ngtcp2_path path = {{(ngtcp2_sockaddr *)local, sizeof(*local)},
                         {(ngtcp2_sockaddr *)&k->remote, sizeof(k->remote)}};
     ngtcp2_pkt_info pi = {0};
     (void)ngtcp2_conn_read_pkt(k->conn, &path, &pi, buf, (size_t)r, now_ns());
   }
+}
+
+/* client_read_at() for the client's main address (also used for a NAT-rebound socket, which the
+ * client does not know about). */
+static void client_read(raw_client *k, int fd, int *counter) {
+  client_read_at(k, fd, &k->local, counter);
 }
 
 /* Runs the client for ms milliseconds, reading k->fd (and fd2 when >= 0, counting the datagrams
@@ -409,11 +456,13 @@ static void client_read(raw_client *k, int fd, int *counter) {
 static void client_run(raw_client *k, unsigned ms, int fd2, int *on_fd, int *on_fd2) {
   uint64_t end = now_ns() + (uint64_t)ms * 1000000ull;
   while (now_ns() < end) {
-    struct pollfd p[2] = {{k->fd, POLLIN, 0}, {fd2, POLLIN, 0}};
-    (void)poll(p, fd2 >= 0 ? 2 : 1, 5);
+    struct pollfd p[3] = {{k->fd, POLLIN, 0}, {fd2, POLLIN, 0}, {k->alt_fd, POLLIN, 0}};
+    (void)poll(p, 3, 5); /* negative fds are ignored */
     client_read(k, k->fd, on_fd);
     if (fd2 >= 0)
       client_read(k, fd2, on_fd2);
+    if (k->alt_fd >= 0)
+      client_read_at(k, k->alt_fd, &k->alt_local, nullptr);
     if (ngtcp2_conn_get_expiry(k->conn) <= now_ns())
       (void)ngtcp2_conn_handle_expiry(k->conn, now_ns());
     client_flush(k);
@@ -512,7 +561,7 @@ void test_h3raw_unanswered_initials_do_not_lock_out(void) {
   rem.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   TEST_ASSERT_EQUAL_INT(0, connect(ffd, (struct sockaddr *)&rem, sizeof(rem)));
   for (int i = 0; i < 4; i++) {
-    raw_client one = {.fd = -1, .send_fd = -1};
+    raw_client one = {.fd = -1, .send_fd = -1, .alt_fd = -1};
     client_init(&one, grpc_server_http3_port(server));
     one.send_fd = ffd; /* all from one socket, never read: the handshakes never progress */
     uint8_t buf[1452];
@@ -580,6 +629,162 @@ void test_h3raw_content_type_exact(void) {
   TEST_ASSERT_EQUAL_INT(200, h3_request(k, "application/grpc+proto"));
 }
 
+/* Active migration (RFC 9000 section 9.2): the client moves to a new local address and a new
+ * connection ID. The server validates the new path, keeps serving the connection there and reports
+ * the new peer address to handlers. */
+void test_h3raw_active_migration(void) {
+  grpc_server *server = start_server((grpc_config){0});
+  raw_client *k = &fx.client;
+  client_handshake(k, grpc_server_http3_port(server));
+  TEST_ASSERT_EQUAL_INT(200, h3_request(k, "application/grpc"));
+  TEST_ASSERT_EQUAL_INT(ntohs(k->local.sin_port), (int)last_peer_port());
+
+  k->alt_fd = socket(AF_INET, SOCK_DGRAM, 0);
+  TEST_ASSERT_TRUE(k->alt_fd >= 0);
+  TEST_ASSERT_EQUAL_INT(0, connect(k->alt_fd, (struct sockaddr *)&k->remote, sizeof(k->remote)));
+  socklen_t len = sizeof(k->alt_local);
+  TEST_ASSERT_EQUAL_INT(0, getsockname(k->alt_fd, (struct sockaddr *)&k->alt_local, &len));
+  ngtcp2_path path2 = {{(ngtcp2_sockaddr *)&k->alt_local, sizeof(k->alt_local)},
+                       {(ngtcp2_sockaddr *)&k->remote, sizeof(k->remote)}};
+  /* refused by the client's ngtcp2 when the server advertises disable_active_migration */
+  TEST_ASSERT_EQUAL_INT(0, ngtcp2_conn_initiate_migration(k->conn, &path2, now_ns()));
+  /* the client validates the new path, then moves to it */
+  for (int i = 0; i < 200; i++) {
+    const ngtcp2_path *cur = ngtcp2_conn_get_path(k->conn);
+    if (((const struct sockaddr_in *)cur->local.addr)->sin_port == k->alt_local.sin_port)
+      break;
+    client_run(k, 10, -1, nullptr, nullptr);
+  }
+  const ngtcp2_path *cur = ngtcp2_conn_get_path(k->conn);
+  TEST_ASSERT_EQUAL_INT_MESSAGE(ntohs(k->alt_local.sin_port),
+                                ntohs(((const struct sockaddr_in *)cur->local.addr)->sin_port),
+                                "the new path was not validated");
+
+  TEST_ASSERT_EQUAL_INT(200, h3_request(k, "application/grpc"));
+  TEST_ASSERT_EQUAL_INT_MESSAGE(ntohs(k->alt_local.sin_port), (int)last_peer_port(),
+                                "the server reports the old peer address");
+  TEST_ASSERT_FALSE(ngtcp2_conn_in_closing_period(k->conn) ||
+                    ngtcp2_conn_in_draining_period(k->conn));
+}
+
+/* After the server closed a connection (here at max_connection_age, with no stream open), the
+ * closing period (RFC 9000 section 10.2) answers a client that missed the CONNECTION_CLOSE: its
+ * next packet gets the CONNECTION_CLOSE again, instead of silence until its idle timeout. The
+ * connection slot is free meanwhile. */
+void test_h3raw_closing_period(void) {
+  grpc_server *server = start_server((grpc_config){
+      .max_connection_age_ms = 200, .max_connection_age_grace_ms = 100, .max_connections = 1});
+  uint16_t port = grpc_server_http3_port(server);
+  raw_client *k = &fx.client;
+  client_handshake(k, port);
+  /* from now on the client misses what the server sends: the GOAWAY and the CONNECTION_CLOSE */
+  k->deaf = true;
+  grpc_server_stats st = {0};
+  for (int i = 0; i < 300; i++) {
+    client_run(k, 10, -1, nullptr, nullptr);
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_get_stats(server, &st));
+    if (st.active_connections == 0)
+      break;
+  }
+  TEST_ASSERT_EQUAL_UINT64_MESSAGE(0, st.active_connections, "the server kept the connection");
+  k->deaf = false;
+  int64_t id;
+  TEST_ASSERT_EQUAL_INT(0, ngtcp2_conn_open_bidi_stream(k->conn, &id, nullptr));
+  stream_write(k, id, "\x01", 1);
+  int got = 0;
+  client_run(k, 500, -1, &got, nullptr);
+  TEST_ASSERT_TRUE_MESSAGE(got > 0, "a late packet was not answered");
+  TEST_ASSERT_TRUE_MESSAGE(ngtcp2_conn_in_draining_period(k->conn),
+                           "the answer was not the CONNECTION_CLOSE");
+
+  /* the closed connection no longer holds the only slot */
+  raw_client two = {.fd = -1, .send_fd = -1, .alt_fd = -1};
+  client_handshake(&two, port);
+  client_free(&two);
+}
+
+/* A large response goes out in batches of packets; on Linux each batch is one sendmsg() with
+ * UDP_SEGMENT (GSO) rather than one call per packet. The data arrives intact either way. */
+void test_h3raw_gso_batches(void) {
+  grpc_server *server = start_server((grpc_config){.max_message_size = 4 << 20});
+  grpc_err err = GRPC_OK;
+  grpc_client *client =
+      grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
+                                            .port = grpc_server_http3_port(server),
+                                            .timeout_ms = 10000,
+                                            .max_message_size = 4 << 20,
+                                            .transport = GRPC_TRANSPORT_HTTP3,
+                                            .tls = {.enable = true, .insecure_skip_verify = true}},
+                      &err);
+  TEST_ASSERT_NOT_NULL(client);
+  enum { BODY = 2 << 20 };
+  uint8_t *body = malloc(BODY);
+  TEST_ASSERT_NOT_NULL(body);
+  for (size_t i = 0; i < BODY; i++)
+    body[i] = (uint8_t)(i * 131 + (i >> 11));
+  grpc_client_response resp = {0};
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_client_unary(client, "/raw.Svc/Echo", body, BODY, nullptr, 0, 10000, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  TEST_ASSERT_NOT_NULL(resp.message);
+  TEST_ASSERT_EQUAL_UINT32(BODY, resp.message->len);
+  TEST_ASSERT_EQUAL_MEMORY(body, resp.message->data, BODY);
+  grpc_client_response_free(&resp);
+  free(body);
+  uint64_t queued = 0, dropped = 0, client_gso = 0;
+  h3c_send_counters(&client->subs[0], &queued, &dropped, &client_gso);
+  grpc_client_free(client);
+  stop_server(); /* the counters are the loop thread's */
+#if defined(__linux__)
+  TEST_ASSERT_FALSE_MESSAGE(server->h3->gso_off, "GSO was found unusable on loopback");
+  TEST_ASSERT_TRUE_MESSAGE(server->h3->stat_gso_sends > 0, "the server sent no batch with GSO");
+  TEST_ASSERT_TRUE_MESSAGE(client_gso > 0, "the client sent no batch with GSO");
+#endif
+}
+
+/* Servers on two loops share one port (reuse_port). The kernel picks a socket by the client's
+ * address, so after each NAT rebinding the client's packets may reach the server that does not own
+ * the connection; that server forwards them to the owner's loop. Eight rebindings each land on the
+ * wrong server half the time, so all requests succeeding is no accident. */
+void test_h3raw_rebinding_across_reuse_port_servers(void) {
+  grpc_server *server = start_server((grpc_config){.reuse_port = true});
+  uint16_t port = grpc_server_http3_port(server);
+  grpc_config cfg2 = {
+      .port = grpc_server_port(server),
+      .ipv4_addr = "127.0.0.1",
+      .reuse_port = true,
+      .tls = {.cert_file = "test_cert.pem", .key_file = "test_key.pem"},
+      .http3 = {.enable = true, .port = port},
+      .log_level = GRPC_LOG_OFF,
+  };
+  grpc_server *server2 = grpc_server_new(&cfg2);
+  TEST_ASSERT_NOT_NULL(server2);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server2, "/raw.Svc/Ok", ok_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(port, grpc_server_http3_port(server2));
+  pthread_t thread2;
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&thread2, nullptr, run_server, server2));
+
+  raw_client *k = &fx.client;
+  client_handshake(k, port);
+  TEST_ASSERT_EQUAL_INT(200, h3_request(k, "application/grpc"));
+  int ok = 0;
+  for (int i = 0; i < 8; i++) {
+    /* a new source address; the client does not know (NAT rebinding) */
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    TEST_ASSERT_TRUE(fd >= 0);
+    TEST_ASSERT_EQUAL_INT(0, connect(fd, (struct sockaddr *)&k->remote, sizeof(k->remote)));
+    close(k->fd);
+    k->fd = k->send_fd = fd;
+    if (h3_request(k, "application/grpc") == 200)
+      ok++;
+  }
+
+  grpc_server_stop(server2);
+  pthread_join(thread2, nullptr);
+  grpc_server_free(server2);
+  TEST_ASSERT_EQUAL_INT_MESSAGE(8, ok, "requests after a rebinding were lost");
+}
+
 int main(void) {
   srand((unsigned)now_ns());
   UNITY_BEGIN();
@@ -588,5 +793,9 @@ int main(void) {
   RUN_TEST(test_h3raw_unanswered_initials_do_not_lock_out);
   RUN_TEST(test_h3raw_drain_after_age_goaway);
   RUN_TEST(test_h3raw_content_type_exact);
+  RUN_TEST(test_h3raw_active_migration);
+  RUN_TEST(test_h3raw_closing_period);
+  RUN_TEST(test_h3raw_gso_batches);
+  RUN_TEST(test_h3raw_rebinding_across_reuse_port_servers);
   return UNITY_END();
 }

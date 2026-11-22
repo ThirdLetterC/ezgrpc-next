@@ -69,6 +69,17 @@ How the other server settings apply to HTTP/3:
 - `grpc_server_drain()` stops accepting new QUIC connections and sends GOAWAY to the existing ones.
 - `grpc_server_reload_tls()` swaps the QUIC TLS context too. Existing connections keep the context they started with.
 - `grpc_call_peer()` and `grpc_call_peer_cert_subject()` work as with TLS over TCP.
+- `reuse_port` lets several servers (one per thread) share the UDP port, as with the TCP listeners; see [Connections on the move](#connections-on-the-move).
+
+### Connections on the move
+
+- **Migration.** Clients may move to a new address, either deliberately (active migration with a new connection ID) or because a NAT rebinds them. ngtcp2 validates the new path, and the server answers there. `grpc_call_peer()` reports the address of the connection's current path.
+- **Servers sharing a port.** With `reuse_port`, the kernel hands each datagram to one of the servers by the client's address, so after a client's address changes its packets may reach a server that does not have the connection. The servers of a process keep a shared table of their connection IDs: such a datagram is passed to the loop of the server that owns the connection, which answers from the same port.
+- **Closing period.** After a connection closes, its connection IDs stay known for three probe timeouts, at least 1 second (RFC 9000 section 10.2). If the server sent the CONNECTION_CLOSE, a client that missed it gets it again on its next packet, instead of waiting for its idle timeout. If the client closed first, its late packets are dropped. The connection slot is free meanwhile.
+
+### Sending
+
+Packets of a flush go out in batches. On Linux, each batch is one `sendmsg()` with `UDP_SEGMENT` (generic segmentation offload). If the route cannot segment, the server stops trying and sends packet by packet. When a socket buffer is full, datagrams wait in libuv's send queue in order, up to 4 MiB per server (and per client connection), instead of being dropped. Pacing follows ngtcp2's send quantum and timer. The client sends the same way.
 
 ---
 
@@ -120,9 +131,9 @@ cd build/http3/generated/http3-example
 
 ## Limitations
 
-- **No 0-RTT** (early data) and no connection migration: the server advertises `disable_active_migration`.
-- **No draining period:** a closed connection is freed right after its CONNECTION_CLOSE is sent, without waiting out the QUIC draining period.
-- **Datagrams are sent with `uv_udp_try_send`**, one packet at a time, with no GSO or pacing beyond ngtcp2's. A full socket buffer drops the packet and QUIC loss recovery resends it.
-- **Multi-loop servers:** with `grpc_config.reuse_port`, like the TCP listeners, the UDP socket sets `SO_REUSEPORT` on Unix, so several `grpc_server`s (one per thread) can share a port. The kernel spreads datagrams by address 4-tuple, so a connection stays on its loop. If a client's address changes mid-connection (NAT rebinding), its packets may reach a loop that doesn't know the connection, and the connection times out.
+- **No 0-RTT** (early data), deliberately. A client's first flight could carry requests, but an attacker on the path can replay early data, and gRPC calls are not idempotent in general. Accepting it safely would need the application to mark replay-safe methods, plus single-use session tickets in every TLS backend. Every connection does a full 1-RTT handshake.
+- **Servers sharing a port** forward datagrams only within one process. Separate processes on one port (`SO_REUSEPORT` across processes) still lose a connection whose client moves to an address the kernel maps to another process.
+- **The client** does not migrate on its own, and frees a connection as soon as it closes it. Its loop runs only during calls, so there is no closing period on that side.
+- **GSO** is Linux-only. Other systems send packet by packet.
 - **Windows builds keep HTTP/3 off.** The CI does not install ngtcp2/nghttp3 there.
 - **Python `grpcio` has no HTTP/3.** HTTP/3 is tested with the library's own client (`src/tests/http3.c`). For interoperability checks, use .NET `Grpc.Net.Client` (which supports HTTP/3) or `curl --http3` with a gRPC-framed body.

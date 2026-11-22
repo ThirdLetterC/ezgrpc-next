@@ -232,6 +232,12 @@ bool h3c_usable(client_subchannel *s);
  * that none is kept for a stream nghttp3 never knew. */
 size_t h3c_orphan_count(const client_subchannel *s);
 
+/* The connection's count of datagrams queued because the socket buffer was full, dropped because
+ * the queue was full too, and of batches sent with one GSO call (0 without a connection). For
+ * tests. */
+void h3c_send_counters(const client_subchannel *s, uint64_t *queued, uint64_t *dropped,
+                       uint64_t *gso_sends);
+
 /* Opens a request stream, submits the headers with st->send_buf as the body source and sets
  * st->stream_id. Returns 0, or -1. */
 int h3c_submit_request(client_subchannel *s, grpc_client_stream *st, const grpc_nv *nva,

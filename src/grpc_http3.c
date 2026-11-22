@@ -5,6 +5,7 @@
  * internal_http3.h are stubbed here so the server core links unchanged and enabling HTTP/3 fails
  * with GRPC_ERR_UNSUPPORTED.
  */
+#include <errno.h>
 #include <stdio.h>
 
 #include "core.h"
@@ -31,6 +32,67 @@ const nghttp3_mem grpc_h3_mem = {
     .calloc = grpc_mem_hook_calloc,
     .realloc = grpc_mem_hook_realloc,
 };
+
+#if defined(__linux__)
+#include <netinet/udp.h>
+#include <sys/socket.h>
+#endif
+
+int grpc_h3_send_gso(uv_udp_t *udp, const struct sockaddr *to, const uint8_t *data, size_t len,
+                     size_t gsolen) {
+#if defined(__linux__) && defined(UDP_SEGMENT)
+  uv_os_fd_t fd;
+  if (gsolen == 0 || gsolen > UINT16_MAX || uv_fileno((const uv_handle_t *)udp, &fd) != 0)
+    return UV_ENOTSUP;
+  struct iovec iov = {.iov_base = grpc_unconst(data), .iov_len = len};
+  union {
+    char buf[CMSG_SPACE(sizeof(uint16_t))];
+    struct cmsghdr align;
+  } control;
+  memset(&control, 0, sizeof(control));
+  struct msghdr msg = {
+      .msg_name = grpc_unconst(to),
+      .msg_namelen = to == nullptr               ? 0
+                     : to->sa_family == AF_INET6 ? (socklen_t)sizeof(struct sockaddr_in6)
+                                                 : (socklen_t)sizeof(struct sockaddr_in),
+      .msg_iov = &iov,
+      .msg_iovlen = 1,
+      .msg_control = control.buf,
+      .msg_controllen = sizeof(control.buf),
+  };
+  struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+  cm->cmsg_level = SOL_UDP;
+  cm->cmsg_type = UDP_SEGMENT;
+  cm->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+  uint16_t seg = (uint16_t)gsolen;
+  memcpy(CMSG_DATA(cm), &seg, sizeof(seg));
+  ssize_t n;
+  do {
+    n = sendmsg(fd, &msg, 0);
+  } while (n < 0 && errno == EINTR);
+  if (n >= 0)
+    return 0;
+#if EWOULDBLOCK != EAGAIN
+  if (errno == EWOULDBLOCK)
+    return UV_EAGAIN;
+#endif
+  if (errno == EAGAIN)
+    return UV_EAGAIN;
+  if (errno == ENOBUFS)
+    return UV_ENOBUFS;
+  /* EIO: the route has no checksum offload; EINVAL / ENOPROTOOPT: no UDP GSO in this kernel */
+  if (errno == EIO || errno == EINVAL || errno == ENOPROTOOPT || errno == EOPNOTSUPP)
+    return UV_ENOTSUP;
+  return uv_translate_sys_error(errno);
+#else
+  (void)udp;
+  (void)to;
+  (void)data;
+  (void)len;
+  (void)gsolen;
+  return UV_ENOTSUP;
+#endif
+}
 
 GRPC_API bool grpc_http3_available(void) {
   return true;
@@ -72,6 +134,10 @@ grpc_err http3_server_start(grpc_server *server, const grpc_tls_config *tls) {
   (void)tls;
   LOG_ERROR(server, "http3 was requested but the library was built without HTTP/3\n");
   return GRPC_ERR_UNSUPPORTED;
+}
+
+void http3_server_leave_cluster(grpc_server *server) {
+  (void)server;
 }
 
 void http3_server_stop_accepting(grpc_server *server) {
@@ -130,6 +196,11 @@ bool h3c_usable(client_subchannel *s) {
 size_t h3c_orphan_count(const client_subchannel *s) {
   (void)s;
   return 0;
+}
+void h3c_send_counters(const client_subchannel *s, uint64_t *queued, uint64_t *dropped,
+                       uint64_t *gso_sends) {
+  (void)s;
+  *queued = *dropped = *gso_sends = 0;
 }
 int h3c_submit_request(client_subchannel *s, grpc_client_stream *st, const grpc_nv *nva,
                        size_t nvlen) {

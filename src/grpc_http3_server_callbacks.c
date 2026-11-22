@@ -122,6 +122,7 @@ static int h3_on_begin_headers(nghttp3_conn *conn, int64_t stream_id, void *conn
   grpc_quic_conn *qc = conn_user_data;
   if (stream_user_data != nullptr)
     return 0;
+  h3_qc_note_path(qc); /* the request's call takes the peer address of the current path */
   grpc_stream *stream = stream_new(stream_id, &grpc_h3_transport_ops);
   if (stream == nullptr)
     return NGHTTP3_ERR_CALLBACK_FAILURE;

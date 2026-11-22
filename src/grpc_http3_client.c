@@ -106,36 +106,72 @@ static void h3c_arm_timer(h3c_conn *hc) {
 }
 
 /* Sends one datagram on the connected socket; a full buffer drops it (QUIC retransmits). */
-static void h3c_send(h3c_conn *hc, const uint8_t *data, size_t len) {
-  uv_buf_t buf = uv_buf_init(grpc_unconst(data), (unsigned int)len);
-  (void)uv_udp_try_send(&hc->udp, &buf, 1, nullptr);
+/* A datagram waiting in libuv's send queue, with its own copy of the bytes. */
+typedef struct h3c_send_req {
+  uv_udp_send_t req;
+  h3c_conn *hc;
+  size_t len;
+  uint8_t data[];
+} h3c_send_req;
+
+/* uv_udp_send() completion, or cancellation when the socket closes (before the connection is
+ * freed in on_h3c_handle_closed()). */
+static void on_h3c_send_done(uv_udp_send_t *req, int status) {
+  (void)status;
+  h3c_send_req *sr = (h3c_send_req *)req;
+  sr->hc->send_queued_bytes -= sr->len;
+  grpc_free(sr);
 }
 
-void h3c_flush(client_subchannel *s) {
-  h3c_conn *hc = s->h3c;
-  if (hc == nullptr || hc->conn == nullptr || s->closed)
+/* Sends a datagram on the connected socket. When the socket buffer is full (or libuv still holds
+ * queued datagrams, which keeps them in order) a copy is queued instead of left to loss recovery,
+ * up to H3C_SEND_QUEUE_MAX bytes. */
+static void h3c_send(h3c_conn *hc, const uint8_t *data, size_t len) {
+  uv_buf_t buf = uv_buf_init(grpc_unconst(data), (unsigned int)len);
+  int rv = uv_udp_try_send(&hc->udp, &buf, 1, nullptr);
+  if (rv >= 0 || (rv != UV_EAGAIN && rv != UV_ENOBUFS))
     return;
-  ngtcp2_tstamp ts = h3c_now();
+  h3c_send_req *sr =
+      len <= H3C_SEND_QUEUE_MAX - hc->send_queued_bytes ? grpc_malloc(sizeof(*sr) + len) : nullptr;
+  if (sr == nullptr) {
+    hc->stat_send_dropped++;
+    return;
+  }
+  sr->hc = hc;
+  sr->len = len;
+  memcpy(sr->data, data, len);
+  buf = uv_buf_init((char *)sr->data, (unsigned int)len);
+  if (uv_udp_send(&sr->req, &hc->udp, &buf, 1, nullptr, on_h3c_send_done) != 0) {
+    grpc_free(sr);
+    hc->stat_send_dropped++;
+    return;
+  }
+  hc->send_queued_bytes += len;
+  hc->stat_send_queued++;
+}
+
+/* ngtcp2_write_pkt for ngtcp2_conn_write_aggregate_pkt(): writes one packet with whatever
+ * nghttp3 has to send (or only QUIC frames). Returns its length, 0 when there is nothing to send,
+ * or a negative ngtcp2 error, which fails the connection. */
+static ngtcp2_ssize h3c_write_pkt(ngtcp2_conn *conn, ngtcp2_path *path, ngtcp2_pkt_info *pi,
+                                  uint8_t *dest, size_t destlen, ngtcp2_tstamp ts,
+                                  void *user_data) {
+  h3c_conn *hc = user_data;
   for (;;) {
     int64_t stream_id = -1;
     int fin = 0;
     nghttp3_vec vec[16];
     nghttp3_ssize sveccnt = 0;
-    if (hc->h3 != nullptr && ngtcp2_conn_get_max_data_left(hc->conn)) {
+    if (hc->h3 != nullptr && ngtcp2_conn_get_max_data_left(conn)) {
       sveccnt = nghttp3_conn_writev_stream(hc->h3, &stream_id, &fin, vec, 16);
-      if (sveccnt < 0) {
-        h3c_fail(hc, GRPC_ERR_PROTOCOL);
-        return;
-      }
+      if (sveccnt < 0)
+        return NGTCP2_ERR_CALLBACK_FAILURE;
     }
     ngtcp2_ssize ndatalen = -1;
-    ngtcp2_path_storage ps;
-    ngtcp2_path_storage_zero(&ps);
-    ngtcp2_pkt_info pi;
     uint32_t flags = NGTCP2_WRITE_STREAM_FLAG_MORE | (fin ? NGTCP2_WRITE_STREAM_FLAG_FIN : 0);
     ngtcp2_ssize nwrite =
-        ngtcp2_conn_writev_stream(hc->conn, &ps.path, &pi, hc->sbuf, sizeof(hc->sbuf), &ndatalen,
-                                  flags, stream_id, (const ngtcp2_vec *)vec, (size_t)sveccnt, ts);
+        ngtcp2_conn_writev_stream(conn, path, pi, dest, destlen, &ndatalen, flags, stream_id,
+                                  (const ngtcp2_vec *)vec, (size_t)sveccnt, ts);
     if (nwrite < 0) {
       switch (nwrite) {
       case NGTCP2_ERR_STREAM_DATA_BLOCKED:
@@ -145,24 +181,59 @@ void h3c_flush(client_subchannel *s) {
         nghttp3_conn_shutdown_stream_write(hc->h3, stream_id);
         continue;
       case NGTCP2_ERR_WRITE_MORE:
-        if (nghttp3_conn_add_write_offset(hc->h3, stream_id, (size_t)ndatalen) != 0) {
-          h3c_fail(hc, GRPC_ERR_PROTOCOL);
-          return;
-        }
+        if (nghttp3_conn_add_write_offset(hc->h3, stream_id, (size_t)ndatalen) != 0)
+          return NGTCP2_ERR_CALLBACK_FAILURE;
         continue;
       default:
-        h3c_fail(hc, GRPC_ERR_IO);
-        return;
+        return nwrite;
       }
     }
     if (ndatalen >= 0 && stream_id >= 0 &&
-        nghttp3_conn_add_write_offset(hc->h3, stream_id, (size_t)ndatalen) != 0) {
-      h3c_fail(hc, GRPC_ERR_PROTOCOL);
+        nghttp3_conn_add_write_offset(hc->h3, stream_id, (size_t)ndatalen) != 0)
+      return NGTCP2_ERR_CALLBACK_FAILURE;
+    return nwrite;
+  }
+}
+
+/* Sends `len` bytes of packets of `gsolen` bytes each (the last may be shorter): with one GSO call
+ * where possible (and libuv holds no queued datagrams, which must go first), else packet by
+ * packet. */
+static void h3c_send_batch(h3c_conn *hc, const uint8_t *data, size_t len, size_t gsolen) {
+  if (len > gsolen && !hc->gso_off && hc->send_queued_bytes == 0) {
+    int rv = grpc_h3_send_gso(&hc->udp, nullptr, data, len, gsolen);
+    if (rv == 0) {
+      hc->stat_gso_sends++;
       return;
     }
-    if (nwrite == 0)
+    if (rv == UV_ENOTSUP)
+      hc->gso_off = true;
+    else if (rv != UV_EAGAIN && rv != UV_ENOBUFS)
+      return; /* lost like any datagram; loss recovery resends */
+  }
+  for (size_t off = 0; off < len; off += gsolen)
+    h3c_send(hc, data + off, len - off < gsolen ? len - off : gsolen);
+}
+
+void h3c_flush(client_subchannel *s) {
+  h3c_conn *hc = s->h3c;
+  if (hc == nullptr || hc->conn == nullptr || s->closed)
+    return;
+  ngtcp2_tstamp ts = h3c_now();
+  size_t cap = hc->gso_off ? H3C_MAX_UDP_PAYLOAD : sizeof(hc->gsobuf);
+  for (;;) {
+    ngtcp2_path_storage ps;
+    ngtcp2_path_storage_zero(&ps);
+    ngtcp2_pkt_info pi;
+    size_t gsolen = 0;
+    ngtcp2_ssize n = ngtcp2_conn_write_aggregate_pkt(hc->conn, &ps.path, &pi, hc->gsobuf, cap,
+                                                     &gsolen, h3c_write_pkt, ts);
+    if (n < 0) {
+      h3c_fail(hc, n == NGTCP2_ERR_CALLBACK_FAILURE ? GRPC_ERR_PROTOCOL : GRPC_ERR_IO);
+      return;
+    }
+    if (n == 0)
       break;
-    h3c_send(hc, hc->sbuf, (size_t)nwrite);
+    h3c_send_batch(hc, hc->gsobuf, (size_t)n, gsolen);
   }
   ngtcp2_conn_update_pkt_tx_time(hc->conn, ts);
   h3c_arm_timer(hc);
@@ -451,6 +522,13 @@ void h3c_resume(client_subchannel *s, grpc_client_stream *st) {
 void h3c_reset(client_subchannel *s, grpc_client_stream *st) {
   if (s->h3c != nullptr && s->h3c->conn != nullptr)
     (void)ngtcp2_conn_shutdown_stream(s->h3c->conn, 0, st->stream_id, NGHTTP3_H3_REQUEST_CANCELLED);
+}
+
+void h3c_send_counters(const client_subchannel *s, uint64_t *queued, uint64_t *dropped,
+                       uint64_t *gso_sends) {
+  *queued = s->h3c != nullptr ? s->h3c->stat_send_queued : 0;
+  *dropped = s->h3c != nullptr ? s->h3c->stat_send_dropped : 0;
+  *gso_sends = s->h3c != nullptr ? s->h3c->stat_gso_sends : 0;
 }
 
 size_t h3c_orphan_count(const client_subchannel *s) {

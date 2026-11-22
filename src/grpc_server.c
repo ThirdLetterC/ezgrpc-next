@@ -410,6 +410,7 @@ GRPC_API uint16_t grpc_server_http3_port(const grpc_server *server) {
 GRPC_API void grpc_server_free(grpc_server *server) {
   if (server == nullptr)
     return;
+  http3_server_leave_cluster(server); /* before run_posted(): see there */
 
   if (server->sessions != nullptr) {
     /* deliver what the application already queued */

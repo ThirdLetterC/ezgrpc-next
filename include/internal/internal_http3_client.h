@@ -12,11 +12,14 @@
 
 #include "core.h"
 #include "internal_client.h"
+#include "internal_http3.h"
 #include "internal_quic_tls.h"
 
 enum { H3C_CID_LEN = 18 };
 enum { H3C_CHUNK = 16384 };
 enum { H3C_MAX_UDP_PAYLOAD = 1452 };
+/* Most bytes of datagrams waiting in a connection's UDP send queue. */
+enum { H3C_SEND_QUEUE_MAX = 4 * 1024 * 1024 };
 
 /* A request-body chunk handed to nghttp3, freed once acknowledged. */
 typedef struct h3c_chunk h3c_chunk;
@@ -61,10 +64,19 @@ struct h3c_conn {
   ngtcp2_tstamp last_rx;
   /* the server sent GOAWAY (or its shutdown notice): no new request goes on this connection */
   bool goaway_received;
+  /* datagrams the kernel could not take at once, queued with uv_udp_send() (as on the server) */
+  size_t send_queued_bytes;
+  uint64_t stat_send_queued;
+  uint64_t stat_send_dropped;
+  /* batches sent with one GSO call (Linux), and whether GSO turned out unusable here */
+  uint64_t stat_gso_sends;
+  bool gso_off;
   /* Stream states whose RPC was freed before nghttp3 closed the stream. */
   h3c_stream *orphans;
   uint8_t rbuf[65536];
   uint8_t sbuf[H3C_MAX_UDP_PAYLOAD];
+  /* packets of one flush, sent together with GSO where available */
+  uint8_t gsobuf[GRPC_H3_GSO_BUF];
 };
 typedef struct h3c_conn h3c_conn;
 
