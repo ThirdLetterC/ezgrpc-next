@@ -376,7 +376,7 @@ static void stream_drain_messages(grpc_client_stream *st) {
     if (st->on_message != nullptr) {
       st->on_message(msg, st->on_message_userdata);
       grpc_message_free(msg);
-    } else if (grpc_list_push_back(&st->recv_queue, msg) != 0) {
+    } else if (msg_queue_push(&st->recv_queue, msg) != GRPC_OK) {
       grpc_message_free(msg);
       st->err = GRPC_ERR_NOMEM;
       st->stream_done = true;
@@ -1107,9 +1107,7 @@ static void stream_free_internal(grpc_client_stream *st) {
     if (st->sub->active_stream == st)
       st->sub->active_stream = nullptr;
   }
-  grpc_message *m;
-  while ((m = grpc_list_pop_front(&st->recv_queue)) != nullptr)
-    grpc_message_free(m);
+  msg_queue_clear(&st->recv_queue);
   h3c_stream_free(st);
   buf_free(&st->send_buf);
   buf_free(&st->recv_buf);
@@ -1146,7 +1144,6 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
   }
   st->sub = s;
   st->resp.status = GRPC_STATUS_UNKNOWN;
-  grpc_list_init(&st->recv_queue);
 
   grpc_client *c = s->parent;
   const char *enc_name = nullptr;
@@ -1313,9 +1310,9 @@ GRPC_API grpc_err grpc_client_stream_recv(grpc_client_stream *st, grpc_message *
   if (st == nullptr || out_msg == nullptr)
     return GRPC_ERR_INVALID;
   *out_msg = nullptr;
-  while (grpc_list_is_empty(&st->recv_queue) && !st->stream_done && !st->sub->closed)
+  while (msg_queue_is_empty(&st->recv_queue) && !st->stream_done && !st->sub->closed)
     uv_run(&st->sub->loop, UV_RUN_ONCE);
-  *out_msg = grpc_list_pop_front(&st->recv_queue);
+  *out_msg = msg_queue_pop(&st->recv_queue);
   if (*out_msg != nullptr)
     return GRPC_OK;
   return st->err;
@@ -1338,7 +1335,7 @@ GRPC_API grpc_err grpc_client_stream_finish(grpc_client_stream *st, grpc_client_
   }
   /* Move last queued message (if any) into out->message for unary convenience. */
   grpc_message *m;
-  while ((m = grpc_list_pop_front(&st->recv_queue)) != nullptr) {
+  while ((m = msg_queue_pop(&st->recv_queue)) != nullptr) {
     grpc_message_free(st->resp.message);
     st->resp.message = m;
   }

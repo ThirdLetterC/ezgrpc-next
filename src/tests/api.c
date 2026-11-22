@@ -308,12 +308,6 @@ void test_strings(void) {
   TEST_ASSERT_TRUE(capture_stdout_dump(sample, 0, dumped, sizeof(dumped)));
   TEST_ASSERT_EQUAL_STRING("", dumped);
 
-  grpc_header ha = {.name = (char *)"content-type", .namelen = 12};
-  grpc_header hb = {.name = (char *)"CONTENT-TYPE", .namelen = 12};
-  grpc_header hc = {.name = (char *)"x", .namelen = 1};
-  TEST_ASSERT_EQUAL_INT(0, list_cmp_ezheader_name(&ha, &hb));
-  TEST_ASSERT_NOT_EQUAL(0, list_cmp_ezheader_name(&ha, &hc));
-
   /* Bind failure on non-local address + GRPC_LOG_TRACE + channelz error paths */
   /* 192.0.2.1 (TEST-NET-1) is normally not a local address, but the bind succeeds where
    * net.ipv4.ip_nonlocal_bind=1 (or the address is configured): then there is nothing to check */

@@ -21,66 +21,53 @@
 #include "internal_helpers.h"
 #include "grpc_stream_core.h"
 
-/* Splits len bytes of the gRPC wire format (1-byte compressed flag, 4-byte big-endian length,
- * payload) into messages. Stops at the first incomplete message and returns the number of bytes
- * consumed by complete ones; the caller keeps the rest for the next chunk. *messages is allocated
- * on the first complete message and stays nullptr otherwise; the caller owns it. Compressed
- * messages (flag 1) are decompressed with encoding, limited to max_output bytes: exceeding it sets
- * *too_large and returns 0 (the caller frees any messages already parsed), while any other
- * decompression failure keeps the message as received, still flagged compressed. */
-static size_t parse_grpc_message(void *data, size_t len, grpc_compression_algorithm encoding,
-                                 grpc_messages **messages, size_t max_output, bool *too_large) {
-  i8 *wire = data;
-  *messages = nullptr;
-  *too_large = false;
-  /* quick check if there's any message to parse */
-  if (len < 5)
-    return 0;
+/* Splits gRPC length-prefixed frames (1-byte compressed flag, 4-byte big-endian length,
+ * payload) and appends the messages to *out. Stops at the first incomplete message; *consumed
+ * is the number of bytes taken by complete ones, and the caller keeps the rest for the next
+ * chunk. Compressed messages (flag 1) are decompressed with encoding, limited to max_output
+ * bytes; any decompression failure other than GRPC_ERR_LIMIT or GRPC_ERR_NOMEM keeps the message
+ * as received, still flagged compressed. Returns GRPC_OK, GRPC_ERR_LIMIT when a message
+ * decompresses past max_output, or GRPC_ERR_NOMEM. On an error the messages appended so far stay
+ * in *out. */
+static grpc_err parse_grpc_message(const uint8_t *wire, size_t len,
+                                   grpc_compression_algorithm encoding, grpc_msg_queue *out,
+                                   size_t max_output, size_t *consumed) {
+  *consumed = 0;
+  size_t seek = 0;
+  while (len - seek >= 5) {
+    uint8_t cflag = wire[seek];
+    uint32_t msg_len = ntohl(uread_u32(wire + seek + 1));
+    if (msg_len > len - seek - 5)
+      break;
+    const uint8_t *msg_data = wire + seek + 5;
 
-  size_t seek = 0, lseek = 0;
-  while (seek < len) {
-    if (seek + 5 > len) {
-      return lseek;
-    }
-    i8 cflag = wire[seek];
-    seek += 1;
-
-    uint32_t msg_len = ntohl(uread_u32(wire + seek));
-    seek += 4;
-    void *msg_data = wire + seek;
-
-    if (seek + msg_len > len) {
-      return lseek;
-    }
-
-    if (*messages == nullptr)
-      *messages = grpc_messages_new(nullptr);
     grpc_message *msg = nullptr;
     if (cflag == 1) {
       uint8_t *decomp = nullptr;
       size_t decomp_len = 0;
-      grpc_err result = grpc_decompress_limited(encoding, (const uint8_t *)msg_data, msg_len,
-                                                &decomp, &decomp_len, max_output);
-      if (result == GRPC_ERR_LIMIT) {
-        *too_large = true;
-        return 0;
-      }
+      grpc_err result =
+          grpc_decompress_limited(encoding, msg_data, msg_len, &decomp, &decomp_len, max_output);
+      if (result == GRPC_ERR_LIMIT || result == GRPC_ERR_NOMEM)
+        return result;
       if (result == GRPC_OK) {
         msg = message_create(0, decomp, decomp_len);
         grpc_free(decomp);
       } else {
-        msg = message_create((u8)cflag, msg_data, msg_len);
+        msg = message_create(cflag, msg_data, msg_len);
       }
     } else {
-      msg = message_create((u8)cflag, msg_data, msg_len);
+      msg = message_create(cflag, msg_data, msg_len);
     }
-    assert(msg != nullptr);
-    grpc_messages_push(*messages, msg);
-    seek += msg_len;
-    lseek = seek;
+    if (msg == nullptr)
+      return GRPC_ERR_NOMEM;
+    if (msg_queue_push(out, msg) != GRPC_OK) {
+      grpc_message_free(msg);
+      return GRPC_ERR_NOMEM;
+    }
+    seek += 5 + (size_t)msg_len;
+    *consumed = seek;
   }
-
-  return lseek;
+  return GRPC_OK;
 }
 
 /* Returns true if the value_len bytes at value equal the NUL-terminated expected, exactly. */
@@ -296,13 +283,33 @@ int stream_core_on_data(grpc_session *session, grpc_stream *stream, const uint8_
   return 0;
 }
 
-/* Moves parsed messages onto the call's pending queue, counts them and queues the call. */
-static void deliver_messages(grpc_session *session, grpc_call *call, grpc_messages *messages) {
-  atomic_fetch_add(&session->server->stat_messages_received,
-                   grpc_list_count((grpc_list *)messages));
-  grpc_list_concat_and_empty_src(&call->pending, (grpc_list *)messages);
-  grpc_list_free((grpc_list *)messages);
-  call_queue(call);
+/* Parses complete messages from data straight onto the call's pending queue, counts them and
+ * queues the call. Returns parse_grpc_message()'s result; on an error the call is aborted with
+ * RESOURCE_EXHAUSTED and the stream discards the rest of the request (the messages already
+ * queued are dropped with the finished call). */
+static grpc_err receive_messages(grpc_session *session, grpc_stream *stream, grpc_call *call,
+                                 const uint8_t *data, size_t len, size_t *consumed) {
+  size_t max_out = session->server->config.max_message_size > 5
+                       ? session->server->config.max_message_size - 5
+                       : 0;
+  size_t before = msg_queue_count(&call->pending);
+  grpc_err err =
+      parse_grpc_message(data, len, stream->grpc_encoding, &call->pending, max_out, consumed);
+  if (err != GRPC_OK) {
+    stream->is_discarding = true;
+    stream->recv_len = 0;
+    stream->recv_start = 0;
+    call_abort(call, GRPC_STATUS_RESOURCE_EXHAUSTED,
+               err == GRPC_ERR_LIMIT ? "decompressed request exceeds server limit"
+                                     : "server out of memory");
+    return err;
+  }
+  size_t added = msg_queue_count(&call->pending) - before;
+  if (added > 0) {
+    atomic_fetch_add(&session->server->stat_messages_received, added);
+    call_queue(call);
+  }
+  return GRPC_OK;
 }
 
 /* True if every byte is in the standard base64 alphabet or '='. Padding may appear mid-body:
@@ -323,11 +330,6 @@ void stream_core_on_data_end(grpc_session *session, grpc_stream *stream, bool en
     return;
   grpc_call *call = stream->call;
 
-  grpc_messages *messages = nullptr;
-  bool too_large = false;
-  size_t max_out = session->server->config.max_message_size > 5
-                       ? session->server->config.max_message_size - 5
-                       : 0;
   if (stream->is_grpc_web_text) {
     /* base64 can only be decoded as a whole: wait for the end of the body */
     if (!end_stream)
@@ -339,29 +341,26 @@ void stream_core_on_data_end(grpc_session *session, grpc_stream *stream, bool en
       return;
     }
     size_t dec_len = 0;
-    uint8_t *dec = grpc_metadata_decode_bin((const char *)(stream->recv_data + stream->recv_start),
-                                            stream->recv_len, &dec_len);
-    if (dec == nullptr && stream->recv_len > 0) {
-      stream->recv_len = 0;
-      call_abort(call, GRPC_STATUS_INVALID_ARGUMENT, "invalid grpc-web-text base64");
-      return;
+    uint8_t *dec = nullptr;
+    if (stream->recv_len > 0) {
+      dec = grpc_metadata_decode_bin((const char *)(stream->recv_data + stream->recv_start),
+                                     stream->recv_len, &dec_len);
+      if (dec == nullptr) { /* the alphabet was checked, so only out of memory */
+        stream->is_discarding = true;
+        stream->recv_len = 0;
+        call_abort(call, GRPC_STATUS_RESOURCE_EXHAUSTED, "server out of memory");
+        return;
+      }
     }
-    size_t lseek = dec != nullptr ? parse_grpc_message(dec, dec_len, stream->grpc_encoding,
-                                                       &messages, max_out, &too_large)
-                                  : 0;
+    size_t consumed = 0;
+    grpc_err err =
+        dec != nullptr ? receive_messages(session, stream, call, dec, dec_len, &consumed) : GRPC_OK;
     grpc_free(dec);
     stream->recv_len = 0;
     stream->recv_start = 0;
-    if (too_large) {
-      if (messages != nullptr)
-        grpc_messages_free(messages);
-      stream->is_discarding = true;
-      call_abort(call, GRPC_STATUS_RESOURCE_EXHAUSTED, "decompressed request exceeds server limit");
+    if (err != GRPC_OK)
       return;
-    }
-    if (messages != nullptr)
-      deliver_messages(session, call, messages);
-    if (lseek < dec_len) {
+    if (consumed < dec_len) {
       call_abort(call, GRPC_STATUS_DATA_LOSS, "truncated message");
     } else {
       call->half_closed = true;
@@ -370,25 +369,17 @@ void stream_core_on_data_end(grpc_session *session, grpc_stream *stream, bool en
     return;
   }
 
-  size_t lseek = parse_grpc_message(stream->recv_data + stream->recv_start, stream->recv_len,
-                                    stream->grpc_encoding, &messages, max_out, &too_large);
-  if (too_large) {
-    if (messages != nullptr)
-      grpc_messages_free(messages);
-    stream->is_discarding = true;
-    stream->recv_len = 0;
-    call_abort(call, GRPC_STATUS_RESOURCE_EXHAUSTED, "decompressed request exceeds server limit");
+  size_t consumed = 0;
+  if (receive_messages(session, stream, call, stream->recv_data + stream->recv_start,
+                       stream->recv_len, &consumed) != GRPC_OK)
     return;
-  }
-  if (lseek) {
-    assert(lseek <= stream->recv_len);
-    stream->recv_start += lseek;
-    stream->recv_len -= lseek;
+  if (consumed > 0) {
+    assert(consumed <= stream->recv_len);
+    stream->recv_start += consumed;
+    stream->recv_len -= consumed;
     if (stream->recv_len == 0)
       stream->recv_start = 0;
   }
-  if (messages != nullptr)
-    deliver_messages(session, call, messages);
 
   if (end_stream) {
     if (stream->recv_len > 0) {
@@ -411,7 +402,7 @@ void stream_core_on_close(grpc_session *session, grpc_stream *stream) {
 
 size_t stream_core_pull(grpc_stream *stream, uint8_t *buf, size_t cap, bool *eof,
                         bool *end_stream) {
-  grpc_list *lmessages = &stream->lqueue_omessages;
+  grpc_msg_queue *lmessages = &stream->lqueue_omessages;
   grpc_message *msg;
   *eof = false;
   *end_stream = false;
@@ -420,7 +411,7 @@ size_t stream_core_pull(grpc_stream *stream, uint8_t *buf, size_t cap, bool *eof
    * the front message was already written, so a message (and even its prefix) may span several
    * frames. */
   size_t buf_seek = 0;
-  while (buf_seek < cap && (msg = grpc_list_peek_front(lmessages)) != nullptr) {
+  while (buf_seek < cap && (msg = msg_queue_peek(lmessages)) != nullptr) {
     size_t seek = stream->trunc_seek;
     bool raw_frame = (msg->cflag == 0xFE);
     size_t prefix_len = raw_frame ? 0 : 5;
@@ -444,7 +435,7 @@ size_t stream_core_pull(grpc_stream *stream, uint8_t *buf, size_t cap, bool *eof
     }
 
     if (seek == total) {
-      (void)grpc_list_pop_front(lmessages);
+      (void)msg_queue_pop(lmessages);
       if (stream->queued_send_bytes >= msg->len)
         stream->queued_send_bytes -= msg->len;
       else
@@ -461,7 +452,7 @@ size_t stream_core_pull(grpc_stream *stream, uint8_t *buf, size_t cap, bool *eof
     stream->trunc_seek = seek;
   }
 
-  if (grpc_list_is_empty(lmessages)) {
+  if (msg_queue_is_empty(lmessages)) {
     *eof = true;
     /* with send_eof_on_empty the trailers were already sent in the body (gRPC-Web); otherwise the
      * stream stays open for them */

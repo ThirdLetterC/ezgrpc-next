@@ -35,9 +35,7 @@
 #include "grpc.h"
 #include "common.h"
 #include "grpc_header.h"
-#include "grpc_list.h"
-#include "grpc_list_struct.h"
-#include "grpc_messages.h"
+#include "grpc_msg_queue.h"
 
 /* ---- logging ------------------------------------------------------------- */
 
@@ -190,7 +188,7 @@ struct grpc_call {
   size_t nb_req_headers;
 
   /* Received messages not yet delivered to the application. */
-  grpc_list pending;
+  grpc_msg_queue pending;
   /* The request for a ROUTE_UNARY call. */
   grpc_message *request;
 
@@ -298,7 +296,7 @@ struct grpc_stream {
    * five-byte prefix. */
   size_t trunc_seek;
   size_t queued_send_bytes;
-  grpc_list lqueue_omessages;
+  grpc_msg_queue lqueue_omessages;
   bool send_eof_on_empty : 1;
 
   /* Trailers submitted while DATA is queued. They are sent after the data

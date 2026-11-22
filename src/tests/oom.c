@@ -13,7 +13,7 @@
 #endif
 #include "internal/grpc_threads.h"
 #include "grpc.h"
-#include "grpc_list.h"
+#include "grpc_msg_queue.h"
 #include "test.h"
 
 /* Deterministic countdown allocator for OOM fault-injection testing. It is installed once in
@@ -26,6 +26,8 @@
  *                  countdown, so injection is deterministic even while another thread (the
  *                  server loop, or the client blocked in a call) allocates concurrently
  *   g_injected     number of allocations failed since the last oom_enable_on()
+ *   g_one_shot     when set (oom_enable_once_on()), only that one allocation fails and the
+ *                  countdown then disarms itself, like a transient allocation failure
  *
  * Every fault-injection loop runs with n = 0, 1, 2, ... until an iteration completes without an
  * injected failure, so each allocation point of the operation is failed exactly once with all
@@ -35,6 +37,7 @@ enum { OOM_MAX_STEPS = 2000 };
 static atomic_int g_fail_after = -1;
 static atomic_int g_target_tid = 0;
 static atomic_int g_injected = 0;
+static atomic_bool g_one_shot = false;
 static atomic_int g_next_tid = 1;
 static _Thread_local int t_oom_tid;
 
@@ -55,6 +58,9 @@ static bool should_fail(void) {
     if (cur < 0)
       return false;
     if (cur == 0) {
+      /* one-shot: only the thread that disarms the countdown fails */
+      if (atomic_load(&g_one_shot) && !atomic_compare_exchange_strong(&g_fail_after, &cur, -1))
+        continue;
       atomic_fetch_add(&g_injected, 1);
       return true;
     }
@@ -99,9 +105,18 @@ static void oom_install(void) {
   });
 }
 
-/* Arms the countdown for thread `tid` only. */
+/* Arms the countdown for thread `tid` only: every allocation after the first fail_after fails. */
 static void oom_enable_on(int tid, int fail_after) {
   atomic_store(&g_injected, 0);
+  atomic_store(&g_one_shot, false);
+  atomic_store(&g_target_tid, tid);
+  atomic_store(&g_fail_after, fail_after);
+}
+
+/* Like oom_enable_on(), but only allocation number fail_after fails. */
+static void oom_enable_once_on(int tid, int fail_after) {
+  atomic_store(&g_injected, 0);
+  atomic_store(&g_one_shot, true);
   atomic_store(&g_target_tid, tid);
   atomic_store(&g_fail_after, fail_after);
 }
@@ -266,9 +281,14 @@ static bool response_is(const grpc_client_response *r, const void *data, size_t 
 /* ---- library primitives ----------------------------------------------------------------- */
 
 void test_oom_primitives(void) {
-  /* Messages, strdup, metadata base64, list */
+  /* Messages, strdup, metadata base64, message queue */
   for (int n = 0;; n++) {
     OOM_ASSERT_STEP(n);
+    grpc_message *qmsgs[6];
+    for (size_t i = 0; i < 6; i++) {
+      qmsgs[i] = grpc_message_new("q", 1);
+      TEST_ASSERT_NOT_NULL(qmsgs[i]);
+    }
     oom_enable_self(n);
     grpc_message *m = grpc_message_new("hello", 5);
     grpc_message *a = grpc_message_alloc(16);
@@ -278,12 +298,11 @@ void test_oom_primitives(void) {
     char *b64 = grpc_metadata_encode_bin((const uint8_t *)"hello", 5, &b64_len);
     size_t raw_len = 0;
     uint8_t *raw = grpc_metadata_decode_bin("aGVsbG8=", 8, &raw_len);
-    grpc_list *l = grpc_list_new();
-    int pushed_back = -1, pushed_front = -1;
-    if (l != nullptr) {
-      pushed_back = grpc_list_push_back(l, (void *)"a");
-      pushed_front = grpc_list_push_front(l, (void *)"b");
-    }
+    /* six pushes: the first allocates the 4-slot buffer and the fifth doubles it */
+    grpc_msg_queue q = {0};
+    grpc_err pushed[6];
+    for (size_t i = 0; i < 6; i++)
+      pushed[i] = msg_queue_push(&q, qmsgs[i]);
     bool injected = oom_disable();
 
     /* every result is either complete and correct, or the documented nullptr / nonzero */
@@ -305,18 +324,28 @@ void test_oom_primitives(void) {
       TEST_ASSERT_EQUAL_size_t(5, raw_len);
       TEST_ASSERT_EQUAL_MEMORY("hello", raw, 5);
     }
-    if (l != nullptr) {
-      size_t expect = (pushed_back == 0 ? 1u : 0u) + (pushed_front == 0 ? 1u : 0u);
-      TEST_ASSERT_EQUAL_size_t(expect, grpc_list_count(l));
-      /* the list stays usable after a failed push */
-      TEST_ASSERT_EQUAL_INT(0, grpc_list_push_back(l, (void *)"c"));
-      TEST_ASSERT_EQUAL_size_t(expect + 1, grpc_list_count(l));
+    /* a failed push leaves the message with the caller and the queue intact: the queue holds
+     * exactly the messages whose push succeeded, in order */
+    size_t expect = 0;
+    for (size_t i = 0; i < 6; i++) {
+      ASSERT_OK_OR_NOMEM(pushed[i]);
+      if (pushed[i] == GRPC_OK)
+        expect++;
     }
+    TEST_ASSERT_EQUAL_size_t(expect, msg_queue_count(&q));
+    for (size_t i = 0; i < 6; i++) {
+      if (pushed[i] == GRPC_OK)
+        TEST_ASSERT_EQUAL_PTR(qmsgs[i], msg_queue_pop(&q));
+    }
+    TEST_ASSERT_NULL(msg_queue_pop(&q));
+    msg_queue_clear(&q);
+    for (size_t i = 0; i < 6; i++) /* popped or never queued: the test owns them all again */
+      grpc_message_free(qmsgs[i]);
     if (!injected) {
       TEST_ASSERT_TRUE(m != nullptr && a != nullptr && s != nullptr && sn != nullptr &&
-                       b64 != nullptr && raw != nullptr && l != nullptr);
-      TEST_ASSERT_EQUAL_INT(0, pushed_back);
-      TEST_ASSERT_EQUAL_INT(0, pushed_front);
+                       b64 != nullptr && raw != nullptr);
+      for (size_t i = 0; i < 6; i++)
+        TEST_ASSERT_EQUAL_INT(GRPC_OK, pushed[i]);
     }
     grpc_message_free(m);
     grpc_message_free(a);
@@ -324,7 +353,6 @@ void test_oom_primitives(void) {
     grpc_free(sn);
     grpc_free(b64);
     grpc_free(raw);
-    grpc_list_free(l);
     if (!injected) {
       oom_report("primitives", n);
       break;
@@ -794,6 +822,104 @@ void test_oom_live_call_and_client(void) {
   TEST_ASSERT_EQUAL_INT(GRPC_OK, atomic_load(&g_srv_rc));
 }
 
+/* ---- request parsing on the server thread ------------------------------------------------ */
+
+/* Streaming handler for /oom.Svc/Recv. The first message is answered with "armed" and then arms
+ * a one-shot failure on the server thread, so one allocation made while receiving and parsing
+ * the following messages fails; on_end disarms it and replies with the number of messages seen. */
+static atomic_int g_recv_count = 0;
+
+static void recv_on_message(grpc_call *call, [[maybe_unused]] const grpc_message *msg,
+                            [[maybe_unused]] void *ud) {
+  if (atomic_fetch_add(&g_recv_count, 1) == 0) {
+    SRV_EXPECT(grpc_call_send_data(call, "armed", 5) == GRPC_OK);
+    oom_enable_once_on(oom_thread_id(), atomic_load(&g_step));
+  }
+}
+
+static void recv_on_end(grpc_call *call, [[maybe_unused]] void *ud) {
+  bool injected = oom_disable();
+  atomic_store(&g_step_injected, injected ? 1 : 0);
+  char reply[16];
+  int n = snprintf(reply, sizeof(reply), "%d", atomic_load(&g_recv_count));
+  SRV_EXPECT(grpc_call_send_data(call, reply, (size_t)n) == GRPC_OK);
+  SRV_EXPECT(grpc_call_finish(call, GRPC_STATUS_OK, nullptr) == GRPC_OK);
+}
+
+void test_oom_request_parsing(void) {
+  grpc_server *srv = fx_server_new();
+  const grpc_stream_handler recv = {.on_message = recv_on_message, .on_end = recv_on_end};
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle_stream(srv, "/oom.Svc/Recv", &recv, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(srv, "/oom.Svc/Echo", oom_echo_handler, nullptr));
+  fx_server_start();
+  grpc_client *c = fx_client_new(grpc_server_port(srv));
+
+  /* Step n fails the n-th allocation of the server thread (only that one) while it sends
+   * "armed" and receives five more messages: the call either completes, ends with
+   * RESOURCE_EXHAUSTED (message creation or the pending queue failed), or the stream or
+   * connection is lost (nghttp2 itself ran out of memory). The server never crashes, leaks or
+   * delivers a request with a message silently missing. */
+  bool saw_exhausted = false;
+  for (int n = 0;; n++) {
+    OOM_ASSERT_STEP(n);
+    atomic_store(&g_step, n);
+    atomic_store(&g_step_injected, -1);
+    atomic_store(&g_recv_count, 0);
+    grpc_err err = GRPC_OK;
+    grpc_client_stream *st = grpc_client_stream_open(c, "/oom.Svc/Recv", nullptr, 0, 2000, &err);
+    TEST_ASSERT_NOT_NULL(st);
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(st, "m0", 2));
+    /* sending "armed" itself allocates after arming, so an early step may lose the connection
+     * before it arrives; later steps reach the allocations made while parsing */
+    grpc_message *armed = nullptr;
+    grpc_err rc_armed = grpc_client_stream_recv(st, &armed);
+    bool got_armed = rc_armed == GRPC_OK && armed != nullptr;
+    if (got_armed)
+      TEST_ASSERT_EQUAL_MEMORY("armed", armed->data, 5);
+    else
+      ASSERT_ERR_ONE_OF2(rc_armed, GRPC_ERR_CLOSED, GRPC_ERR_IO);
+    grpc_message_free(armed);
+    for (int i = 1; got_armed && i <= 5; i++)
+      (void)grpc_client_stream_send(st, "msg", 3); /* may fail once the connection is gone */
+    grpc_client_response r = {0};
+    grpc_err rc = grpc_client_stream_finish(st, &r);
+    /* on_end does not run when the call was aborted: disarm from here then */
+    int handler_injected = atomic_load(&g_step_injected);
+    bool injected = oom_disable() || handler_injected == 1;
+    bool complete = rc == GRPC_OK && r.status == GRPC_STATUS_OK && r.message != nullptr &&
+                    r.message->len == 1 && r.message->data[0] == '6';
+    bool exhausted = rc == GRPC_OK && r.status == GRPC_STATUS_RESOURCE_EXHAUSTED;
+    grpc_status status = r.status;
+    if (getenv("OOM_VERBOSE") != nullptr)
+      printf("[oom] request parsing step %d: armed=%d rc=%d status=%d msg=%s count=%d inj=%d\n", n,
+             got_armed, (int)rc, (int)status, r.status_message ? r.status_message : "-",
+             atomic_load(&g_recv_count), handler_injected);
+    grpc_client_response_free(&r);
+    assert_server_expectations();
+    if (!injected) {
+      TEST_ASSERT_TRUE_MESSAGE(complete, "request without OOM did not complete");
+      oom_report("request parsing (server thread)", n);
+      break;
+    }
+    if (exhausted)
+      saw_exhausted = true;
+    if (!complete && !exhausted && rc == GRPC_OK) {
+      /* an RPC error other than RESOURCE_EXHAUSTED: the server reset the stream or lost the
+       * connection, never OK with a wrong message count */
+      TEST_ASSERT_NOT_EQUAL_INT(GRPC_STATUS_OK, status);
+    }
+    assert_echo_works(c);
+  }
+  TEST_ASSERT_TRUE_MESSAGE(saw_exhausted,
+                           "no step reached the RESOURCE_EXHAUSTED path of request parsing");
+
+  grpc_client_free(c);
+  g_fx.client = nullptr;
+  fx_server_stop();
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, atomic_load(&g_srv_rc));
+}
+
 #ifndef _WIN32
 /* Runs on the server thread: adds a trailer, then replies with allocation g_step failing. */
 static void oom_web_handler(grpc_call *call, const grpc_message *req, [[maybe_unused]] void *ud) {
@@ -1117,6 +1243,7 @@ int main(void) {
   RUN_TEST(test_oom_server_and_services);
   RUN_TEST(test_oom_client);
   RUN_TEST(test_oom_live_call_and_client);
+  RUN_TEST(test_oom_request_parsing);
 #ifndef _WIN32
   RUN_TEST(test_oom_grpc_web_and_client_deterministic);
 #endif

@@ -118,7 +118,6 @@ set(GRPC_SOURCES
   src/grpc_health.c
   src/grpc_http3.c
   src/grpc_interceptor.c
-  src/grpc_list.c
   src/grpc_mem.c
   src/grpc_message.c
   src/grpc_metadata.c
@@ -344,7 +343,7 @@ if(GRPC_BUILD_TESTS)
     set(GRPC_TEST_TARGETS ${GRPC_TEST_TARGETS} test_${name} PARENT_SCOPE)
   endfunction()
 
-  set(grpc_unit_tests api list mem metadata timeout compression health interceptor status_details
+  set(grpc_unit_tests api msg_queue mem metadata timeout compression health interceptor status_details
                       reflection version client)
   # integration and oom exercise gzip throughout (as do the Python greeter tests below)
   if(GRPC_ZLIB_ENABLED)

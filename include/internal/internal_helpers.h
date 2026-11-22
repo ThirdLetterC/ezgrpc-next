@@ -39,8 +39,6 @@ void stream_link(grpc_session *session, grpc_stream *stream);
 /* Remove `stream` from the session's list and decrement the counters; does not free it. */
 void stream_unlink(grpc_session *session, grpc_stream *stream);
 
-/* grpc_list comparator: 0 when two grpc_header names match case-insensitively. */
-int list_cmp_ezheader_name(const void *data, const void *userdata);
 /* printf-style write of "[timestamp] " plus the message to `fp`, ignoring log levels. */
 void ezflog(FILE *fp, const char *fmt, ...);
 /* Write the local date and time into `buf` (at most `len` bytes) and return `buf`. */

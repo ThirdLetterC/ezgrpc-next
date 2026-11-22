@@ -40,7 +40,7 @@ struct grpc_client_stream {
   grpc_buf send_buf;
   size_t send_off;
   grpc_buf recv_buf;
-  grpc_list recv_queue; /* queued grpc_message* from server */
+  grpc_msg_queue recv_queue; /* received messages not yet taken by grpc_client_stream_recv() */
   grpc_client_response resp;
   void (*on_message)(const grpc_message *msg, void *userdata);
   void *on_message_userdata;

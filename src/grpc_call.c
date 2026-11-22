@@ -140,17 +140,18 @@ static grpc_nv *nva_dup(const grpc_nv *nva, size_t nvlen) {
 
 /* ---- lifetime ------------------------------------------------------------------ */
 
-/* Frees the received messages that were not delivered to the application. */
+/* Frees the received messages that were not delivered to the application (the queue's buffer
+ * is kept for later messages; call_free() releases it). */
 static void drop_pending(grpc_call *call) {
   grpc_message *msg;
-  while ((msg = grpc_list_pop_front(&call->pending)) != nullptr)
+  while ((msg = msg_queue_pop(&call->pending)) != nullptr)
     grpc_message_free(msg);
 }
 
 /* Releases everything the call owns, runs the userdata destructor and frees the call. Called
  * only by grpc_call_unref() when the last reference goes away. */
 static void call_free(grpc_call *call) {
-  drop_pending(call);
+  msg_queue_clear(&call->pending);
   grpc_message_free(call->request);
   nv_list_free(&call->headers);
   nv_list_free(&call->trailers);
@@ -275,7 +276,6 @@ grpc_call *call_new(grpc_session *session, grpc_stream *stream) {
     call->method_override = grpc_strndup(stream->hpath, stream->hpath_len);
   memcpy(call->peer, session->peer, sizeof(call->peer));
   memcpy(call->peer_cert_subject, session->peer_cert_subject, sizeof(call->peer_cert_subject));
-  grpc_list_init(&call->pending);
   atomic_fetch_add(&session->server->stat_total_calls, 1);
   grpc_compression_algorithm def_alg = session->server->config.default_compression;
   if (def_alg != GRPC_COMPRESS_IDENTITY && codec_is_supported(def_alg) &&
@@ -568,7 +568,7 @@ static grpc_err call_finish_internal(grpc_call *call, grpc_status status, const 
         }
         if (tmsg != nullptr) {
           stream->send_eof_on_empty = true;
-          if (grpc_list_push_back(&stream->lqueue_omessages, tmsg) != 0) {
+          if (msg_queue_push(&stream->lqueue_omessages, tmsg) != GRPC_OK) {
             grpc_message_free(tmsg);
             err = GRPC_ERR_NOMEM;
           } else if (!stream->is_data_active) {
@@ -752,7 +752,7 @@ GRPC_API grpc_err grpc_call_send(grpc_call *call, grpc_message *message) {
       return GRPC_ERR_NOMEM;
   }
 
-  if (grpc_list_push_back(&stream->lqueue_omessages, message) != 0) {
+  if (msg_queue_push(&stream->lqueue_omessages, message) != GRPC_OK) {
     grpc_message_free(message);
     return GRPC_ERR_NOMEM;
   }
@@ -1260,7 +1260,7 @@ static void dispatch_unary(grpc_call *call) {
   if (call->request_delivered || !call->half_closed)
     return;
 
-  size_t count = grpc_list_count(&call->pending);
+  size_t count = msg_queue_count(&call->pending);
   if (count != 1) {
     drop_pending(call);
     (void)call_finish_internal(call, GRPC_STATUS_INTERNAL,
@@ -1268,7 +1268,7 @@ static void dispatch_unary(grpc_call *call) {
                                           : "more than one request message");
     return;
   }
-  call->request = grpc_list_pop_front(&call->pending);
+  call->request = msg_queue_pop(&call->pending);
   call->request_delivered = true;
   if (!interceptors_run_on_recv(call, call->request))
     return;
@@ -1281,7 +1281,7 @@ static void dispatch_unary(grpc_call *call) {
 static void dispatch_stream(grpc_call *call) {
   const grpc_stream_handler *handler = &call->route->stream;
   grpc_message *msg;
-  while (!call->finished && (msg = grpc_list_pop_front(&call->pending)) != nullptr) {
+  while (!call->finished && (msg = msg_queue_pop(&call->pending)) != nullptr) {
     if (!interceptors_run_on_recv(call, msg)) {
       grpc_message_free(msg);
       break;
@@ -1305,7 +1305,7 @@ static void dispatch_stream(grpc_call *call) {
 static void dispatch_events(grpc_call *call) {
   grpc_server *server = call->server;
   grpc_message *msg;
-  while (!call->finished && (msg = grpc_list_pop_front(&call->pending)) != nullptr) {
+  while (!call->finished && (msg = msg_queue_pop(&call->pending)) != nullptr) {
     if (!interceptors_run_on_recv(call, msg)) {
       grpc_message_free(msg);
       break;

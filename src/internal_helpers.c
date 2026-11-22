@@ -35,14 +35,6 @@
 #include "internal_helpers.h"
 #include "internal_tls.h"
 
-/* Compares the names of two grpc_header (data and userdata) case-insensitively, as a grpc_list
- * comparator. Returns 0 when the names are equal, nonzero otherwise. */
-int list_cmp_ezheader_name(const void *data, const void *userdata) {
-  const grpc_header *a = data;
-  const grpc_header *b = userdata;
-  return a->namelen == b->namelen ? strncasecmp(a->name, b->name, a->namelen) : 1;
-}
-
 /* Prints len bytes to stdout as hex pairs, with an extra space after the 8th byte. */
 static void dump_decode_binary(const i8 *data, size_t len) {
   const i8 look_up[16] = {'0', '1', '2', '3', '4', '5', '6', '7',
@@ -696,7 +688,6 @@ grpc_stream *stream_new(int64_t stream_id, const grpc_transport_ops *ops) {
   ezstream->ops = ops;
   ezstream->recv_data = ezstream->recv_inline;
   ezstream->recv_cap = sizeof(ezstream->recv_inline);
-  grpc_list_init(&ezstream->lqueue_omessages);
   return ezstream;
 }
 
@@ -716,10 +707,7 @@ void stream_free(grpc_stream *ezstream) {
     ezstream->ops->hdr_decref(ezstream->header_refs[i][1]);
   }
 
-  grpc_message *msg;
-  while ((msg = grpc_list_pop_front(&ezstream->lqueue_omessages)) != nullptr) {
-    grpc_message_free(msg);
-  }
+  msg_queue_clear(&ezstream->lqueue_omessages);
 
   grpc_free(ezstream);
 }
