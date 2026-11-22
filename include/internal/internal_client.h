@@ -2,8 +2,10 @@
 
 /* internal_client.h - the client's internal data model, shared by its two transports
  *
- * grpc_client.c implements the client and its HTTP/2 transport (nghttp2 over TCP / Unix sockets);
- * grpc_http3_client.c implements HTTP/3 (ngtcp2 + nghttp3 over UDP) for subchannels of a client
+ * grpc_client.c implements the client API on top of subchannels, with the HTTP/2 transport
+ * (nghttp2 over TCP / Unix sockets) in grpc_client_connect.c (connecting, TLS, tearing down) and
+ * grpc_client_io.c (socket I/O, nghttp2 callbacks), and response handling in
+ * grpc_client_response.c. grpc_http3_client.c implements HTTP/3 (ngtcp2 + nghttp3 over UDP) for subchannels of a client
  * created with GRPC_TRANSPORT_HTTP3. Both feed responses through client_resp_header() /
  * client_resp_data() so headers, trailers, status, decompression and message delivery are shared.
  * Each subchannel runs its own libuv loop only while the calling thread waits; nothing here is
@@ -122,6 +124,90 @@ void client_resp_header(grpc_client_stream *st, const uint8_t *name, size_t name
 /* Appends response body bytes and delivers every complete message. Fails the stream with
  * GRPC_ERR_LIMIT past max_message_size. Returns 0, or -1 when out of memory (the stream fails). */
 int client_resp_data(grpc_client_stream *st, const uint8_t *data, size_t len);
+
+/* Returns the subchannel handle as a uv_stream_t, whichever of TCP or pipe it is. */
+static inline uv_stream_t *sub_stream(client_subchannel *s) {
+  return s->is_unix ? (uv_stream_t *)&s->handle.pipe : (uv_stream_t *)&s->handle.tcp;
+}
+
+/* Returns the subchannel handle as a uv_handle_t, whichever of TCP or pipe it is. */
+static inline uv_handle_t *sub_handle(client_subchannel *s) {
+  return s->is_unix ? (uv_handle_t *)&s->handle.pipe : (uv_handle_t *)&s->handle.tcp;
+}
+
+/* ---- HTTP/2 subchannel I/O (grpc_client_io.c) ---- */
+
+/* Installs the client's nghttp2 callbacks (headers, data, frames, stream close) in cbs. */
+void client_h2_set_callbacks(nghttp2_session_callbacks *cbs);
+
+/* Starts reading the subchannel's handle into its nghttp2 session. Returns uv_read_start()'s
+ * result. */
+int sub_read_start(client_subchannel *s);
+
+/* Pulls all pending frames out of nghttp2 (through SSL when TLS is on) into obuf and writes
+ * them: first with uv_try_write, then the remainder with an async uv_write after swapping obuf
+ * into wbuf, so obuf can keep accumulating while the write is in flight. Only one uv_write is
+ * outstanding at a time; while it is, this returns early and on_sub_write calls back. Errors
+ * mark the active stream done with an error and, for I/O errors, the subchannel closed. Before
+ * the TLS handshake completes, only handshake bytes are sent. */
+void sub_flush(client_subchannel *s);
+
+/* Marks the connection unusable after nghttp2 output was lost (nghttp2 already considers bytes it
+ * handed out as sent, so the session and the server are now out of sync), records why in
+ * s->fail_err for sub_connect(), and fails the active RPC. The next RPC reconnects. */
+void sub_fail(client_subchannel *s, grpc_err err);
+
+/* nghttp2 data-provider callback for the request body: copies queued bytes from send_buf, sets
+ * EOF once the send side is half-closed and drained, and returns NGHTTP2_ERR_DEFERRED when there
+ * is nothing to send yet (resumed by nghttp2_session_resume_data on the next send/close). The
+ * stream is looked up through the subchannel rather than the data source, which may outlive it:
+ * once the application freed the stream (e.g. after the server answered before the whole
+ * request was sent) the callback fails it, and nghttp2 resets that stream. */
+ssize_t client_data_read(nghttp2_session *session, int32_t stream_id, uint8_t *buf, size_t length,
+                         uint32_t *data_flags, nghttp2_data_source *source, void *user_data);
+
+/* ---- Subchannel lifecycle (grpc_client_connect.c) ---- */
+
+#if defined(GRPC_CLIENT_HAS_OPENSSL)
+/* Builds the shared client SSL_CTX: TLS 1.2+, ALPN "h2", peer verification against ca_file,
+ * ca_pem or the system default paths (unless insecure_skip_verify), and an optional client
+ * certificate/key for mTLS (both files are required together). Returns nullptr on any error. */
+SSL_CTX *client_ssl_ctx_new(const grpc_client_config *cfg);
+#endif
+
+/* Tears down the connection: frees the nghttp2 session and SSL object, closes the handle and
+ * timer, runs the loop until all close callbacks (and any pending connect request) complete,
+ * and closes the loop. Keeps the target strings and buffers so sub_connect can reuse them. Safe
+ * to call on a never-connected or already disconnected subchannel. */
+void sub_disconnect(client_subchannel *s);
+
+/* True if a connected subchannel can still carry a new RPC. Its loop only runs during RPCs, so
+ * this first catches up: refreshes the loop clock and handles what arrived meanwhile (an EOF, a
+ * GOAWAY), then asks the transport: nghttp2 refuses new streams after a GOAWAY, and a QUIC
+ * connection may have idled out. */
+bool sub_usable(client_subchannel *s);
+
+/* Ensures the subchannel is connected, reconnecting from scratch if it was closed or can no
+ * longer carry requests (sub_usable()). Creates a fresh loop, connects to the Unix path or to each
+ * resolved address in turn (IP literals skip getaddrinfo, which otherwise blocks), performs the
+ * TLS handshake when configured, creates the nghttp2 session and queues SETTINGS. The whole
+ * sequence is bounded by bound_ms when nonzero (the smaller of config.timeout_ms and the RPC's
+ * own deadline). Blocks the caller while it runs the private loop. Returns GRPC_OK, or
+ * GRPC_ERR_IO / GRPC_ERR_NOMEM / GRPC_ERR_PROTOCOL after disconnecting again. */
+grpc_err sub_connect(client_subchannel *s, uint32_t bound_ms);
+
+/* Parses a target string: "unix:path" or "unix://path" sets *out_unix, otherwise "host:port" or
+ * "[ipv6]:port" sets *out_host and *out_port (1-65535; characters after the digits are ignored).
+ * Outputs are grpc_malloc strings owned by the caller. Returns GRPC_OK, GRPC_ERR_INVALID for
+ * malformed input or GRPC_ERR_NOMEM, with nothing left allocated on failure. */
+grpc_err client_parse_target(const char *target, char **out_host, uint16_t *out_port,
+                             char **out_unix);
+
+/* Fills in a zeroed subchannel's target (copying host or unix_path) and the :authority value
+ * ("localhost" for Unix sockets). Does not connect. Returns GRPC_ERR_NOMEM if a copy fails; the
+ * partially initialized subchannel is still released by grpc_client_free. */
+grpc_err client_init_subchannel(client_subchannel *s, grpc_client *parent, const char *host,
+                                uint16_t port, const char *unix_path);
 
 /* ---- HTTP/3 transport (grpc_http3_client.c; stubs without GRPC_ENABLE_HTTP3) ---- */
 

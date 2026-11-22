@@ -1,7 +1,7 @@
 /* grpc_http3.c - HTTP/3 feature queries, and stubs for builds without HTTP/3
  *
  * grpc_http3_available() and grpc_http3_versions() are always present. With GRPC_ENABLE_HTTP3 the
- * transport lives in grpc_http3_server.c / grpc_http3_client.c; without it, the internal hooks of
+ * transport lives in grpc_http3_server*.c / grpc_http3_client*.c; without it, the internal hooks of
  * internal_http3.h are stubbed here so the server core links unchanged and enabling HTTP/3 fails
  * with GRPC_ERR_UNSUPPORTED.
  */
@@ -14,7 +14,23 @@
 #if defined(GRPC_ENABLE_HTTP3)
 #include <nghttp3/nghttp3.h>
 #include <ngtcp2/ngtcp2.h>
+#include "internal_helpers.h"
 #include "internal_quic_tls.h"
+
+const ngtcp2_mem grpc_quic_mem = {
+    .user_data = nullptr,
+    .malloc = grpc_mem_hook_malloc,
+    .free = grpc_mem_hook_free,
+    .calloc = grpc_mem_hook_calloc,
+    .realloc = grpc_mem_hook_realloc,
+};
+const nghttp3_mem grpc_h3_mem = {
+    .user_data = nullptr,
+    .malloc = grpc_mem_hook_malloc,
+    .free = grpc_mem_hook_free,
+    .calloc = grpc_mem_hook_calloc,
+    .realloc = grpc_mem_hook_realloc,
+};
 
 GRPC_API bool grpc_http3_available(void) {
   return true;

@@ -1,7 +1,7 @@
 /* internal_nghttp2_callbacks.c - nghttp2 server callbacks: from HTTP/2 frames to gRPC calls
  *
  * nghttp2 runs these callbacks synchronously from nghttp2_session_mem_recv() and
- * nghttp2_session_mem_send(), i.e. on the loop thread while internal_helpers.c feeds it received
+ * nghttp2_session_mem_send(), i.e. on the loop thread while internal_session_io.c feeds it received
  * bytes or serializes output. A grpc_stream is created when a request's HEADERS begins, kept as
  * nghttp2 stream user data and in the session's stream list, and freed when nghttp2 closes the
  * stream. Request headers are not copied: the stream keeps references on nghttp2's rcbufs.
@@ -146,7 +146,7 @@ const grpc_transport_ops grpc_h2_transport_ops = {
     .goaway = h2_goaway,
     .shutdown_notice = h2_shutdown_notice,
     .ping = h2_ping,
-    /* flush and close: the TCP implementation in internal_helpers.c */
+    /* flush and close: the TCP implementation (internal_session_io.c, internal_helpers.c) */
 };
 
 /* ----------- BEGIN NGHTTP2 CALLBACKS ------------------*/

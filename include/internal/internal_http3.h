@@ -2,11 +2,22 @@
 
 /* internal_http3.h - hooks between the server/client core and the HTTP/3 transport
  *
- * The server side lives in src/grpc_http3_server.c and the client side in src/grpc_http3_client.c,
+ * The server side lives in src/grpc_http3_server*.c and the client side in src/grpc_http3_client*.c,
  * both compiled only with GRPC_ENABLE_HTTP3. src/grpc_http3.c provides the public feature queries
  * and, in builds without HTTP/3, stubs of the functions below that report GRPC_ERR_UNSUPPORTED.
  */
 #include "core.h"
+
+#if defined(GRPC_ENABLE_HTTP3)
+#include <nghttp3/nghttp3.h>
+#include <ngtcp2/ngtcp2.h>
+
+/* Memory tables routing ngtcp2 and nghttp3 allocations through the grpc allocator, shared by the
+ * server and client transports. Both libraries keep a pointer to them, so they live for the
+ * program (defined in grpc_http3.c). */
+extern const ngtcp2_mem grpc_quic_mem;
+extern const nghttp3_mem grpc_h3_mem;
+#endif
 
 /* Opens the UDP listener(s) and builds the QUIC TLS context from `tls` (the normalized server TLS
  * config, still valid during grpc_server_new_ex()) and installs the HTTP/3 server state in

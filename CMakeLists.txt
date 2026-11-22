@@ -112,8 +112,15 @@ configure_file(include/grpc_version_config.h.in
 
 set(GRPC_SOURCES
   src/grpc_call.c
+  src/grpc_call_access.c
+  src/grpc_call_async.c
+  src/grpc_call_dispatch.c
+  src/grpc_call_response.c
   src/grpc_channelz.c
   src/grpc_client.c
+  src/grpc_client_connect.c
+  src/grpc_client_io.c
+  src/grpc_client_response.c
   src/grpc_compression.c
   src/grpc_health.c
   src/grpc_http3.c
@@ -123,6 +130,10 @@ set(GRPC_SOURCES
   src/grpc_metadata.c
   src/grpc_reflection.c
   src/grpc_server.c
+  src/grpc_server_listen.c
+  src/grpc_server_log.c
+  src/grpc_server_routes.c
+  src/grpc_server_run.c
   src/grpc_status.c
   src/grpc_status_details.c
   src/grpc_stream_core.c
@@ -130,6 +141,7 @@ set(GRPC_SOURCES
   src/grpc_tls.c
   src/grpc_version.c
   src/internal_helpers.c
+  src/internal_session_io.c
   src/internal_nghttp2_callbacks.c
 )
 if(GRPC_TLS_SOURCE)
@@ -139,7 +151,8 @@ if(GRPC_PROTOBUF_C_ENABLED)
   list(APPEND GRPC_SOURCES src/grpc_protobuf_c.c)
 endif()
 if(GRPC_HTTP3_ENABLED)
-  list(APPEND GRPC_SOURCES src/grpc_http3_server.c src/grpc_http3_client.c "${GRPC_QUIC_TLS_SOURCE}")
+  list(APPEND GRPC_SOURCES src/grpc_http3_server.c src/grpc_http3_server_callbacks.c
+    src/grpc_http3_server_conn.c src/grpc_http3_client.c src/grpc_http3_client_callbacks.c "${GRPC_QUIC_TLS_SOURCE}")
 endif()
 if(GRPC_FLATCC_ENABLED)
   list(APPEND GRPC_SOURCES src/grpc_flatcc.c)

@@ -2,7 +2,7 @@
 
 /* grpc_stream_core.h - transport-independent handling of one gRPC request stream
  *
- * HTTP/2 (internal_nghttp2_callbacks.c) and HTTP/3 (grpc_http3_server.c) both deliver the same
+ * HTTP/2 (internal_nghttp2_callbacks.c) and HTTP/3 (grpc_http3_server_callbacks.c) both deliver the same
  * events for a request: header fields, the end of the header block, body chunks, the end of the
  * body and the stream closing. These functions turn them into calls and messages, and produce the
  * response body, so both transports share one implementation of validation, routing, deadlines,

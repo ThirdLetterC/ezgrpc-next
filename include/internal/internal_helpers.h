@@ -4,7 +4,8 @@
  *
  * Connection (grpc_session) lifecycle and output flushing, stream allocation and linking, logging
  * helpers, and the growable grpc_buf byte buffer. Everything here runs on the server loop thread.
- * Implemented in src/internal_helpers.c.
+ * Implemented in src/internal_helpers.c and, for accepting, reading and flushing sessions,
+ * src/internal_session_io.c.
  */
 
 #include <stdio.h>
@@ -98,4 +99,16 @@ static inline uint32_t uread_u32(const void *p) {
   uint32_t ret;
   memcpy(&ret, p, 4);
   return ret;
+}
+
+/* Returns the session's handle as a stream, whichever of the pipe or TCP members is in use. */
+static inline uv_stream_t *session_stream(grpc_session *session) {
+  return session->is_unix ? (uv_stream_t *)&session->handle.pipe
+                          : (uv_stream_t *)&session->handle.tcp;
+}
+
+/* Returns the session's handle as a generic uv_handle_t, for uv_close() and handle->data. */
+static inline uv_handle_t *session_handle(grpc_session *session) {
+  return session->is_unix ? (uv_handle_t *)&session->handle.pipe
+                          : (uv_handle_t *)&session->handle.tcp;
 }

@@ -154,8 +154,8 @@ struct grpc_transport_ops {
   /* Queue a keepalive ping; 0 if one was queued. nullptr when the transport keeps the
    * connection alive by itself (QUIC). */
   int (*ping)(grpc_session *session);
-  /* Write pending output / tear the connection down. nullptr selects the TCP implementation in
-   * internal_helpers.c (session_flush() / session_close()). */
+  /* Write pending output / tear the connection down. nullptr selects the TCP implementation:
+   * session_flush() in internal_session_io.c / session_close() in internal_helpers.c. */
   void (*flush)(grpc_session *session);
   void (*close)(grpc_session *session);
 };
@@ -524,7 +524,7 @@ struct grpc_server {
 
 /* ---- internal functions ------------------------------------------------------ */
 
-/* grpc_call.c */
+/* grpc_call.c, grpc_call_response.c (call_abort), grpc_call_dispatch.c (dispatch and events) */
 /* Create the call for a stream whose request headers were accepted. The returned reference is
  * owned by the stream and dropped by call_detach(). nullptr when out of memory. */
 grpc_call *call_new(grpc_session *session, grpc_stream *stream);
@@ -541,7 +541,7 @@ void server_clear_events(grpc_server *server);
 /* Drop queued calls without dispatching them. */
 void server_drop_ready(grpc_server *server);
 
-/* grpc_server.c */
+/* grpc_server_routes.c */
 /* Return the route whose path equals the `len` bytes at `path` (enabled or disabled), or
  * nullptr. */
 grpc_route *server_find_route(grpc_server *server, const char *path, size_t len);
