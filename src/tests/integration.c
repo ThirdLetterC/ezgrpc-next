@@ -8,6 +8,8 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/ioctl.h>
+#include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 #include <uv.h>
@@ -848,6 +850,25 @@ void test_integration_health_watch_and_reflection(void) {
   TEST_ASSERT_EQUAL_UINT8(GRPC_HEALTH_SERVING, resp.message->data[1]);
   grpc_client_response_free(&resp);
 
+  /* a service the server serves but whose status was never set is SERVING (here reflection) */
+  const char refl_svc[] = "grpc.reflection.v1.ServerReflection";
+  uint8_t hreq_refl[64] = {0x0A, (uint8_t)(sizeof(refl_svc) - 1)};
+  memcpy(hreq_refl + 2, refl_svc, sizeof(refl_svc) - 1);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_unary(client, GRPC_HEALTH_PATH_CHECK, hreq_refl,
+                                                   2 + sizeof(refl_svc) - 1, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  TEST_ASSERT_NOT_NULL(resp.message);
+  TEST_ASSERT_EQUAL_UINT8(GRPC_HEALTH_SERVING, resp.message->data[1]);
+  grpc_client_response_free(&resp);
+
+  /* a service the server does not serve and has no status: NOT_FOUND (health protocol) */
+  const uint8_t hreq_none[] = {0x0A, 8, 'n', 'o', '.', 'S', 'u', 'c', 'h', 'x'};
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_unary(client, GRPC_HEALTH_PATH_CHECK, hreq_none,
+                                                   sizeof(hreq_none), nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_NOT_FOUND, resp.status);
+  TEST_ASSERT_NULL(resp.message);
+  grpc_client_response_free(&resp);
+
   /* 2. Health Watch: receive initial SERVING, update to NOT_SERVING, receive update, cancel */
   grpc_client_stream *watch =
       fx_stream(grpc_client_stream_open(client, GRPC_HEALTH_PATH_WATCH, nullptr, 0, 3000, &err));
@@ -1126,6 +1147,7 @@ typedef struct h2_rec {
   size_t nb_closed;
   int goaways;
   uint32_t goaway_code;
+  int32_t goaway_last_ids[4]; /* last_stream_id of the first GOAWAYs */
   int ping_acks;
 } h2_rec;
 
@@ -1189,6 +1211,8 @@ static int h2_rec_on_frame([[maybe_unused]] nghttp2_session *s, const nghttp2_fr
       st->rst_code = f->rst_stream.error_code;
     }
   } else if (f->hd.type == NGHTTP2_GOAWAY) {
+    if (r->goaways < 4)
+      r->goaway_last_ids[r->goaways] = f->goaway.last_stream_id;
     r->goaways++;
     r->goaway_code = f->goaway.error_code;
   } else if (f->hd.type == NGHTTP2_PING && (f->hd.flags & NGHTTP2_FLAG_ACK)) {
@@ -1533,7 +1557,8 @@ static void run_raw_h2_requests(uint16_t port) {
   int32_t s_empty =
       h2_track(rec, nghttp2_submit_request(sess, nullptr, empty_hdrs, 6, nullptr, nullptr));
 
-  /* 10d. Invalid compressed payload (cflag=1, bad gzip) + trailing 2 bytes after msg (L27, L56) */
+  /* 10d. Invalid compressed payload (cflag=1, bad gzip) + trailing 2 bytes: the corrupt message
+   * is rejected with INTERNAL before the truncation matters */
   const uint8_t bad_gz_frame[] = {0x01, 0x00, 0x00, 0x00, 0x03, 'b', 'a', 'd', 0x00, 0x00};
   raw_h2_payload p_bgz = {.data = bad_gz_frame, .len = sizeof(bad_gz_frame), .off = 0};
   nghttp2_data_provider dp_bgz = {.source.ptr = &p_bgz, .read_callback = raw_h2_read_cb};
@@ -1589,7 +1614,7 @@ static void run_raw_h2_requests(uint16_t port) {
   TEST_ASSERT_TRUE(strcmp(h2_get(rec, s_ae)->grpc_encoding, "gzip") != 0);
   /* a unary method needs exactly one request message: none or two end with INTERNAL */
   assert_grpc_stream(rec, s_empty, GRPC_STATUS_INTERNAL);
-  assert_grpc_stream(rec, s_bgz, GRPC_STATUS_DATA_LOSS);
+  assert_grpc_stream(rec, s_bgz, GRPC_STATUS_INTERNAL);
   assert_grpc_stream(rec, s_cmp, GRPC_STATUS_INTERNAL);
 
   /* 11. Too many headers (> CONFIG_STREAM_MAX_HEADERS): only that stream is reset */
@@ -2708,6 +2733,580 @@ void test_integration_async_write_backpressure(void) {
 }
 #endif
 
+#ifndef _WIN32
+/* ---- request framing: trailers, message limits and compression flags (raw HTTP/2) ---- */
+
+static atomic_int g_frame_count = 0;
+
+static void frame_echo_handler(grpc_call *call, const grpc_message *req,
+                               [[maybe_unused]] void *ud) {
+  HCHECK(grpc_call_reply_data(call, req->data, req->len) == GRPC_OK);
+}
+
+static void frame_count_on_message([[maybe_unused]] grpc_call *call,
+                                   [[maybe_unused]] const grpc_message *msg,
+                                   [[maybe_unused]] void *ud) {
+  atomic_fetch_add(&g_frame_count, 1);
+}
+
+static void frame_count_on_end(grpc_call *call, [[maybe_unused]] void *ud) {
+  char reply[16];
+  int n = snprintf(reply, sizeof(reply), "%d", atomic_load(&g_frame_count));
+  HCHECK(grpc_call_send_data(call, reply, (size_t)n) == GRPC_OK);
+  HCHECK(grpc_call_finish(call, GRPC_STATUS_OK, nullptr) == GRPC_OK);
+}
+
+/* Body then request trailers: EOF without END_STREAM, and the trailers end the stream. */
+static ssize_t trailer_read_cb(nghttp2_session *s, int32_t sid, uint8_t *buf, size_t len,
+                               uint32_t *flags, nghttp2_data_source *src, void *ud) {
+  ssize_t n = raw_h2_read_cb(s, sid, buf, len, flags, src, ud);
+  if (*flags & NGHTTP2_DATA_FLAG_EOF) {
+    *flags |= NGHTTP2_DATA_FLAG_NO_END_STREAM;
+    nghttp2_nv tr[] = {NV("x-trailer", "1")};
+    if (nghttp2_submit_trailer(s, sid, tr, 1) != 0)
+      return NGHTTP2_ERR_CALLBACK_FAILURE;
+  }
+  return n;
+}
+
+/* Body that never ends: the request stays open after the payload. */
+static ssize_t open_read_cb(nghttp2_session *s, int32_t sid, uint8_t *buf, size_t len,
+                            uint32_t *flags, nghttp2_data_source *src, void *ud) {
+  raw_h2_payload *p = src->ptr;
+  if (p->off == p->len)
+    return NGHTTP2_ERR_DEFERRED;
+  ssize_t n = raw_h2_read_cb(s, sid, buf, len, flags, src, ud);
+  *flags = NGHTTP2_DATA_FLAG_NONE;
+  return n;
+}
+
+/* Writes a gRPC frame (flag, big-endian length, payload) at out; returns its size. */
+static size_t grpc_frame(uint8_t *out, uint8_t flag, uint32_t declared, const void *payload,
+                         size_t len) {
+  out[0] = flag;
+  out[1] = (uint8_t)(declared >> 24);
+  out[2] = (uint8_t)(declared >> 16);
+  out[3] = (uint8_t)(declared >> 8);
+  out[4] = (uint8_t)declared;
+  if (len > 0)
+    memcpy(out + 5, payload, len);
+  return 5 + len;
+}
+
+void test_integration_request_framing(void) {
+  grpc_server *server = fx_server(grpc_server_new(&(grpc_config){
+      .port = 0, .ipv4_addr = "127.0.0.1", .max_message_size = 100, .log_level = GRPC_LOG_OFF}));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(server, "/f.Svc/Echo", frame_echo_handler, nullptr));
+  const grpc_stream_handler count = {.on_message = frame_count_on_message,
+                                     .on_end = frame_count_on_end};
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle_stream(server, "/f.Svc/Count", &count, nullptr));
+  fx_start(server);
+  uint16_t port = grpc_server_port(server);
+
+  int fd = fx_fd(socket(AF_INET, SOCK_STREAM, 0));
+  struct sockaddr_in sin = {.sin_family = AF_INET, .sin_port = htons(port)};
+  inet_pton(AF_INET, "127.0.0.1", &sin.sin_addr);
+  TEST_ASSERT_EQUAL_INT_MESSAGE(0, connect(fd, (struct sockaddr *)&sin, sizeof(sin)),
+                                strerror(errno));
+  static h2_rec rec_storage;
+  h2_rec *rec = &rec_storage;
+  memset(rec, 0, sizeof(*rec));
+  nghttp2_session *sess = h2_client_session(rec);
+  nghttp2_submit_settings(sess, NGHTTP2_FLAG_NONE, nullptr, 0);
+
+#define FRAME_HDRS(path, ...)              \
+  {NV(":method", "POST"),                  \
+   NV(":scheme", "http"),                  \
+   NV(":path", path),                      \
+   NV(":authority", "localhost"),          \
+   NV("content-type", "application/grpc"), \
+   NV("te", "trailers"),                   \
+   __VA_ARGS__}
+  nghttp2_nv echo_hdrs[] = FRAME_HDRS("/f.Svc/Echo", NV("x-pad", "0"));
+  nghttp2_nv count_hdrs[] = FRAME_HDRS("/f.Svc/Count", NV("x-pad", "0"));
+  nghttp2_nv br_hdrs[] = FRAME_HDRS("/f.Svc/Echo", NV("grpc-encoding", "br"));
+#undef FRAME_HDRS
+  const size_t nhdrs = 7;
+
+  /* 1. one message followed by request trailers: an ordinary unary call */
+  uint8_t f_tr[16];
+  raw_h2_payload p_tr = {.data = f_tr, .len = grpc_frame(f_tr, 0, 2, "hi", 2)};
+  nghttp2_data_provider dp_tr = {.source.ptr = &p_tr, .read_callback = trailer_read_cb};
+  int32_t s_tr =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, echo_hdrs, nhdrs, &dp_tr, nullptr));
+  /* 2. a second unary message, with the request left open: rejected at once */
+  uint8_t f_two[32];
+  size_t two_len = grpc_frame(f_two, 0, 1, "a", 1);
+  two_len += grpc_frame(f_two + two_len, 0, 1, "b", 1);
+  raw_h2_payload p_two = {.data = f_two, .len = two_len};
+  nghttp2_data_provider dp_two = {.source.ptr = &p_two, .read_callback = open_read_cb};
+  int32_t s_two =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, echo_hdrs, nhdrs, &dp_two, nullptr));
+  /* 3. an invalid compressed flag */
+  uint8_t f_flag[16];
+  raw_h2_payload p_flag = {.data = f_flag, .len = grpc_frame(f_flag, 7, 2, "hi", 2)};
+  nghttp2_data_provider dp_flag = {.source.ptr = &p_flag, .read_callback = raw_h2_read_cb};
+  int32_t s_flag =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, echo_hdrs, nhdrs, &dp_flag, nullptr));
+  /* 4. a compressed message with a codec the server does not have */
+  uint8_t f_br[16];
+  raw_h2_payload p_br = {.data = f_br, .len = grpc_frame(f_br, 1, 2, "hi", 2)};
+  nghttp2_data_provider dp_br = {.source.ptr = &p_br, .read_callback = raw_h2_read_cb};
+  int32_t s_br =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, br_hdrs, nhdrs, &dp_br, nullptr));
+  /* 5. a compressed message without grpc-encoding */
+  uint8_t f_noenc[16];
+  raw_h2_payload p_noenc = {.data = f_noenc, .len = grpc_frame(f_noenc, 1, 2, "hi", 2)};
+  nghttp2_data_provider dp_noenc = {.source.ptr = &p_noenc, .read_callback = raw_h2_read_cb};
+  int32_t s_noenc =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, echo_hdrs, nhdrs, &dp_noenc, nullptr));
+  /* 6. exactly max_message_size bytes pass; one more is rejected */
+  static uint8_t f_max[128], f_over[128], body[101];
+  memset(body, 'M', sizeof(body));
+  raw_h2_payload p_max = {.data = f_max, .len = grpc_frame(f_max, 0, 100, body, 100)};
+  nghttp2_data_provider dp_max = {.source.ptr = &p_max, .read_callback = raw_h2_read_cb};
+  int32_t s_max =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, echo_hdrs, nhdrs, &dp_max, nullptr));
+  raw_h2_payload p_over = {.data = f_over, .len = grpc_frame(f_over, 0, 101, body, 101)};
+  nghttp2_data_provider dp_over = {.source.ptr = &p_over, .read_callback = raw_h2_read_cb};
+  int32_t s_over =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, echo_hdrs, nhdrs, &dp_over, nullptr));
+  /* 7. thirty small messages in one DATA frame, 450 bytes in all, to a streaming method */
+  static uint8_t f_many[512];
+  size_t many_len = 0;
+  for (int i = 0; i < 30; i++)
+    many_len += grpc_frame(f_many + many_len, 0, 10, "0123456789", 10);
+  raw_h2_payload p_many = {.data = f_many, .len = many_len};
+  nghttp2_data_provider dp_many = {.source.ptr = &p_many, .read_callback = raw_h2_read_cb};
+  int32_t s_many =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, count_hdrs, nhdrs, &dp_many, nullptr));
+  /* 9. content-type must be application/grpc itself (or with +codec / parameters), not merely
+   * start with it */
+  nghttp2_nv xyz_hdrs[] = {NV(":method", "POST"),
+                           NV(":scheme", "http"),
+                           NV(":path", "/f.Svc/Echo"),
+                           NV(":authority", "localhost"),
+                           NV("content-type", "application/grpcXYZ"),
+                           NV("te", "trailers")};
+  uint8_t f_ct[16];
+  raw_h2_payload p_xyz = {.data = f_ct, .len = grpc_frame(f_ct, 0, 2, "hi", 2)};
+  nghttp2_data_provider dp_xyz = {.source.ptr = &p_xyz, .read_callback = raw_h2_read_cb};
+  int32_t s_xyz =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, xyz_hdrs, 6, &dp_xyz, nullptr));
+  nghttp2_nv proto_hdrs[] = {NV(":method", "POST"),
+                             NV(":scheme", "http"),
+                             NV(":path", "/f.Svc/Echo"),
+                             NV(":authority", "localhost"),
+                             NV("content-type", "application/grpc+proto"),
+                             NV("te", "trailers")};
+  raw_h2_payload p_proto = {.data = f_ct, .len = grpc_frame(f_ct, 0, 2, "hi", 2)};
+  nghttp2_data_provider dp_proto = {.source.ptr = &p_proto, .read_callback = raw_h2_read_cb};
+  int32_t s_proto =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, proto_hdrs, 6, &dp_proto, nullptr));
+
+  /* 8. a declared length far above the limit, with the request left open: rejected on the
+   * prefix, before any of it is buffered */
+  uint8_t f_huge[16];
+  raw_h2_payload p_huge = {.data = f_huge, .len = grpc_frame(f_huge, 0, 0x7FFFFFFF, "x", 1)};
+  nghttp2_data_provider dp_huge = {.source.ptr = &p_huge, .read_callback = open_read_cb};
+  int32_t s_huge =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, echo_hdrs, nhdrs, &dp_huge, nullptr));
+
+  h2_flush(sess, fd);
+  H2_PUMP_UNTIL(sess, fd, rec->nb_closed == rec->nb_streams, 5000);
+  ASSERT_HANDLER_CHECKS();
+
+  const h2_stream_rec *st = h2_get(rec, s_tr);
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, st->grpc_status);
+  TEST_ASSERT_EQUAL_INT(200, st->http_status);
+  TEST_ASSERT_EQUAL_UINT64(7, st->body_len);
+  TEST_ASSERT_EQUAL_MEMORY("hi", st->body + 5, 2);
+  /* answered early: trailers, then RST_STREAM NO_ERROR so the client stops sending */
+  st = h2_get(rec, s_two);
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_INTERNAL, st->grpc_status);
+  TEST_ASSERT_TRUE(st->rst);
+  TEST_ASSERT_EQUAL_UINT32(NGHTTP2_NO_ERROR, st->rst_code);
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_INTERNAL, h2_get(rec, s_flag)->grpc_status);
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_UNIMPLEMENTED, h2_get(rec, s_br)->grpc_status);
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_INTERNAL, h2_get(rec, s_noenc)->grpc_status);
+  st = h2_get(rec, s_max);
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, st->grpc_status);
+  TEST_ASSERT_EQUAL_UINT64(105, st->body_total);
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_RESOURCE_EXHAUSTED, h2_get(rec, s_over)->grpc_status);
+  st = h2_get(rec, s_many);
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, st->grpc_status);
+  TEST_ASSERT_EQUAL_UINT64(7, st->body_len);
+  TEST_ASSERT_EQUAL_MEMORY("30", st->body + 5, 2);
+  st = h2_get(rec, s_huge);
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_RESOURCE_EXHAUSTED, st->grpc_status);
+  TEST_ASSERT_TRUE(st->rst);
+  TEST_ASSERT_EQUAL_INT(415, h2_get(rec, s_xyz)->http_status);
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, h2_get(rec, s_proto)->grpc_status);
+
+  /* nothing is left behind on the still-open connection (request trailers used to orphan a
+   * second stream per call) */
+  grpc_server_stats stats;
+  uint64_t until = now_ms() + 2000;
+  do {
+    grpc_server_get_stats(server, &stats);
+  } while (stats.active_streams != 0 && now_ms() < until && h2_pump(sess, fd, 10));
+  TEST_ASSERT_EQUAL_UINT64(0, stats.active_streams);
+
+  fx_close(fd);
+  fx_server_free(server);
+}
+#endif
+
+#ifndef _WIN32
+/* ---- server lifecycle: drain with event routes, ping strikes, unix sockets, idle ---- */
+
+static void slow_unary_handler(grpc_call *call, const grpc_message *req,
+                               [[maybe_unused]] void *ud) {
+  struct timespec ts = {.tv_sec = 1, .tv_nsec = 500 * 1000 * 1000};
+  nanosleep(&ts, nullptr); /* holds the server thread longer than max_connection_idle_ms */
+  HCHECK(grpc_call_reply_data(call, req->data, req->len) == GRPC_OK);
+}
+
+/* Keeps a reference to the first two calls and where their x-shared value lives. */
+static grpc_call *g_kept_calls[2];
+static const char *g_kept_values[2];
+static atomic_int g_kept = 0;
+
+static void keep_call_handler(grpc_call *call, const grpc_message *req, [[maybe_unused]] void *ud) {
+  int i = atomic_fetch_add(&g_kept, 1);
+  if (i < 2) {
+    g_kept_calls[i] = grpc_call_ref(call);
+    g_kept_values[i] = grpc_call_metadata(call, "x-shared", nullptr);
+  }
+  HCHECK(grpc_call_reply_data(call, req->data, req->len) == GRPC_OK);
+}
+
+/* An on_done interceptor that flushes the server from inside the deadline scan. */
+static atomic_int g_done_flushes = 0;
+static void flush_on_done(grpc_call *call, [[maybe_unused]] grpc_status status,
+                          [[maybe_unused]] uint64_t duration_ms, void *userdata) {
+  (void)call;
+  grpc_server_flush(userdata);
+  atomic_fetch_add(&g_done_flushes, 1);
+}
+
+static void never_finish_handler(grpc_call *call, [[maybe_unused]] const grpc_message *req,
+                                 [[maybe_unused]] void *ud) {
+  (void)call;
+}
+
+typedef struct drain_client_ctx {
+  grpc_client_stream *st;
+  grpc_err rc;
+  grpc_client_response resp;
+} drain_client_ctx;
+
+/* Sends one message on an open event-route stream while the main thread drains. */
+static void *drain_client_thread(void *arg) {
+  drain_client_ctx *ctx = arg;
+  struct timespec ts = {.tv_sec = 0, .tv_nsec = 200 * 1000 * 1000};
+  nanosleep(&ts, nullptr);
+  (void)grpc_client_stream_send(ctx->st, "ev", 2);
+  (void)grpc_client_stream_close_send(ctx->st);
+  ctx->rc = grpc_client_stream_finish(ctx->st, &ctx->resp);
+  return nullptr;
+}
+
+/* Connects a raw HTTP/2 session to port, sends `pings` PINGs and waits for their ACKs. */
+static void raw_pings(uint16_t port, h2_rec *rec, int pings, bool keep_open, int *out_fd) {
+  int fd = fx_fd(socket(AF_INET, SOCK_STREAM, 0));
+  struct sockaddr_in sin = {.sin_family = AF_INET, .sin_port = htons(port)};
+  inet_pton(AF_INET, "127.0.0.1", &sin.sin_addr);
+  TEST_ASSERT_EQUAL_INT(0, connect(fd, (struct sockaddr *)&sin, sizeof(sin)));
+  memset(rec, 0, sizeof(*rec));
+  nghttp2_session *sess = h2_client_session(rec);
+  nghttp2_submit_settings(sess, NGHTTP2_FLAG_NONE, nullptr, 0);
+  for (int i = 0; i < pings; i++)
+    nghttp2_submit_ping(sess, NGHTTP2_FLAG_NONE, nullptr);
+  h2_flush(sess, fd);
+  H2_PUMP_UNTIL(sess, fd, rec->ping_acks + rec->goaways >= pings, 2000);
+  H2_PUMP_UNTIL(sess, fd, rec->goaways > 0, 200); /* a GOAWAY would follow the ACKs */
+  if (keep_open)
+    *out_fd = fd;
+  else
+    fx_close(fd);
+}
+
+void test_integration_server_lifecycle_fixes(void) {
+  /* 1. ping strikes do not carry over to the next connection in the same session slot */
+  grpc_server *ps = fx_server(grpc_server_new(&(grpc_config){.port = 0,
+                                                             .ipv4_addr = "127.0.0.1",
+                                                             .max_connections = 1,
+                                                             .max_ping_strikes = 1,
+                                                             .min_ping_interval_ms = 10000,
+                                                             .log_level = GRPC_LOG_OFF}));
+  fx_start(ps);
+  static h2_rec prec;
+  raw_pings(grpc_server_port(ps), &prec, 1, false, nullptr);
+  TEST_ASSERT_EQUAL_INT(1, prec.ping_acks);
+  grpc_server_stats st;
+  uint64_t until = now_ms() + 2000;
+  do { /* the slot comes back once the server has seen the close */
+    grpc_server_get_stats(ps, &st);
+  } while (st.active_connections != 0 && now_ms() < until);
+  TEST_ASSERT_EQUAL_UINT64(0, st.active_connections);
+  /* two quick PINGs on a fresh connection: one strike at most, allowed by max_ping_strikes */
+  raw_pings(grpc_server_port(ps), &prec, 2, false, nullptr);
+  TEST_ASSERT_EQUAL_INT(2, prec.ping_acks);
+  TEST_ASSERT_EQUAL_INT(0, prec.goaways);
+  fx_server_free(ps);
+
+  /* 2. a server that fails to start never removes another server's Unix socket; a stale socket
+   * is replaced, anything else is left alone */
+  char sock_path[256];
+  snprintf(sock_path, sizeof(sock_path), "%s", fx_tmp_path("life.sock"));
+  grpc_server *ua = fx_server(grpc_server_new(
+      &(grpc_config){.port = 0, .unix_path = sock_path, .log_level = GRPC_LOG_OFF}));
+  fx_start(ua);
+  grpc_err err = GRPC_OK;
+  grpc_server *ub = grpc_server_new_ex(
+      &(grpc_config){
+          .port = 0, .ipv4_addr = "999.0.0.1", .unix_path = sock_path, .log_level = GRPC_LOG_OFF},
+      &err);
+  TEST_ASSERT_NULL(ub);
+  TEST_ASSERT_EQUAL_INT(0, access(sock_path, F_OK));
+  /* binding the live socket again fails instead of stealing it */
+  ub = grpc_server_new_ex(
+      &(grpc_config){.port = 0, .unix_path = sock_path, .log_level = GRPC_LOG_OFF}, &err);
+  TEST_ASSERT_NULL(ub);
+  TEST_ASSERT_EQUAL_INT(0, access(sock_path, F_OK));
+  grpc_client *uc = fx_client(
+      grpc_client_new(&(grpc_client_config){.unix_path = sock_path, .timeout_ms = 2000}, &err));
+  TEST_ASSERT_NOT_NULL_MESSAGE(uc, "the first server's socket is gone");
+  fx_client_free(uc);
+  fx_server_free(ua);
+  TEST_ASSERT_NOT_EQUAL_INT(0, access(sock_path, F_OK)); /* removed by its owner */
+  /* a stale socket file (no listener) is replaced */
+  int stale = socket(AF_UNIX, SOCK_STREAM, 0);
+  struct sockaddr_un sun = {.sun_family = AF_UNIX};
+  TEST_ASSERT_TRUE(strlen(sock_path) < sizeof(sun.sun_path));
+  memcpy(sun.sun_path, sock_path, strlen(sock_path) + 1);
+  TEST_ASSERT_EQUAL_INT(0, bind(stale, (struct sockaddr *)&sun, sizeof(sun)));
+  close(stale);
+  grpc_server *uc2 = fx_server(grpc_server_new(
+      &(grpc_config){.port = 0, .unix_path = sock_path, .log_level = GRPC_LOG_OFF}));
+  fx_server_free(uc2);
+  /* a regular file is never deleted */
+  FILE *f = fopen(sock_path, "w");
+  TEST_ASSERT_NOT_NULL(f);
+  fclose(f);
+  ub = grpc_server_new_ex(
+      &(grpc_config){.port = 0, .unix_path = sock_path, .log_level = GRPC_LOG_OFF}, &err);
+  TEST_ASSERT_NULL(ub);
+  TEST_ASSERT_EQUAL_INT(0, access(sock_path, F_OK));
+  unlink(sock_path);
+
+  /* 3. max_connection_idle_ms counts from when the last stream ended: a call slower than the
+   * idle limit does not get its connection closed right after it */
+  grpc_server *is = fx_server(grpc_server_new(&(grpc_config){.port = 0,
+                                                             .ipv4_addr = "127.0.0.1",
+                                                             .max_connection_idle_ms = 1000,
+                                                             .log_level = GRPC_LOG_OFF}));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(is, "/life.Svc/Slow", slow_unary_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(is, "/life.Svc/Echo", frame_echo_handler, nullptr));
+  fx_start(is);
+  grpc_client *ic = fx_client(grpc_client_new(
+      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(is), .timeout_ms = 3000},
+      &err));
+  TEST_ASSERT_NOT_NULL(ic);
+  grpc_client_response resp = {0};
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(ic, "/life.Svc/Slow", "s", 1, nullptr, 0, 3000, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  grpc_client_response_free(&resp);
+  struct timespec half = {.tv_sec = 0, .tv_nsec = 500 * 1000 * 1000};
+  nanosleep(&half, nullptr);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(ic, "/life.Svc/Echo", "e", 1, nullptr, 0, 3000, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  grpc_client_response_free(&resp);
+  grpc_server_get_stats(is, &st);
+  TEST_ASSERT_EQUAL_UINT64(1, st.total_connections);
+  fx_client_free(ic);
+  fx_server_free(is);
+
+  /* 4. request headers belong to the call: two calls on one connection with the same header
+   * (decoded from one shared HPACK entry) get separate copies, so the last reference may be
+   * dropped on any thread while the loop thread decodes further requests */
+  grpc_server *hs = fx_server(grpc_server_new(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF}));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(hs, "/life.Svc/Keep", keep_call_handler, nullptr));
+  fx_start(hs);
+  atomic_store(&g_kept, 0);
+  grpc_client *hc = fx_client(grpc_client_new(
+      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(hs), .timeout_ms = 3000},
+      &err));
+  TEST_ASSERT_NOT_NULL(hc);
+  grpc_metadata shared_md[] = {{.key = "x-shared", .value = "same-value-on-both-calls"}};
+  for (int i = 0; i < 2; i++) {
+    TEST_ASSERT_EQUAL_INT(
+        GRPC_OK, grpc_client_unary(hc, "/life.Svc/Keep", "k", 1, shared_md, 1, 3000, &resp));
+    TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+    grpc_client_response_free(&resp);
+  }
+  ASSERT_HANDLER_CHECKS();
+  TEST_ASSERT_EQUAL_INT(2, atomic_load(&g_kept));
+  TEST_ASSERT_TRUE(g_kept_values[0] != g_kept_values[1]);
+  TEST_ASSERT_EQUAL_STRING("same-value-on-both-calls", g_kept_values[0]);
+  TEST_ASSERT_EQUAL_STRING("same-value-on-both-calls", g_kept_values[1]);
+  /* the final unrefs happen here, on the test thread, while the server keeps serving */
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(hc, "/life.Svc/Keep", "k", 1, shared_md, 1, 3000, &resp));
+  grpc_client_response_free(&resp);
+  grpc_call_unref(g_kept_calls[0]);
+  grpc_call_unref(g_kept_calls[1]);
+  fx_client_free(hc);
+  fx_server_free(hs);
+
+  /* 5. a port already in use is not silently shared; reuse_port opts into sharing (Unix) */
+  grpc_server *p1 = fx_server(grpc_server_new(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF}));
+  uint16_t taken = grpc_server_port(p1);
+  TEST_ASSERT_NULL(grpc_server_new_ex(
+      &(grpc_config){.port = taken, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF}, &err));
+  fx_server_free(p1);
+  grpc_server *r1 = fx_server(grpc_server_new(&(grpc_config){
+      .port = 0, .ipv4_addr = "127.0.0.1", .reuse_port = true, .log_level = GRPC_LOG_OFF}));
+  grpc_server *r2 = fx_server(grpc_server_new(&(grpc_config){.port = grpc_server_port(r1),
+                                                             .ipv4_addr = "127.0.0.1",
+                                                             .reuse_port = true,
+                                                             .log_level = GRPC_LOG_OFF}));
+  TEST_ASSERT_EQUAL_UINT16(grpc_server_port(r1), grpc_server_port(r2));
+  fx_server_free(r2);
+  fx_server_free(r1);
+
+  /* 6. drain shuts connections down in gRPC's two steps: a GOAWAY notice naming the largest
+   * stream id, then the final GOAWAY naming the last stream */
+  grpc_server *gs = fx_server(grpc_server_new(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF}));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(gs, "/life.Svc/Echo", frame_echo_handler, nullptr));
+  fx_start(gs);
+  int gfd = fx_fd(socket(AF_INET, SOCK_STREAM, 0));
+  struct sockaddr_in gsin = {.sin_family = AF_INET, .sin_port = htons(grpc_server_port(gs))};
+  inet_pton(AF_INET, "127.0.0.1", &gsin.sin_addr);
+  TEST_ASSERT_EQUAL_INT(0, connect(gfd, (struct sockaddr *)&gsin, sizeof(gsin)));
+  static h2_rec grec;
+  memset(&grec, 0, sizeof(grec));
+  nghttp2_session *gsess = h2_client_session(&grec);
+  nghttp2_submit_settings(gsess, NGHTTP2_FLAG_NONE, nullptr, 0);
+  nghttp2_nv ghdrs[] = {NV(":method", "POST"),
+                        NV(":scheme", "http"),
+                        NV(":path", "/life.Svc/Echo"),
+                        NV(":authority", "localhost"),
+                        NV("content-type", "application/grpc"),
+                        NV("te", "trailers")};
+  static const uint8_t gbody[] = {0, 0, 0, 0, 1, 'g'};
+  raw_h2_payload gp = {.data = gbody, .len = sizeof(gbody)};
+  nghttp2_data_provider gdp = {.source.ptr = &gp, .read_callback = raw_h2_read_cb};
+  int32_t gsid = h2_track(&grec, nghttp2_submit_request(gsess, nullptr, ghdrs, 6, &gdp, nullptr));
+  h2_flush(gsess, gfd);
+  H2_PUMP_UNTIL(gsess, gfd, grec.nb_closed == 1, 3000);
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, h2_get(&grec, gsid)->grpc_status);
+  fx_stop_join(gs); /* this thread owns the server now */
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_drain(gs, 0));
+  H2_PUMP_UNTIL(gsess, gfd, grec.goaways >= 2, 2000);
+  TEST_ASSERT_EQUAL_INT(2, grec.goaways);
+  TEST_ASSERT_EQUAL_INT32(INT32_MAX, grec.goaway_last_ids[0]);
+  TEST_ASSERT_EQUAL_INT32(gsid, grec.goaway_last_ids[1]);
+  fx_close(gfd);
+  fx_server_free(gs);
+
+  /* 7. an on_done callback of an expired call may flush the server: the deadline scan defers it
+   * instead of letting it close a session the scan is walking, and the status still goes out */
+  grpc_server *ds = fx_server(grpc_server_new(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF}));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(ds, "/life.Svc/Never", never_finish_handler, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_add_interceptor(ds, &(grpc_interceptor){
+                                                                     .name = "flush-on-done",
+                                                                     .on_done = flush_on_done,
+                                                                     .userdata = ds,
+                                                                 }));
+  fx_start(ds);
+  atomic_store(&g_done_flushes, 0);
+  grpc_client *dc = fx_client(grpc_client_new(
+      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(ds), .timeout_ms = 3000},
+      &err));
+  TEST_ASSERT_NOT_NULL(dc);
+  for (int i = 0; i < 3; i++) {
+    /* the grpc-timeout header makes the server's deadline fire */
+    grpc_client_response dr = {0};
+    grpc_err drc = grpc_client_unary(dc, "/life.Svc/Never", "n", 1, nullptr, 0, 150, &dr);
+    TEST_ASSERT_TRUE(drc == GRPC_OK || drc == GRPC_ERR_TIMEOUT);
+    if (drc == GRPC_OK)
+      TEST_ASSERT_EQUAL_INT(GRPC_STATUS_DEADLINE_EXCEEDED, dr.status);
+    grpc_client_response_free(&dr);
+  }
+  until = now_ms() + 2000;
+  while (atomic_load(&g_done_flushes) < 3 && now_ms() < until) {
+    struct timespec t = {.tv_sec = 0, .tv_nsec = 5 * 1000 * 1000};
+    nanosleep(&t, nullptr);
+  }
+  TEST_ASSERT_EQUAL_INT(3, atomic_load(&g_done_flushes));
+  fx_client_free(dc);
+  fx_server_free(ds);
+
+  /* 8. drain hands event-route events to the application instead of discarding them */
+  grpc_server *es = fx_server(grpc_server_new(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF}));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_register_path(es, "/life.Svc/Event", nullptr));
+  fx_start(es);
+  grpc_client *ec = fx_client(grpc_client_new(
+      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(es), .timeout_ms = 5000},
+      &err));
+  TEST_ASSERT_NOT_NULL(ec);
+  static drain_client_ctx dctx;
+  memset(&dctx, 0, sizeof(dctx));
+  dctx.st = grpc_client_stream_open(ec, "/life.Svc/Event", nullptr, 0, 5000, &err);
+  TEST_ASSERT_NOT_NULL(dctx.st);
+  /* the server sees the stream before the application takes the loop over */
+  until = now_ms() + 2000;
+  do {
+    grpc_server_get_stats(es, &st);
+  } while (st.active_streams == 0 && now_ms() < until);
+  TEST_ASSERT_EQUAL_UINT64(1, st.active_streams);
+  fx_stop_join(es); /* this thread now owns the server */
+  pthread_t cth;
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&cth, nullptr, drain_client_thread, &dctx));
+  bool answered = false;
+  grpc_err drc;
+  int rounds = 0;
+  while ((drc = grpc_server_drain(es, 3000)) == GRPC_ERR_STATE && rounds++ < 10) {
+    size_t n = 0;
+    const grpc_event *ev = grpc_server_events(es, &n);
+    for (size_t i = 0; i < n; i++) {
+      if (ev[i].type == GRPC_EVENT_MESSAGE && !answered) {
+        TEST_ASSERT_EQUAL_UINT32(2, ev[i].message->len);
+        TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_call_send_data(ev[i].call, "ok", 2));
+        TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_call_finish(ev[i].call, GRPC_STATUS_OK, nullptr));
+        answered = true;
+      }
+    }
+  }
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, drc);
+  TEST_ASSERT_TRUE(answered);
+  pthread_join(cth, nullptr);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, dctx.rc);
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, dctx.resp.status);
+  TEST_ASSERT_NOT_NULL(dctx.resp.message);
+  TEST_ASSERT_EQUAL_MEMORY("ok", dctx.resp.message->data, 2);
+  grpc_client_response_free(&dctx.resp);
+  fx_client_free(ec);
+  fx_server_free(es);
+}
+#endif
+
 int main(void) {
 #ifndef _WIN32
   signal(SIGPIPE, SIG_IGN);
@@ -2720,6 +3319,8 @@ int main(void) {
   RUN_TEST(test_integration_maintenance_drain_and_edge_paths);
 #ifndef _WIN32
   RUN_TEST(test_integration_async_write_backpressure);
+  RUN_TEST(test_integration_request_framing);
+  RUN_TEST(test_integration_server_lifecycle_fixes);
 #endif
   return UNITY_END();
 }

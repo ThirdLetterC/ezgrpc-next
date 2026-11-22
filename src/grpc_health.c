@@ -1,7 +1,9 @@
 /* grpc_health.c - the grpc.health.v1.Health service (Check and Watch)
  *
  * Each server has a lazily created health_state: the overall status (the "" service) and a list
- * of per-service statuses. Services not in the list report SERVING. Statuses can be set from any
+ * of per-service statuses. As the gRPC health protocol requires, a service with no status set is
+ * known when the server serves routes of it (SERVING) and unknown otherwise: Check answers it with
+ * NOT_FOUND, Watch with SERVICE_UNKNOWN (and later changes). Statuses can be set from any
  * thread, so they are guarded by a mutex; the list of Watch streams is touched only on the
  * server thread. A status change posts notify_watchers_on_loop() to the server thread, which
  * sends the new status to every watcher whose service status changed.
@@ -77,6 +79,28 @@ void health_free(grpc_server *server) {
   server->health = nullptr;
 }
 
+/* True if the server has an enabled route of `service` ("/service/Method"). Routes change only
+ * on the server thread, so this runs there. */
+static bool service_has_route(grpc_server *server, const char *service) {
+  size_t n = strlen(service);
+  for (size_t i = 0; i < server->nb_routes; i++) {
+    const char *path = server->routes[i]->path;
+    if (!server->routes[i]->disabled && path != nullptr && path[0] == '/' &&
+        strncmp(path + 1, service, n) == 0 && path[1 + n] == '/')
+      return true;
+  }
+  return false;
+}
+
+/* The status reported for `service` on the server thread: the one set, else SERVING for a
+ * service the server serves, else SERVICE_UNKNOWN. */
+static grpc_health_status status_on_loop(grpc_server *server, const char *service) {
+  grpc_health_status st = grpc_health_get_status(server, service);
+  if (st == GRPC_HEALTH_SERVICE_UNKNOWN && service_has_route(server, service))
+    return GRPC_HEALTH_SERVING;
+  return st;
+}
+
 /* Posted to the server thread on a status change. Removes watchers whose call was cancelled
  * (dropping their reference) and sends the current status to every other watcher whose service
  * status differs from the last one it was sent. */
@@ -94,7 +118,7 @@ static void notify_watchers_on_loop(void *arg) {
       grpc_free(w);
       continue;
     }
-    grpc_health_status cur = grpc_health_get_status(server, w->service);
+    grpc_health_status cur = status_on_loop(server, w->service);
     if (cur != w->last_status) {
       w->last_status = cur;
       uint8_t response[2] = {0x08, (uint8_t)cur};
@@ -158,15 +182,14 @@ out:
 }
 
 /* Returns UNKNOWN when health was never set up on the server, the overall status for an empty
- * or null service, the registered status, or SERVING for an unregistered service. Takes the
- * lock, so it is safe from any thread. */
+ * or null service, the status set for the service, or SERVICE_UNKNOWN when none was set. Takes
+ * the lock, so it is safe from any thread. */
 GRPC_API grpc_health_status grpc_health_get_status(grpc_server *server, const char *service) {
   if (server == nullptr || server->health == nullptr)
     return GRPC_HEALTH_UNKNOWN;
   struct health_state *health = server->health;
 
-  /* services report SERVING until told otherwise */
-  grpc_health_status res = GRPC_HEALTH_SERVING;
+  grpc_health_status res = GRPC_HEALTH_SERVICE_UNKNOWN;
   pthread_mutex_lock(&health->lock);
   if (service == nullptr || *service == '\0') {
     res = health->overall;
@@ -247,7 +270,12 @@ static void health_check(grpc_call *call, const grpc_message *request, void *use
     parse_health_request_service(request->data, request->len, service_name, sizeof(service_name));
   }
 
-  grpc_health_status status = grpc_health_get_status(server, service_name);
+  grpc_health_status status = status_on_loop(server, service_name);
+  if (status == GRPC_HEALTH_SERVICE_UNKNOWN) {
+    /* the health protocol: Check of a service the server does not know fails with NOT_FOUND */
+    (void)grpc_call_finish(call, GRPC_STATUS_NOT_FOUND, "unknown service");
+    return;
+  }
 
   /* HealthCheckResponse { ServingStatus status = 1; } */
   uint8_t response[2] = {0x08, (uint8_t)status};
@@ -269,7 +297,8 @@ static void health_watch_message(grpc_call *call, const grpc_message *request, v
   if (request->len > 0)
     parse_health_request_service(request->data, request->len, service_name, sizeof(service_name));
 
-  grpc_health_status status = grpc_health_get_status(server, service_name);
+  /* an unknown service is reported as SERVICE_UNKNOWN, and watched for a status to be set */
+  grpc_health_status status = status_on_loop(server, service_name);
   uint8_t response[2] = {0x08, (uint8_t)status};
   if (grpc_call_send_data(call, response, sizeof(response)) != GRPC_OK)
     return;

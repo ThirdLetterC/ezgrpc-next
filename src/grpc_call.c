@@ -94,8 +94,9 @@ static void nv_list_free(nv_list *list) {
 }
 
 /* Appends application metadata to `list`. A zero key_len or value_len means the string is
- * NUL-terminated. Rejects null keys or values, empty keys and pseudo-headers (":...") with
- * GRPC_ERR_INVALID. On error the entries already appended stay in the list. */
+ * NUL-terminated. Rejects with GRPC_ERR_INVALID anything metadata_entry_valid() refuses: null,
+ * empty or malformed keys, pseudo-headers and reserved names, and values with control bytes. On
+ * error the entries already appended stay in the list. */
 static grpc_err nv_list_add_metadata(nv_list *list, const grpc_metadata *metadata, size_t count) {
   if (metadata == nullptr && count > 0)
     return GRPC_ERR_INVALID;
@@ -105,8 +106,7 @@ static grpc_err nv_list_add_metadata(nv_list *list, const grpc_metadata *metadat
       return GRPC_ERR_INVALID;
     size_t klen = md->key_len ? md->key_len : strlen(md->key);
     size_t vlen = md->value_len ? md->value_len : strlen(md->value);
-    /* pseudo-headers belong to HTTP/2 itself */
-    if (klen == 0 || md->key[0] == ':')
+    if (!metadata_entry_valid(md->key, klen, md->value, vlen, true))
       return GRPC_ERR_INVALID;
     grpc_err err = nv_list_add(list, md->key, klen, md->value, vlen);
     if (err != GRPC_OK)
@@ -155,30 +155,43 @@ static void call_free(grpc_call *call) {
   grpc_message_free(call->request);
   nv_list_free(&call->headers);
   nv_list_free(&call->trailers);
-  for (size_t i = 0; i < call->nb_req_headers; i++) {
-    call->ops->hdr_decref(call->req_header_refs[i][0]);
-    call->ops->hdr_decref(call->req_header_refs[i][1]);
-  }
+  grpc_free(call->req_header_data);
   if (call->userdata_free != nullptr)
     call->userdata_free(call->userdata);
   grpc_free(call->method_override);
   grpc_free(call);
 }
 
-/* Copies the stream's header table into the call and takes a reference on each transport header
- * buffer (nghttp2/nghttp3 rcbuf), so the names and values stay valid after the stream and its
- * session are freed without copying them. The references are dropped in call_free() through
- * call->ops. */
-static void retain_request_headers(grpc_call *call, const grpc_stream *stream) {
+/* Copies the stream's request headers into one call-owned block (names and values
+ * NUL-terminated), so they outlive the stream and its session. The call must not keep references
+ * on the transport's header buffers: those are shared with the connection's HPACK/QPACK decoder
+ * through non-atomic reference counts, and the call's last reference may be dropped by a worker
+ * thread while the loop thread decodes the next request. Returns false when out of memory. */
+static bool retain_request_headers(grpc_call *call, const grpc_stream *stream) {
   call->ops = stream->ops;
+  size_t total = 0;
+  for (size_t i = 0; i < stream->nb_headers; i++)
+    total += stream->headers[i].namelen + 1 + stream->headers[i].valuelen + 1;
+  char *block = total > 0 ? grpc_malloc(total) : nullptr;
+  if (total > 0 && block == nullptr)
+    return false;
+  char *p = block;
   for (size_t i = 0; i < stream->nb_headers; i++) {
-    call->req_headers[i] = stream->headers[i];
-    call->req_header_refs[i][0] = stream->header_refs[i][0];
-    call->req_header_refs[i][1] = stream->header_refs[i][1];
-    stream->ops->hdr_incref(call->req_header_refs[i][0]);
-    stream->ops->hdr_incref(call->req_header_refs[i][1]);
+    const grpc_header *h = &stream->headers[i];
+    grpc_header *c = &call->req_headers[i];
+    memcpy(p, h->name, h->namelen);
+    p[h->namelen] = '\0';
+    *c = (grpc_header){.name = p, .namelen = h->namelen};
+    p += h->namelen + 1;
+    memcpy(p, h->value, h->valuelen);
+    p[h->valuelen] = '\0';
+    c->value = p;
+    c->valuelen = h->valuelen;
+    p += h->valuelen + 1;
   }
+  call->req_header_data = block;
   call->nb_req_headers = stream->nb_headers;
+  return true;
 }
 
 /* Returns true if `alg` is identity or a codec compiled into this build. */
@@ -261,7 +274,10 @@ grpc_call *call_new(grpc_session *session, grpc_stream *stream) {
   grpc_call *call = grpc_calloc(1, sizeof(*call));
   if (call == nullptr)
     return nullptr;
-  retain_request_headers(call, stream);
+  if (!retain_request_headers(call, stream)) {
+    grpc_free(call);
+    return nullptr;
+  }
   /* the stream's reference, dropped by call_detach() */
   atomic_init(&call->refs, 1);
   call->server = session->server;
@@ -272,8 +288,14 @@ grpc_call *call_new(grpc_session *session, grpc_stream *stream) {
   call->start_ms = grpc_time_now_ms();
   call->is_grpc_web = stream->is_grpc_web;
   call->is_grpc_web_text = stream->is_grpc_web_text;
-  if (stream->route == session->server->fallback_route && stream->hpath != nullptr)
+  if (stream->route == session->server->fallback_route && stream->hpath != nullptr) {
     call->method_override = grpc_strndup(stream->hpath, stream->hpath_len);
+    if (call->method_override == nullptr) { /* the fallback handler needs the real method */
+      grpc_free(call->req_header_data);
+      grpc_free(call);
+      return nullptr;
+    }
+  }
   memcpy(call->peer, session->peer, sizeof(call->peer));
   memcpy(call->peer_cert_subject, session->peer_cert_subject, sizeof(call->peer_cert_subject));
   atomic_fetch_add(&session->server->stat_total_calls, 1);
@@ -611,13 +633,28 @@ static grpc_err call_finish_internal(grpc_call *call, grpc_status status, const 
   return GRPC_OK;
 }
 
+/* Ends a call whose status could not be sent (out of memory building the trailers): resets the
+ * stream with INTERNAL_ERROR, which needs no new allocation of ours, so the client learns at once
+ * instead of waiting for its deadline, and marks the call finished. */
+static void call_reset_unfinished(grpc_call *call, grpc_status status) {
+  if (call->finished || call->closed || call->stream == nullptr)
+    return;
+  call->finished = true;
+  call->stream->is_deadline_set = false;
+  call->session->ops->reset_stream(call->session, call->stream, GRPC_RESET_INTERNAL_ERROR);
+  session_schedule_flush(call->session);
+  call_record_done_stat(call, status);
+  interceptors_run_on_done(call, status);
+}
+
 /* Ends the call from inside the library (e.g. deadline exceeded, malformed request) with
- * `status`, then cancels it so the application learns the call is over. No-op if the call is
- * already finished or closed. */
+ * `status`, then cancels it so the application learns the call is over. When the status cannot
+ * be sent, the stream is reset instead. No-op if the call is already finished or closed. */
 void call_abort(grpc_call *call, grpc_status status, const char *message) {
   if (call->finished || call->closed)
     return;
-  (void)call_finish_internal(call, status, message);
+  if (call_finish_internal(call, status, message) != GRPC_OK)
+    call_reset_unfinished(call, status);
   call_cancel(call, status);
 }
 
@@ -798,12 +835,17 @@ GRPC_API grpc_err grpc_call_reply_data(grpc_call *call, const void *data, size_t
   return grpc_call_finish(call, GRPC_STATUS_OK, nullptr);
 }
 
-/* Checks that the call can still respond, then ends it with call_finish_internal(). */
+/* Checks that the call can still respond, then ends it with call_finish_internal(). When the
+ * status cannot be sent for lack of memory, the stream is reset instead (the client sees the call
+ * fail at once rather than at its deadline) and GRPC_ERR_NOMEM returned; the call is over. */
 GRPC_API grpc_err grpc_call_finish(grpc_call *call, grpc_status status, const char *message) {
   grpc_err err = call_check(call);
   if (err != GRPC_OK)
     return err;
-  return call_finish_internal(call, status, message);
+  err = call_finish_internal(call, status, message);
+  if (err == GRPC_ERR_NOMEM)
+    call_reset_unfinished(call, status);
+  return err;
 }
 
 /* ---- accessors ---------------------------------------------------------------- */
@@ -1119,7 +1161,7 @@ static grpc_err post_async_metadata(grpc_call *call, async_op_kind kind,
       }
       size_t klen = metadata[i].key_len ? metadata[i].key_len : strlen(metadata[i].key);
       size_t vlen = metadata[i].value_len ? metadata[i].value_len : strlen(metadata[i].value);
-      if (klen == 0 || metadata[i].key[0] == ':') {
+      if (!metadata_entry_valid(metadata[i].key, klen, metadata[i].value, vlen, true)) {
         op->metadata_count = i;
         async_op_free(op);
         return GRPC_ERR_INVALID;

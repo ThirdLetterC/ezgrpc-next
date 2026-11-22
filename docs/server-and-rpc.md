@@ -126,6 +126,12 @@ grpc_metadata trailers[] = {{.key = "x-server-time", .value = "2ms"}};
 (void)grpc_call_finish(call, GRPC_STATUS_OK, nullptr);
 ```
 
+Metadata keys may contain only lower-case letters, digits, `-`, `_` and `.`, and values only
+printable ASCII (no CR/LF), with `-bin` values Base64 encoded (`grpc_metadata_encode_bin()`).
+Reserved names (`content-type`, `te`, HTTP connection headers, and `grpc-status`, `grpc-message`,
+`grpc-encoding`, `grpc-accept-encoding` in responses) are rejected with `GRPC_ERR_INVALID`, so a
+value echoed from a client can never inject further fields.
+
 ### Rich Error Model (`google.rpc.Status`)
 
 ```c
@@ -208,3 +214,7 @@ Call `grpc_server_stop(server)` from a signal handler or another thread to exit 
 grpc_err drain_err = grpc_server_drain(server, 5000);
 grpc_server_free(server);
 ```
+
+Calls on event routes (`grpc_server_register_path()`) need the application to answer them: when
+they produce events during a drain, `grpc_server_drain()` returns `GRPC_ERR_STATE` with the events
+available from `grpc_server_events()`. Handle them, then call `grpc_server_drain()` again.

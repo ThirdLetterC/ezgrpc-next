@@ -24,6 +24,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <signal.h>
 #include <time.h>
 #include <stddef.h>
 #include "internal/grpc_platform.h"
@@ -173,6 +174,8 @@ grpc_session *session_slot_acquire(grpc_server *server) {
   uint64_t now = grpc_time_now_ms();
   session->created_ms = now;
   session->last_activity_ms = now;
+  session->idle_since_ms = now;
+  session->last_client_ping_ms = 0;
   session->ping_pending = false;
   session->goaway_sent = false;
   session->ping_strikes = 0;
@@ -197,12 +200,14 @@ void session_slot_release(grpc_session *session) {
   session->ping_pending = false;
   session->goaway_sent = false;
   session->ping_strikes = 0;
+  session->last_client_ping_ms = 0;
   memset(&session->sockaddr, 0, sizeof(session->sockaddr));
   session->peer[0] = '\0';
   session->peer_cert_subject[0] = '\0';
   session->is_closing = false;
   session->is_active = false;
   session->is_flush_blocked = false;
+  session->close_on_flush = false;
   session->ops = nullptr;
 
   atomic_fetch_sub(&server->stat_active_connections, 1);
@@ -264,6 +269,19 @@ void session_close(grpc_session *session) {
 
   /* pending writes are cancelled before on_session_close runs */
   uv_close(session_handle(session), on_session_close);
+}
+
+void ignore_default_sigpipe(void) {
+#ifndef _WIN32
+  struct sigaction old;
+  if (sigaction(SIGPIPE, nullptr, &old) == 0 && !(old.sa_flags & SA_SIGINFO) &&
+      old.sa_handler == SIG_DFL) {
+    struct sigaction ign = {0};
+    ign.sa_handler = SIG_IGN;
+    sigemptyset(&ign.sa_mask);
+    (void)sigaction(SIGPIPE, &ign, nullptr);
+  }
+#endif
 }
 
 void *grpc_mem_hook_malloc(size_t size, [[maybe_unused]] void *user_data) {
@@ -677,6 +695,10 @@ void session_flush(grpc_session *ezsession) {
   /* an in-flight write resumes the flush from on_session_write */
   if (!ezsession->is_active || ezsession->is_closing || ezsession->is_writing)
     return;
+  if (ezsession->close_on_flush) {
+    session_close(ezsession);
+    return;
+  }
 
   for (;;) {
     int serialized = session_serialize(ezsession);
@@ -788,5 +810,7 @@ void stream_unlink(grpc_session *session, grpc_stream *stream) {
     stream->next->prev = stream->prev;
   stream->prev = stream->next = nullptr;
   session->nb_streams--;
+  if (session->nb_streams == 0)
+    session->idle_since_ms = grpc_time_now_ms();
   atomic_fetch_sub(&session->server->stat_active_streams, 1);
 }

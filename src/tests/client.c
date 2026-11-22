@@ -277,14 +277,26 @@ void test_client_server_tcp_end_to_end(void) {
                                                    nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   TEST_ASSERT_NOT_NULL(resp.message);
-  TEST_ASSERT_TRUE(resp.message->len > 0);
+  /* GetServersResponse.server[0] (1) > Server.ref (1) > ServerRef { server_id = 5: 1,
+   * name = 6: "ezGRPC-next" } with the grpc.channelz.v1 field numbers */
+  TEST_ASSERT_TRUE(resp.message->len > 8);
+  TEST_ASSERT_EQUAL_HEX8(0x0A, resp.message->data[0]);
+  TEST_ASSERT_EQUAL_HEX8(0x0A, resp.message->data[2]);
+  TEST_ASSERT_EQUAL_HEX8(0x28, resp.message->data[4]);
+  TEST_ASSERT_EQUAL_HEX8(0x01, resp.message->data[5]);
+  TEST_ASSERT_EQUAL_HEX8(0x32, resp.message->data[6]);
+  TEST_ASSERT_EQUAL_UINT8(11, resp.message->data[7]);
   grpc_client_response_free(&resp);
 
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_unary(client, GRPC_CHANNELZ_PATH_GET_SERVER_SOCKETS,
                                                    "", 0, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   TEST_ASSERT_NOT_NULL(resp.message);
-  TEST_ASSERT_TRUE(resp.message->len > 0);
+  /* socket_ref[0] (1) > SocketRef { socket_id = 3, name = 4 } */
+  TEST_ASSERT_TRUE(resp.message->len > 4);
+  TEST_ASSERT_EQUAL_HEX8(0x0A, resp.message->data[0]);
+  TEST_ASSERT_EQUAL_HEX8(0x18, resp.message->data[2]);
+  TEST_ASSERT_EQUAL_HEX8(0x22, resp.message->data[4]);
   grpc_client_response_free(&resp);
 
   /* 6. Server stats */

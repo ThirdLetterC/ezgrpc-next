@@ -11,6 +11,11 @@
 #include <string.h>
 #include "core.h"
 
+/* Ignores SIGPIPE when it still has its default disposition (which would kill the process when a
+ * write reaches a connection the peer closed; libuv writes without MSG_NOSIGNAL). A handler the
+ * application installed, or SIG_IGN, is left alone. No-op on Windows. */
+void ignore_default_sigpipe(void);
+
 /* Allocator hooks in the shape shared by nghttp2_mem, ngtcp2_mem and nghttp3_mem (the user data
  * pointer comes last and is ignored): they route the protocol libraries' memory through
  * grpc_malloc() and friends, so grpc_set_allocator() and the GRPC_ALLOCATOR build option cover

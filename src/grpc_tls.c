@@ -32,42 +32,39 @@ GRPC_API const char *grpc_tls_backend_version(void) {
 /* Returns the backend's native context of the active server context (e.g. SSL_CTX *), or nullptr
  * when the server is nullptr or has no TLS context. */
 GRPC_API void *grpc_server_tls_native(grpc_server *server) {
-  return server != nullptr && server->tls_ctx != nullptr ? tls_backend_ctx_native(server->tls_ctx)
-                                                         : nullptr;
+  return server != nullptr && server->tls_pool.active.ctx != nullptr
+             ? tls_backend_ctx_native(server->tls_pool.active.ctx)
+             : nullptr;
 }
 
-/* Builds a backend context from `cfg` and makes it the server's active context. The previous
- * context is not freed but moved to the retired list, because live sessions created from it may
- * still use it (not every backend reference-counts its context); retired contexts are freed by
- * tls_free(). The list is grown before anything is switched, so if that allocation fails the new
- * context is dropped and GRPC_ERR_NOMEM returned. On any failure the previous context stays
- * active. Expects the PEM lengths in `cfg` to be already filled in. */
+static void free_tcp_ctx(void *ctx) {
+  tls_backend_ctx_free(ctx);
+}
+
+/* Builds the server's first TLS context from `cfg` and makes it active. Returns GRPC_OK, or
+ * GRPC_ERR_INVALID when the credentials cannot be loaded. Expects the PEM lengths in `cfg` to be
+ * already filled in. */
 grpc_err tls_enable(grpc_server *server, const grpc_tls_config *cfg) {
   grpc_tls_ctx *ctx = tls_backend_ctx_new(cfg);
   if (ctx == nullptr) {
     LOG_ERROR(server, "cannot load the TLS certificate/key configuration\n");
     return GRPC_ERR_INVALID;
   }
-  if (server->tls_ctx != nullptr) {
-    grpc_tls_ctx **retired = grpc_realloc(server->retired_tls_ctxs,
-                                          (server->nb_retired_tls_ctxs + 1) * sizeof(*retired));
-    if (retired == nullptr) {
-      /* never free the old context here: live sessions may still be using it */
-      tls_backend_ctx_free(ctx);
-      return GRPC_ERR_NOMEM;
-    }
-    server->retired_tls_ctxs = retired;
-    server->retired_tls_ctxs[server->nb_retired_tls_ctxs++] = server->tls_ctx;
+  if (tls_ctx_pool_reserve(&server->tls_pool) != GRPC_OK) {
+    tls_backend_ctx_free(ctx);
+    return GRPC_ERR_NOMEM;
   }
-  server->tls_ctx = ctx;
+  tls_ctx_pool_install(&server->tls_pool, ctx, free_tcp_ctx);
   server->is_tls = 1;
   return GRPC_OK;
 }
 
-/* Validates `tls` (exactly one of the file pair or the PEM pair, each complete), fills in the
- * lengths of NUL-terminated PEM strings given with a zero length, and installs the new context
- * with tls_enable(). Existing connections keep the context they were created with. A server
- * started without TLS is refused with GRPC_ERR_STATE: a "reload" must not switch its new
+/* Validates `tls` (exactly one of the file pair or the PEM pair, each complete) and fills in the
+ * lengths of NUL-terminated PEM strings given with a zero length. All or nothing: the new TCP
+ * and HTTP/3 contexts are both built (and room to retire the old ones reserved) before either is
+ * switched, so on any failure both keep the previous configuration. Existing connections keep
+ * the context they were created with; a replaced context is freed with its last connection. A
+ * server started without TLS is refused with GRPC_ERR_STATE: a "reload" must not switch its new
  * connections from plaintext to TLS under existing clients. */
 GRPC_API grpc_err grpc_server_reload_tls(grpc_server *server, const grpc_tls_config *tls) {
   if (server == nullptr || tls == nullptr)
@@ -89,25 +86,33 @@ GRPC_API grpc_err grpc_server_reload_tls(grpc_server *server, const grpc_tls_con
     normalized.key_pem_len = strlen(normalized.key_pem);
   if (normalized.ca_pem != nullptr && normalized.ca_pem_len == 0)
     normalized.ca_pem_len = strlen(normalized.ca_pem);
-  grpc_err err = tls_enable(server, &normalized);
-  if (err != GRPC_OK)
-    return err;
+
+  grpc_tls_ctx *ctx = tls_backend_ctx_new(&normalized);
+  if (ctx == nullptr) {
+    LOG_ERROR(server, "cannot load the TLS certificate/key configuration\n");
+    return GRPC_ERR_INVALID;
+  }
   /* HTTP/3 connections use their own QUIC TLS context, built from the same credentials */
-  return http3_server_reload_tls(server, &normalized);
+  void *quic_ctx = nullptr;
+  grpc_err err = http3_server_tls_prepare(server, &normalized, &quic_ctx);
+  if (err == GRPC_OK && tls_ctx_pool_reserve(&server->tls_pool) != GRPC_OK) {
+    http3_server_tls_discard(server, quic_ctx);
+    err = GRPC_ERR_NOMEM;
+  }
+  if (err != GRPC_OK) {
+    tls_backend_ctx_free(ctx);
+    return err;
+  }
+  /* nothing can fail from here on */
+  tls_ctx_pool_install(&server->tls_pool, ctx, free_tcp_ctx);
+  http3_server_tls_install(server, quic_ctx);
+  return GRPC_OK;
 }
 
-/* Frees the active server context and every retired one, and resets the retired list. Called
- * when the server is destroyed. */
+/* Frees the active server context and every retired one. Called when the server is destroyed,
+ * after its connections. */
 void tls_free(grpc_server *server) {
-  if (server->tls_ctx != nullptr) {
-    tls_backend_ctx_free(server->tls_ctx);
-    server->tls_ctx = nullptr;
-  }
-  for (size_t i = 0; i < server->nb_retired_tls_ctxs; i++)
-    tls_backend_ctx_free(server->retired_tls_ctxs[i]);
-  grpc_free(server->retired_tls_ctxs);
-  server->retired_tls_ctxs = nullptr;
-  server->nb_retired_tls_ctxs = 0;
+  tls_ctx_pool_free(&server->tls_pool);
 }
 
 /* Creates the backend session for a new connection from the server's active context. Returns 0
@@ -115,16 +120,19 @@ void tls_free(grpc_server *server) {
  * cannot be created. */
 int grpc_tls_session_init(grpc_session *session) {
   if (session == nullptr || session->server == nullptr || !session->server->is_tls ||
-      session->server->tls_ctx == nullptr) {
+      session->server->tls_pool.active.ctx == nullptr) {
     return 0;
   }
 
-  grpc_tls_session *tls = tls_backend_session_new(session->server->tls_ctx);
+  void *ctx = tls_ctx_pool_acquire(&session->server->tls_pool);
+  grpc_tls_session *tls = tls_backend_session_new(ctx);
   if (tls == nullptr) {
+    tls_ctx_pool_release(&session->server->tls_pool, ctx);
     return 1;
   }
 
   session->tls = tls;
+  session->tls_ctx_used = ctx;
   session->is_tls = 1;
   session->tls_handshake_done = 0;
   return 0;
@@ -195,6 +203,8 @@ void grpc_tls_close_notify(grpc_session *session) {
 void grpc_tls_session_free(grpc_session *session) {
   if (session != nullptr && session->tls != nullptr) {
     tls_backend_session_free(session->tls);
+    tls_ctx_pool_release(&session->server->tls_pool, session->tls_ctx_used);
+    session->tls_ctx_used = nullptr;
     session->tls = nullptr;
     session->is_tls = 0;
     session->tls_handshake_done = 0;

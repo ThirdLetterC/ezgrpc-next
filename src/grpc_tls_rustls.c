@@ -121,7 +121,8 @@ grpc_tls_ctx *tls_backend_ctx_new(const grpc_tls_config *cfg) {
   if (cfg->ca_file != nullptr || cfg->ca_pem != nullptr) {
     const uint8_t *ca_data = nullptr;
     size_t ca_len = 0;
-    if (cfg->ca_pem != nullptr) {
+    /* as in the other backends, ca_pem is used only when ca_file is not set */
+    if (cfg->ca_file == nullptr) {
       ca_data = (const uint8_t *)cfg->ca_pem;
       ca_len = cfg->ca_pem_len;
     } else {
@@ -242,22 +243,28 @@ static rustls_io_result io_write(void *userdata, const uint8_t *buf, size_t n, s
   return 0;
 }
 
-/* moves the ciphertext rustls has ready into io.out. returns 0 on success, 1 on error */
+/* moves the ciphertext rustls has ready into io.out. Returns TLS_DRAIN_OK, TLS_DRAIN_NOMEM when
+ * io.out cannot grow (rustls keeps what was not written, so a later flush continues), or
+ * TLS_DRAIN_ERROR */
 static int flush_tls(grpc_tls_session *tls) {
   while (rustls_connection_wants_write(tls->conn)) {
     size_t n = 0;
-    if (rustls_connection_write_tls(tls->conn, io_write, tls, &n) != 0)
-      return 1;
+    rustls_io_result rv = rustls_connection_write_tls(tls->conn, io_write, tls, &n);
+    if (rv == ENOMEM)
+      return TLS_DRAIN_NOMEM;
+    if (rv != 0)
+      return TLS_DRAIN_ERROR;
   }
-  return 0;
+  return TLS_DRAIN_OK;
 }
 
 /* Flushes the ciphertext rustls has ready into the output queue, then moves the queue to the end
  * of `out`. rustls keeps its ciphertext until rustls_connection_write_tls() is called, so the
  * flush must come first. Returns 0 on success, 1 on error. */
 int tls_backend_drain(grpc_tls_session *tls, grpc_buf *out) {
-  if (flush_tls(tls))
-    return 1;
+  int flushed = flush_tls(tls);
+  if (flushed != TLS_DRAIN_OK)
+    return flushed;
   return tls_io_drain(&tls->io, out);
 }
 

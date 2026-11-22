@@ -709,8 +709,12 @@ static void oom_gzip_handler(grpc_call *call, const grpc_message *req, [[maybe_u
   bool injected = oom_disable();
   SRV_EXPECT(rc == GRPC_OK || rc == GRPC_ERR_NOMEM);
   SRV_EXPECT(injected || rc == GRPC_OK);
-  if (rc != GRPC_OK) /* a failed reply leaves the call open and finishable */
-    SRV_EXPECT(grpc_call_finish(call, GRPC_STATUS_RESOURCE_EXHAUSTED, "oom") == GRPC_OK);
+  if (rc != GRPC_OK) {
+    /* a failed send leaves the call open and finishable; a failed finish (the trailers could not
+     * be built) has reset the stream and ended the call */
+    grpc_err fin = grpc_call_finish(call, GRPC_STATUS_RESOURCE_EXHAUSTED, "oom");
+    SRV_EXPECT(fin == GRPC_OK || fin == GRPC_ERR_FINISHED);
+  }
   atomic_store(&g_step_injected, injected ? 1 : 0);
 }
 
@@ -750,10 +754,14 @@ void test_oom_live_call_and_client(void) {
     grpc_status st = r.status;
     grpc_client_response_free(&r);
     assert_server_expectations();
-    TEST_ASSERT_EQUAL_INT(GRPC_OK, rc);
     TEST_ASSERT_NOT_EQUAL_INT_MESSAGE(-1, injected, "gzip handler did not run");
-    if (!echoed)
-      TEST_ASSERT_EQUAL_INT(GRPC_STATUS_RESOURCE_EXHAUSTED, st);
+    /* unless echoed: RESOURCE_EXHAUSTED, or the stream was reset / the connection dropped
+     * because not even the status could be sent (every allocation fails here); never a hang */
+    if (!echoed && rc == GRPC_OK)
+      TEST_ASSERT_TRUE(st == GRPC_STATUS_RESOURCE_EXHAUSTED || st == GRPC_STATUS_INTERNAL ||
+                       st == GRPC_STATUS_UNKNOWN);
+    else if (!echoed)
+      TEST_ASSERT_TRUE(rc == GRPC_ERR_CLOSED || rc == GRPC_ERR_IO || rc == GRPC_ERR_PROTOCOL);
     if (!injected) {
       TEST_ASSERT_TRUE(echoed);
       oom_report("gzip reply (server thread)", n);
@@ -834,23 +842,24 @@ static void tid_echo_handler(grpc_call *call, const grpc_message *req, [[maybe_u
     (void)grpc_call_finish(call, GRPC_STATUS_RESOURCE_EXHAUSTED, "out of memory");
 }
 
-void test_oom_server_connection(void) {
-  grpc_server *srv = fx_server_new();
-  TEST_ASSERT_EQUAL_INT(GRPC_OK,
-                        grpc_server_handle(srv, "/oom.Svc/Echo", tid_echo_handler, nullptr));
-  fx_server_start();
-  uint16_t port = grpc_server_port(srv);
-  grpc_client *probe = fx_client_new(port);
-  assert_echo_works(probe); /* learns the server thread's id */
-  grpc_client_free(probe);
-  g_fx.client = nullptr;
-  int srv_tid = atomic_load(&g_srv_tid);
-  TEST_ASSERT_NOT_EQUAL_INT(0, srv_tid);
+/* Fallback handler: every call must reach it with the method the client asked for (a failed
+ * copy of the method name fails the call instead of hiding the method). */
+static void fallback_echo_on_message(grpc_call *call, const grpc_message *msg,
+                                     [[maybe_unused]] void *ud) {
+  const char *method = grpc_call_method(call);
+  SRV_EXPECT(method != nullptr && strcmp(method, "/oom.Other/Any") == 0);
+  if (grpc_call_send_data(call, msg->data, msg->len) != GRPC_OK)
+    (void)grpc_call_finish(call, GRPC_STATUS_RESOURCE_EXHAUSTED, "out of memory");
+  else
+    (void)grpc_call_finish(call, GRPC_STATUS_OK, nullptr);
+}
 
-  /* Step n fails only the n-th allocation the (otherwise idle) server thread makes for a new
-   * connection and one unary call: accepting, the session, its SETTINGS and output buffers, the
-   * stream, the request and the reply. Each RPC either succeeds (a blocked flush is retried) or
-   * fails promptly; none hangs until its deadline, and the server keeps serving. */
+/* Step n fails only the n-th allocation the (otherwise idle) server thread makes for a new
+ * connection and one unary call to `path`: accepting, the session, its SETTINGS and output
+ * buffers, the stream, the request (and its method name, for the fallback) and the reply. Each
+ * RPC either succeeds (a blocked flush is retried) or fails promptly; none hangs until its
+ * deadline, and the server keeps serving. */
+static void connection_steps(int srv_tid, uint16_t port, const char *path, const char *label) {
   int recovered = 0;
   for (int n = 0;; n++) {
     OOM_ASSERT_STEP(n);
@@ -862,16 +871,17 @@ void test_oom_server_connection(void) {
     grpc_err rc = err;
     grpc_client_response r = {0};
     if (c != nullptr)
-      rc = grpc_client_unary(c, "/oom.Svc/Echo", "ping", 4, nullptr, 0, 2000, &r);
+      rc = grpc_client_unary(c, path, "ping", 4, nullptr, 0, 2000, &r);
     bool injected = oom_disable();
     bool ok = rc == GRPC_OK && response_is(&r, "ping", 4);
     grpc_status status = r.status;
     grpc_client_response_free(&r);
     grpc_client_free(c);
     g_fx.client = nullptr;
+    assert_server_expectations();
     if (!injected) {
       TEST_ASSERT_TRUE_MESSAGE(ok, "unary without OOM failed");
-      oom_report("server connection + unary (server)", n);
+      oom_report(label, n);
       break;
     }
     if (ok)
@@ -886,7 +896,27 @@ void test_oom_server_connection(void) {
     g_fx.client = nullptr;
   }
   if (getenv("OOM_VERBOSE") != nullptr)
-    printf("[oom] server connection: %d steps recovered without failing the RPC\n", recovered);
+    printf("[oom] %s: %d steps recovered without failing the RPC\n", label, recovered);
+}
+
+void test_oom_server_connection(void) {
+  grpc_server *srv = fx_server_new();
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(srv, "/oom.Svc/Echo", tid_echo_handler, nullptr));
+  const grpc_stream_handler fallback = {.on_message = fallback_echo_on_message};
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_set_fallback(srv, &fallback, nullptr));
+  fx_server_start();
+  uint16_t port = grpc_server_port(srv);
+  grpc_client *probe = fx_client_new(port);
+  assert_echo_works(probe); /* learns the server thread's id */
+  grpc_client_free(probe);
+  g_fx.client = nullptr;
+  int srv_tid = atomic_load(&g_srv_tid);
+  TEST_ASSERT_NOT_EQUAL_INT(0, srv_tid);
+
+  connection_steps(srv_tid, port, "/oom.Svc/Echo", "server connection + unary (server)");
+  /* an unregistered method reaches the fallback handler with its name, or fails */
+  connection_steps(srv_tid, port, "/oom.Other/Any", "server connection + fallback (server)");
 
   fx_server_stop();
   TEST_ASSERT_EQUAL_INT(GRPC_OK, atomic_load(&g_srv_rc));
@@ -995,13 +1025,17 @@ void test_oom_request_parsing(void) {
 static void oom_web_handler(grpc_call *call, const grpc_message *req, [[maybe_unused]] void *ud) {
   grpc_metadata tr[] = {{.key = "x-t", .value = "val"}};
   SRV_EXPECT(grpc_call_add_trailers(call, tr, 1) == GRPC_OK);
-  oom_enable_on(oom_thread_id(), atomic_load(&g_step));
+  /* one allocation fails (a transient failure), so a stream reset can still be queued */
+  oom_enable_once_on(oom_thread_id(), atomic_load(&g_step));
   grpc_err rc = grpc_call_reply_data(call, req->data, req->len);
   bool injected = oom_disable();
   SRV_EXPECT(rc == GRPC_OK || rc == GRPC_ERR_NOMEM);
   SRV_EXPECT(injected || rc == GRPC_OK);
-  if (rc != GRPC_OK) /* a failed reply leaves the call open and finishable */
-    SRV_EXPECT(grpc_call_finish(call, GRPC_STATUS_RESOURCE_EXHAUSTED, "oom") == GRPC_OK);
+  if (rc != GRPC_OK) {
+    /* a failed send leaves the call finishable; a failed finish has reset the stream */
+    grpc_err fin = grpc_call_finish(call, GRPC_STATUS_RESOURCE_EXHAUSTED, "oom");
+    SRV_EXPECT(fin == GRPC_OK || fin == GRPC_ERR_FINISHED);
+  }
   atomic_store(&g_step_injected, injected ? 1 : 0);
 }
 
@@ -1050,6 +1084,7 @@ static void oom_h2_flush(nghttp2_session *sess, int fd) {
 typedef struct oom_web_req {
   int32_t sid;
   bool closed;
+  uint32_t close_code; /* the stream's RST_STREAM code, NO_ERROR when it ended normally */
   int http_status;
 } oom_web_req;
 
@@ -1062,11 +1097,13 @@ static int oom_web_on_header([[maybe_unused]] nghttp2_session *s, const nghttp2_
   return 0;
 }
 
-static int oom_web_on_close([[maybe_unused]] nghttp2_session *s, int32_t sid,
-                            [[maybe_unused]] uint32_t code, void *ud) {
+static int oom_web_on_close([[maybe_unused]] nghttp2_session *s, int32_t sid, uint32_t code,
+                            void *ud) {
   oom_web_req *r = ud;
-  if (sid == r->sid)
+  if (sid == r->sid) {
     r->closed = true;
+    r->close_code = code;
+  }
   return 0;
 }
 
@@ -1225,7 +1262,8 @@ void test_oom_grpc_web_and_client_deterministic(void) {
       else
         oom_web_request(&req, cts[mode], wframe, sizeof(wframe));
       assert_server_expectations();
-      TEST_ASSERT_EQUAL_INT(200, req.http_status);
+      /* answered, or reset because the status could not be built */
+      TEST_ASSERT_TRUE(req.http_status == 200 || req.close_code == NGHTTP2_INTERNAL_ERROR);
       int injected = atomic_load(&g_step_injected);
       TEST_ASSERT_NOT_EQUAL_INT_MESSAGE(-1, injected, "gRPC-Web handler did not run");
       if (!injected) {

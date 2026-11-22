@@ -158,9 +158,13 @@ grpc_quic_tls_session *quic_tls_session_new(grpc_quic_tls_ctx *ctx,
       goto fail;
     gnutls_handshake_set_hook_function(s->session, GNUTLS_HANDSHAKE_CLIENT_HELLO, GNUTLS_HOOK_POST,
                                        client_hello_cb);
-    if (ctx->verify_client)
+    if (ctx->verify_client) {
       gnutls_certificate_server_set_request(
           s->session, ctx->require_client_cert ? GNUTLS_CERT_REQUIRE : GNUTLS_CERT_REQUEST);
+      /* without this GnuTLS only checks that a certificate was sent, not that it chains to
+       * the configured CA (the TCP backend does the same in src/grpc_tls_gnutls.c) */
+      gnutls_session_set_verify_cert(s->session, nullptr, 0);
+    }
   } else {
     if (ngtcp2_crypto_gnutls_configure_client_session(s->session) != 0)
       goto fail;
@@ -200,21 +204,7 @@ void quic_tls_session_free(grpc_quic_tls_session *session) {
 }
 
 int quic_tls_peer_subject(grpc_quic_tls_session *session, char *buf, size_t len) {
-  if (session == nullptr || session->session == nullptr || len == 0)
+  if (session == nullptr || session->session == nullptr)
     return -1;
-  unsigned int list_size = 0;
-  const gnutls_datum_t *certs = gnutls_certificate_get_peers(session->session, &list_size);
-  if (certs == nullptr || list_size == 0)
-    return -1;
-  gnutls_x509_crt_t crt;
-  if (gnutls_x509_crt_init(&crt) < 0)
-    return -1;
-  int res = -1;
-  if (gnutls_x509_crt_import(crt, &certs[0], GNUTLS_X509_FMT_DER) >= 0) {
-    size_t sz = len;
-    if (gnutls_x509_crt_get_dn(crt, buf, &sz) == GNUTLS_E_SUCCESS)
-      res = 0;
-  }
-  gnutls_x509_crt_deinit(crt);
-  return res;
+  return tls_gnutls_peer_subject(session->session, buf, len);
 }

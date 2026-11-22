@@ -9,8 +9,8 @@
  *
  * Protobuf is parsed and built by hand with single-byte tags. Descriptors are copied into a
  * per-server reflection_state owned by the server and freed with it; the state is not
- * synchronized, so register descriptors before the server runs. Symbols and service names are
- * limited to MAX_SYMBOL_LEN - 1 bytes.
+ * synchronized, so register descriptors before the server runs. Symbols, queries and service
+ * names are used at full length.
  */
 
 #include <stdio.h>
@@ -19,10 +19,8 @@
 #include "internal/grpc_threads.h"
 #include "core.h"
 
-enum { MAX_SYMBOL_LEN = 128 };
-
 typedef struct descriptor_entry {
-  char symbol[MAX_SYMBOL_LEN];
+  char *symbol; /* the key, as registered */
   uint8_t *data;
   size_t len;
 } descriptor_entry;
@@ -92,15 +90,17 @@ void reflection_free(grpc_server *server) {
   struct reflection_state *state = server->reflection;
   if (state == nullptr)
     return;
-  for (size_t i = 0; i < state->nb_entries; i++)
+  for (size_t i = 0; i < state->nb_entries; i++) {
+    grpc_free(state->entries[i].symbol);
     grpc_free(state->entries[i].data);
+  }
   grpc_free(state->entries);
   grpc_free(state);
   server->reflection = nullptr;
 }
 
-/* Copies `descriptor`; the key is truncated to MAX_SYMBOL_LEN - 1 bytes. Does not require
- * grpc_reflection_enable() first, and duplicate keys are kept (the first match wins). */
+/* Copies the key and `descriptor`. Does not require grpc_reflection_enable() first, and duplicate
+ * keys are kept (the first match wins). */
 GRPC_API grpc_err grpc_reflection_add_file_descriptor(grpc_server *server,
                                                       const char *symbol_or_filename,
                                                       const uint8_t *descriptor, size_t len) {
@@ -118,84 +118,73 @@ GRPC_API grpc_err grpc_reflection_add_file_descriptor(grpc_server *server,
   state->entries = entries;
 
   uint8_t *copy = grpc_malloc(len);
-  if (copy == nullptr)
+  char *key = grpc_strdup(symbol_or_filename);
+  if (copy == nullptr || key == nullptr) {
+    grpc_free(copy);
+    grpc_free(key);
     return GRPC_ERR_NOMEM;
+  }
   memcpy(copy, descriptor, len);
 
   descriptor_entry *e = &state->entries[state->nb_entries++];
-  strncpy(e->symbol, symbol_or_filename, sizeof(e->symbol) - 1);
-  e->symbol[sizeof(e->symbol) - 1] = '\0';
+  e->symbol = key;
   e->data = copy;
   e->len = len;
   return GRPC_OK;
 }
 
-/* Fills `services` with the distinct service names ("pkg.Service" of "/pkg.Service/Method") of
- * the enabled routes, skipping names of MAX_SYMBOL_LEN bytes or more, and adds the v1alpha
- * reflection service if missing. Stops at `max_services`. Returns the count. */
-static size_t collect_services(grpc_server *server, char services[][MAX_SYMBOL_LEN],
-                               size_t max_services) {
-  size_t count = 0;
+/* A service name: a slice of a route path, or a string literal. */
+typedef struct service_name {
+  const char *name;
+  size_t len;
+} service_name;
 
-  for (size_t i = 0; i < server->nb_routes && count < max_services; i++) {
+/* Lists the distinct service names ("pkg.Service" of "/pkg.Service/Method") of the enabled
+ * routes, plus the v1alpha reflection service if missing, in a grpc_malloc array (the names
+ * point into the routes). Returns nullptr when out of memory. */
+static service_name *collect_services(grpc_server *server, size_t *count) {
+  *count = 0;
+  service_name *services = grpc_malloc((server->nb_routes + 1) * sizeof(*services));
+  if (services == nullptr)
+    return nullptr;
+  for (size_t i = 0; i < server->nb_routes; i++) {
     if (server->routes[i]->disabled)
       continue;
     const char *p = server->routes[i]->path;
     if (p == nullptr || *p != '/')
       continue;
-
     const char *service_start = p + 1;
     const char *service_end = strchr(service_start, '/');
-    if (service_end == nullptr)
+    if (service_end == nullptr || service_end == service_start)
       continue;
-
-    size_t s_len = (size_t)(service_end - service_start);
-    if (s_len == 0 || s_len >= MAX_SYMBOL_LEN)
-      continue;
-
-    char svc[MAX_SYMBOL_LEN];
-    memcpy(svc, service_start, s_len);
-    svc[s_len] = '\0';
-
-    // Check if already in list
+    service_name svc = {service_start, (size_t)(service_end - service_start)};
     bool dup = false;
-    for (size_t k = 0; k < count; k++) {
-      if (strcmp(services[k], svc) == 0) {
-        dup = true;
-        break;
-      }
-    }
-    if (!dup) {
-      strcpy(services[count++], svc);
-    }
+    for (size_t k = 0; k < *count && !dup; k++)
+      dup = services[k].len == svc.len && memcmp(services[k].name, svc.name, svc.len) == 0;
+    if (!dup)
+      services[(*count)++] = svc;
   }
-
-  // Always ensure reflection service itself is advertised
-  const char *refl_svc = "grpc.reflection.v1alpha.ServerReflection";
+  /* always advertise the reflection service itself */
+  static const char refl_svc[] = "grpc.reflection.v1alpha.ServerReflection";
   bool has_refl = false;
-  for (size_t k = 0; k < count; k++) {
-    if (strcmp(services[k], refl_svc) == 0) {
-      has_refl = true;
-      break;
-    }
-  }
-  if (!has_refl && count < max_services) {
-    strcpy(services[count++], refl_svc);
-  }
-
-  return count;
+  for (size_t k = 0; k < *count && !has_refl; k++)
+    has_refl = services[k].len == sizeof(refl_svc) - 1 &&
+               memcmp(services[k].name, refl_svc, sizeof(refl_svc) - 1) == 0;
+  if (!has_refl)
+    services[(*count)++] = (service_name){refl_svc, sizeof(refl_svc) - 1};
+  return services;
 }
 
 /* Serializes a ServerReflectionResponse with original_request (field 2, when non-empty) and
  * list_services_response (field 6) naming `services`. Returns a grpc_malloc()'d buffer and its
  * length in *out_resp_len, or nullptr on allocation failure. */
-static uint8_t *build_list_services_response(const char services[][MAX_SYMBOL_LEN],
-                                             size_t nb_services, const uint8_t *orig_req,
-                                             size_t orig_req_len, size_t *out_resp_len) {
+static uint8_t *build_list_services_response(const service_name *services, size_t nb_services,
+                                             const uint8_t *orig_req, size_t orig_req_len,
+                                             size_t *out_resp_len) {
   // Calculate size of ListServiceResponse
   size_t list_resp_inner = 0;
   for (size_t i = 0; i < nb_services; i++) {
-    size_t nlen = strlen(services[i]);
+    size_t nlen = services[i].len;
     // ServiceResponse: field 1 (string name), tag 0x0A, varint(nlen), nlen
     size_t s_size = 1 + varint_size(nlen) + nlen;
     // ListServiceResponse.service: tag 0x0A, varint(s_size), s_size
@@ -228,7 +217,7 @@ static uint8_t *build_list_services_response(const char services[][MAX_SYMBOL_LE
   off += write_varint(buf + off, list_resp_inner);
 
   for (size_t i = 0; i < nb_services; i++) {
-    size_t nlen = strlen(services[i]);
+    size_t nlen = services[i].len;
     size_t s_size = 1 + varint_size(nlen) + nlen;
 
     buf[off++] = (1 << 3) | 2; // 0x0A
@@ -236,7 +225,7 @@ static uint8_t *build_list_services_response(const char services[][MAX_SYMBOL_LE
 
     buf[off++] = (1 << 3) | 2; // 0x0A
     off += write_varint(buf + off, nlen);
-    memcpy(buf + off, services[i], nlen);
+    memcpy(buf + off, services[i].name, nlen);
     off += nlen;
   }
 
@@ -244,13 +233,14 @@ static uint8_t *build_list_services_response(const char services[][MAX_SYMBOL_LE
   return buf;
 }
 
-/* True when a registered key answers a query: the query equals the key, or names something
- * inside it ("pkg.Service" answers "pkg.Service.Method"). An empty query matches nothing. */
-static bool key_matches(const char *key, const char *query) {
+/* True when a registered key answers the query (qlen bytes, not NUL-terminated): the query
+ * equals the key, or names something inside it ("pkg.Service" answers "pkg.Service.Method"). An
+ * empty query matches nothing. */
+static bool key_matches(const char *key, const char *query, size_t qlen) {
   size_t klen = strlen(key);
-  if (query[0] == '\0' || klen == 0 || strncmp(key, query, klen) != 0)
+  if (qlen == 0 || klen == 0 || qlen < klen || memcmp(key, query, klen) != 0)
     return false;
-  return query[klen] == '\0' || query[klen] == '.';
+  return qlen == klen || query[klen] == '.';
 }
 
 /* Builds a ServerReflectionResponse with original_request (field 2) echoing the request and
@@ -299,7 +289,8 @@ static void reflection_on_message(grpc_call *call, const grpc_message *in_msg, v
   size_t req_len = in_msg->len;
 
   bool is_list_services = false;
-  char queried_symbol[MAX_SYMBOL_LEN] = {};
+  const char *queried_symbol = nullptr; /* points into the request */
+  size_t queried_len = 0;
   bool is_file_query = false;
   /* file_containing_extension (5) / all_extension_numbers_of_type (6): valid, not supported */
   bool is_unsupported = false;
@@ -320,9 +311,8 @@ static void reflection_on_message(grpc_call *call, const grpc_message *in_msg, v
       // file_by_filename (3) or file_containing_symbol (4)
       uint64_t slen = read_varint(req_data, req_len, &seek);
       if (slen <= req_len - seek) {
-        size_t cpy = slen < MAX_SYMBOL_LEN - 1 ? (size_t)slen : MAX_SYMBOL_LEN - 1;
-        memcpy(queried_symbol, req_data + seek, cpy);
-        queried_symbol[cpy] = '\0';
+        queried_symbol = (const char *)req_data + seek;
+        queried_len = (size_t)slen;
       }
       seek = skip_bytes(seek, slen, req_len);
       is_file_query = true;
@@ -351,13 +341,16 @@ static void reflection_on_message(grpc_call *call, const grpc_message *in_msg, v
 
   if (is_list_services || (!is_file_query && req_len <= 2)) {
     // List services request
-    char services[64][MAX_SYMBOL_LEN];
-    size_t nb_services = collect_services(server, services, 64);
-    resp_bytes = build_list_services_response(services, nb_services, req_data, req_len, &resp_len);
+    size_t nb_services = 0;
+    service_name *services = collect_services(server, &nb_services);
+    if (services != nullptr)
+      resp_bytes =
+          build_list_services_response(services, nb_services, req_data, req_len, &resp_len);
+    grpc_free(services);
   } else if (is_file_query) {
     const descriptor_entry *found = nullptr;
     for (size_t i = 0; state != nullptr && i < state->nb_entries; i++) {
-      if (key_matches(state->entries[i].symbol, queried_symbol)) {
+      if (key_matches(state->entries[i].symbol, queried_symbol, queried_len)) {
         found = &state->entries[i];
         break;
       }

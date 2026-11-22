@@ -285,6 +285,7 @@ int main(int argc, char *argv[]) {
 #endif
 
   /* every server binds the same port, SO_REUSEPORT spreads the connections */
+  config.reuse_port = nb_threads > 1;
   for (; g_nb_servers < nb_threads; g_nb_servers++) {
     g_servers[g_nb_servers] = grpc_server_new(&config);
     if (g_servers[g_nb_servers] == nullptr) {

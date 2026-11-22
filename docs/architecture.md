@@ -14,7 +14,7 @@ Each `grpc_server` owns one libuv event loop driven by `grpc_server_run()` or `g
 
 ### Option 1: Multi-Loop (`SO_REUSEPORT`, Unix)
 
-Create one `grpc_server` per thread bound to the same port. On Unix, listening sockets enable `SO_REUSEPORT` so the kernel distributes incoming connections across event loops with zero lock contention. The HTTP/3 (QUIC) UDP sockets do the same; see [HTTP/3](http3.md) for the one caveat (NAT rebinding).
+Create one `grpc_server` per thread bound to the same port, each with `grpc_config.reuse_port = true`. On Unix, the listening sockets then enable `SO_REUSEPORT` so the kernel distributes incoming connections across event loops with zero lock contention. The HTTP/3 (QUIC) UDP sockets do the same; see [HTTP/3](http3.md) for the one caveat (NAT rebinding). Without `reuse_port` (the default) a port that is already in use makes `grpc_server_new()` fail.
 
 ### Option 2: Worker Thread Pool (Unix & Windows)
 

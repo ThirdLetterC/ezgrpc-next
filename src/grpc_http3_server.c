@@ -67,6 +67,9 @@ enum { H3_CHUNK = 16384 };
 enum { H3_MAX_UDP_PAYLOAD = 1452 };
 /* How long a Retry token stays valid. */
 #define H3_RETRY_TOKEN_TIMEOUT (10 * NGTCP2_SECONDS)
+/* A connection that has not completed its handshake by then is dropped, so unanswered Initials
+ * (possibly from spoofed addresses) do not hold a connection slot for the whole idle timeout. */
+#define H3_HANDSHAKE_TIMEOUT (10 * NGTCP2_SECONDS)
 
 typedef struct grpc_quic_conn grpc_quic_conn;
 
@@ -91,9 +94,12 @@ typedef struct grpc_h3_server {
   uint16_t port;
   bool accepting;
 
-  grpc_quic_tls_ctx *tls_ctx;
-  grpc_quic_tls_ctx **retired_tls;
-  size_t nb_retired_tls;
+  /* the active QUIC TLS context and replaced ones still used by live connections */
+  tls_ctx_pool tls_pool;
+
+  /* Connections whose client address is not validated yet (no Retry token, handshake not
+   * complete). Above half the free connection slots, new clients must answer a Retry first. */
+  size_t nb_unvalidated;
 
   /* Secret for stateless reset and Retry tokens, random per server. */
   uint8_t secret[32];
@@ -125,6 +131,12 @@ struct grpc_quic_conn {
   ngtcp2_cid *cids;
   size_t nb_cids;
   size_t cap_cids;
+  /* the HTTP/3 GOAWAY went out (h3_goaway() sends it once) */
+  bool goaway_sent;
+  /* counted in h3s->nb_unvalidated until the handshake completes or the connection closes */
+  bool unvalidated;
+  /* the QUIC TLS context `tls` was created from (released to h3s->tls_pool) */
+  void *tls_ctx_used;
 };
 
 /* Per-stream transport state (grpc_stream.transport). */
@@ -241,6 +253,27 @@ static void udp_send(grpc_server *server, uv_udp_t *udp, const struct sockaddr *
     atomic_fetch_add(&server->stat_bytes_sent, (uint64_t)len);
   else
     LOG_DEBUG(server, "http3: udp send: %s\n", uv_strerror(rv));
+}
+
+/* Sends a packet ngtcp2 wrote for `path` (the path it chose, which changes when the client's
+ * address does, e.g. after NAT rebinding): to the path's remote address, from the socket of the
+ * path's local address family. The connection remembers the latest remote address for its
+ * CONNECTION_CLOSE. */
+static void qc_send(grpc_quic_conn *qc, const ngtcp2_path *path, const uint8_t *data, size_t len) {
+  grpc_h3_server *h3s = qc->h3s;
+  if (path != nullptr && path->remote.addrlen > 0 &&
+      (size_t)path->remote.addrlen <= sizeof(qc->remote)) {
+    memcpy(&qc->remote, path->remote.addr, (size_t)path->remote.addrlen);
+    qc->remotelen = (socklen_t)path->remote.addrlen;
+  }
+  uv_udp_t *udp = qc->udp;
+  if (path != nullptr && path->local.addrlen > 0) {
+    if (path->local.addr->sa_family == AF_INET6 && h3s->udp6_active)
+      udp = &h3s->udp6;
+    else if (path->local.addr->sa_family == AF_INET && h3s->udp4_active)
+      udp = &h3s->udp4;
+  }
+  udp_send(h3s->server, udp, (const struct sockaddr *)&qc->remote, data, len);
 }
 
 /* ---- per-stream state ---- */
@@ -460,16 +493,14 @@ static int h3_on_end_stream(nghttp3_conn *conn, int64_t stream_id, void *conn_us
   return 0;
 }
 
-/* nghttp3 stream_close: the request stream is gone; detaches its call and frees it. A finished
- * client stream also makes room for one more. */
+/* nghttp3 stream_close: the request stream is gone; detaches its call and frees it. (The stream
+ * credit is returned in cb_stream_close(), which also sees streams nghttp3 never knew.) */
 static int h3_on_stream_close(nghttp3_conn *conn, int64_t stream_id, uint64_t app_error_code,
                               void *conn_user_data, void *stream_user_data) {
   (void)conn;
   (void)app_error_code;
   grpc_quic_conn *qc = conn_user_data;
   grpc_stream *stream = stream_user_data;
-  if (ngtcp2_is_bidi_stream(stream_id))
-    ngtcp2_conn_extend_max_streams_bidi(qc->conn, 1);
   if (stream != nullptr) {
     h3_stream_free(stream);
     stream_core_on_close(qc->session, stream);
@@ -568,12 +599,15 @@ static int cb_acked_stream_data_offset(ngtcp2_conn *conn, int64_t stream_id, uin
   return 0;
 }
 
-/* ngtcp2 stream_close: forwards to nghttp3 (which calls h3_on_stream_close). */
+/* ngtcp2 stream_close: a finished client request stream makes room for one more (also one that
+ * was reset before nghttp3 saw any of it, or the credit would be lost for good), then the close
+ * is forwarded to nghttp3, which calls h3_on_stream_close(). */
 static int cb_stream_close(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
                            uint64_t app_error_code, void *user_data, void *stream_user_data) {
-  (void)conn;
   (void)stream_user_data;
   grpc_quic_conn *qc = user_data;
+  if (ngtcp2_is_bidi_stream(stream_id) && !ngtcp2_conn_is_local_stream(conn, stream_id))
+    ngtcp2_conn_extend_max_streams_bidi(conn, 1);
   if (qc->h3 == nullptr)
     return 0;
   if (!(flags & NGTCP2_STREAM_CLOSE_FLAG_APP_ERROR_CODE_SET))
@@ -640,6 +674,10 @@ static int cb_handshake_completed(ngtcp2_conn *conn, void *user_data) {
   (void)conn;
   grpc_quic_conn *qc = user_data;
   qc->session->tls_handshake_done = true;
+  if (qc->unvalidated) {
+    qc->unvalidated = false;
+    qc->h3s->nb_unvalidated--;
+  }
   if (quic_tls_peer_subject(qc->tls, qc->session->peer_cert_subject,
                             sizeof(qc->session->peer_cert_subject)) != 0)
     qc->session->peer_cert_subject[0] = '\0';
@@ -724,6 +762,10 @@ static void h3_session_close(grpc_session *session) {
   grpc_quic_conn *qc = session->quic;
   session->is_closing = true;
   LOG_DEBUG(session->server, "http3: closing connection from %s\n", session->peer);
+  if (qc->unvalidated) {
+    qc->unvalidated = false;
+    qc->h3s->nb_unvalidated--;
+  }
 
   if (qc->conn != nullptr && qc->ccerr.type != NGTCP2_CCERR_TYPE_IDLE_CLOSE &&
       !ngtcp2_conn_in_draining_period(qc->conn) && !ngtcp2_conn_in_closing_period(qc->conn)) {
@@ -733,8 +775,7 @@ static void h3_session_close(grpc_session *session) {
     ngtcp2_ssize n = ngtcp2_conn_write_connection_close(
         qc->conn, &ps.path, &pi, qc->h3s->sbuf, sizeof(qc->h3s->sbuf), &qc->ccerr, h3_now());
     if (n > 0)
-      udp_send(session->server, qc->udp, (const struct sockaddr *)&qc->remote, qc->h3s->sbuf,
-               (size_t)n);
+      qc_send(qc, &ps.path, qc->h3s->sbuf, (size_t)n);
   }
 
   while (qc->nb_cids > 0)
@@ -757,6 +798,8 @@ static void h3_session_close(grpc_session *session) {
   qc->conn = nullptr;
   quic_tls_session_free(qc->tls);
   qc->tls = nullptr;
+  tls_ctx_pool_release(&qc->h3s->tls_pool, qc->tls_ctx_used);
+  qc->tls_ctx_used = nullptr;
 
   uv_timer_stop(&qc->timer);
   uv_close((uv_handle_t *)&qc->timer, on_qc_timer_closed);
@@ -816,7 +859,7 @@ static void h3_session_flush(grpc_session *session) {
       goto fail;
     if (nwrite == 0)
       break;
-    udp_send(session->server, qc->udp, (const struct sockaddr *)&qc->remote, buf, (size_t)nwrite);
+    qc_send(qc, &ps.path, buf, (size_t)nwrite);
   }
   ngtcp2_conn_update_pkt_tx_time(qc->conn, ts);
   qc_arm_timer(qc);
@@ -903,6 +946,7 @@ static grpc_quic_conn *qc_new(grpc_h3_server *h3s, uv_udp_t *udp, const struct s
   ngtcp2_settings_default(&settings);
   settings.initial_ts = h3_now();
   settings.max_tx_udp_payload_size = H3_MAX_UDP_PAYLOAD;
+  settings.handshake_timeout = H3_HANDSHAKE_TIMEOUT;
   if (hd->tokenlen > 0) {
     settings.token = hd->token;
     settings.tokenlen = hd->tokenlen;
@@ -943,7 +987,8 @@ static grpc_quic_conn *qc_new(grpc_h3_server *h3s, uv_udp_t *udp, const struct s
                              &params, &quic_mem, qc) != 0)
     goto fail;
   qc->conn_ref = (ngtcp2_crypto_conn_ref){.get_conn = get_conn, .user_data = qc};
-  qc->tls = quic_tls_session_new(h3s->tls_ctx, &qc->conn_ref, true, nullptr);
+  qc->tls_ctx_used = tls_ctx_pool_acquire(&h3s->tls_pool);
+  qc->tls = quic_tls_session_new(qc->tls_ctx_used, &qc->conn_ref, true, nullptr);
   if (qc->tls == nullptr)
     goto fail;
   ngtcp2_conn_set_tls_native_handle(qc->conn, quic_tls_session_native(qc->tls));
@@ -953,6 +998,10 @@ static grpc_quic_conn *qc_new(grpc_h3_server *h3s, uv_udp_t *udp, const struct s
   /* retransmitted Initials still carry the client-chosen DCID */
   if (cid_add(qc, &scid) != 0 || cid_add(qc, &hd->dcid) != 0)
     goto fail;
+  if (odcid == nullptr) { /* no Retry: the address is unproven until the handshake completes */
+    qc->unvalidated = true;
+    h3s->nb_unvalidated++;
+  }
   LOG_DEBUG(server, "http3: connection from %s\n", session->peer);
   return qc;
 
@@ -996,9 +1045,11 @@ static void send_retry(grpc_h3_server *h3s, uv_udp_t *udp, const struct sockaddr
     udp_send(h3s->server, udp, to, h3s->sbuf, (size_t)n);
 }
 
-/* Handles a packet for no known connection: version negotiation, then (with require_retry) the
- * Retry exchange, then a new connection. Returns the connection to feed the packet to, or
- * nullptr to drop it. */
+/* Handles a packet for no known connection: version negotiation, then the Retry exchange, then a
+ * new connection. A Retry is required with http3.require_retry, and also whenever unvalidated
+ * connections already hold half of the free connection slots (so a flood of spoofed Initials
+ * cannot lock TCP and QUIC clients out). Returns the connection to feed the packet to, or nullptr
+ * to drop it. */
 static grpc_quic_conn *accept_packet(grpc_h3_server *h3s, uv_udp_t *udp, const uint8_t *data,
                                      size_t len, const struct sockaddr *from, socklen_t fromlen) {
   if (!h3s->accepting)
@@ -1007,21 +1058,21 @@ static grpc_quic_conn *accept_packet(grpc_h3_server *h3s, uv_udp_t *udp, const u
   if (ngtcp2_accept(&hd, data, len) != 0)
     return nullptr;
   ngtcp2_cid odcid;
-  bool retried = false;
-  if (h3s->server->config.http3.require_retry) {
-    if (hd.tokenlen == 0) {
+  bool retried = hd.tokenlen > 0 &&
+                 ngtcp2_crypto_verify_retry_token2(&odcid, hd.token, hd.tokenlen, h3s->secret,
+                                                   sizeof(h3s->secret), hd.version,
+                                                   (const ngtcp2_sockaddr *)from, fromlen, &hd.dcid,
+                                                   H3_RETRY_TOKEN_TIMEOUT, h3_now()) == 0;
+  if (!retried) {
+    bool require_retry = h3s->server->config.http3.require_retry;
+    if (require_retry && hd.tokenlen > 0)
+      return nullptr; /* an invalid or expired token */
+    hd.token = nullptr;
+    hd.tokenlen = 0;
+    if (require_retry || h3s->nb_unvalidated >= h3s->server->nb_free_sessions / 2) {
       send_retry(h3s, udp, from, fromlen, &hd);
       return nullptr;
     }
-    if (ngtcp2_crypto_verify_retry_token2(&odcid, hd.token, hd.tokenlen, h3s->secret,
-                                          sizeof(h3s->secret), hd.version,
-                                          (const ngtcp2_sockaddr *)from, fromlen, &hd.dcid,
-                                          H3_RETRY_TOKEN_TIMEOUT, h3_now()) != 0)
-      return nullptr;
-    retried = true;
-  } else {
-    hd.token = nullptr;
-    hd.tokenlen = 0;
   }
   return qc_new(h3s, udp, from, fromlen, &hd, retried ? &odcid : nullptr);
 }
@@ -1067,8 +1118,11 @@ static void on_udp_read(uv_udp_t *udp, ssize_t nread, const uv_buf_t *buf,
   if (qc->session->is_closing || qc->conn == nullptr)
     return;
 
+  /* the local side is the socket the datagram actually arrived on */
+  bool on_v6 = udp == &h3s->udp6;
   ngtcp2_path path = {
-      .local = {.addr = (ngtcp2_sockaddr *)&qc->local, .addrlen = qc->locallen},
+      .local = {.addr = (ngtcp2_sockaddr *)(on_v6 ? &h3s->local6 : &h3s->local4),
+                .addrlen = on_v6 ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in)},
       .remote = {.addr = (ngtcp2_sockaddr *)addr, .addrlen = addrlen},
   };
   ngtcp2_pkt_info pi = {0};
@@ -1191,11 +1245,22 @@ static void h3_hdr_decref(void *ref) {
   nghttp3_rcbuf_decref(ref);
 }
 
-/* goaway op: HTTP/3 GOAWAY naming the last accepted request stream. */
+/* goaway op: HTTP/3 GOAWAY naming the last accepted request stream. Sent once per connection:
+ * nghttp3 asserts on a second shutdown (whose stream id would be larger, which the protocol
+ * forbids). */
 static void h3_goaway(grpc_session *session) {
   grpc_quic_conn *qc = session->quic;
-  if (qc->h3 != nullptr)
+  if (qc->h3 != nullptr && !qc->goaway_sent) {
+    qc->goaway_sent = true;
     (void)nghttp3_conn_shutdown(qc->h3);
+  }
+}
+
+/* shutdown_notice op: nghttp3's GOAWAY with the largest stream id; h3_goaway() follows. */
+static void h3_shutdown_notice(grpc_session *session) {
+  grpc_quic_conn *qc = session->quic;
+  if (qc->h3 != nullptr && !qc->goaway_sent)
+    (void)nghttp3_conn_submit_shutdown_notice(qc->h3);
 }
 
 const grpc_transport_ops grpc_h3_transport_ops = {
@@ -1207,12 +1272,17 @@ const grpc_transport_ops grpc_h3_transport_ops = {
     .hdr_incref = h3_hdr_incref,
     .hdr_decref = h3_hdr_decref,
     .goaway = h3_goaway,
+    .shutdown_notice = h3_shutdown_notice,
     .ping = nullptr, /* QUIC keepalive: ngtcp2_conn_set_keep_alive_timeout() */
     .flush = h3_session_flush,
     .close = h3_session_close,
 };
 
 /* ---- server lifecycle ---- */
+
+static void free_quic_ctx(void *ctx) {
+  quic_tls_ctx_free(ctx);
+}
 
 /* Binds a UDP socket for `family` at `addr`:port and starts reading. Records the bound address
  * (and the port, when it was 0). Returns 0 or a libuv error. */
@@ -1227,14 +1297,17 @@ static int open_udp(grpc_h3_server *h3s, uv_udp_t *udp, struct sockaddr_storage 
   if ((rv = uv_udp_init_ex(&server->loop, udp, (unsigned)family)) != 0)
     return rv;
   udp->data = h3s;
+  bool reuse = server->config.reuse_port;
 #if defined(SO_REUSEPORT) && !defined(_WIN32)
-  /* like the TCP listeners: one server per thread can share the port. The kernel spreads datagrams
-   * by address 4-tuple, so a connection stays on one loop (migration is disabled) */
+  /* like the TCP listeners, with config.reuse_port: one server per thread can share the port.
+   * The kernel spreads datagrams by address 4-tuple, so a connection stays on one loop */
   uv_os_fd_t fd;
-  if (uv_fileno((uv_handle_t *)udp, &fd) == 0)
+  if (reuse && uv_fileno((uv_handle_t *)udp, &fd) == 0)
     (void)setsockopt((int)fd, SOL_SOCKET, SO_REUSEPORT, &(int){1}, sizeof(int));
 #endif
-  unsigned flags = UV_UDP_REUSEADDR | (family == AF_INET6 ? UV_UDP_IPV6ONLY : 0);
+  /* without reuse_port no other socket may hold the port (UV_UDP_REUSEADDR would allow that for
+   * UDP), so a port already in use fails to bind */
+  unsigned flags = (reuse ? UV_UDP_REUSEADDR : 0) | (family == AF_INET6 ? UV_UDP_IPV6ONLY : 0);
   if ((rv = uv_udp_bind(udp, (const struct sockaddr *)&ss, flags)) != 0)
     return rv;
   int namelen = sizeof(*local);
@@ -1262,11 +1335,12 @@ grpc_err http3_server_start(grpc_server *server, const grpc_tls_config *tls) {
   server->h3 = h3s;
   h3_random(h3s->secret, sizeof(h3s->secret));
 
-  h3s->tls_ctx = quic_tls_server_ctx_new(tls);
-  if (h3s->tls_ctx == nullptr) {
+  grpc_quic_tls_ctx *tls_ctx = quic_tls_server_ctx_new(tls);
+  if (tls_ctx == nullptr) {
     LOG_ERROR(server, "http3: cannot load the TLS configuration for QUIC\n");
     return GRPC_ERR_INVALID;
   }
+  tls_ctx_pool_install(&h3s->tls_pool, tls_ctx, free_quic_ctx);
 
   uint16_t port = server->config.http3.port ? server->config.http3.port : server->config.port;
   int rv;
@@ -1321,33 +1395,36 @@ void http3_server_free(grpc_server *server) {
       grpc_free(e);
     }
   }
-  if (h3s->tls_ctx != nullptr)
-    quic_tls_ctx_free(h3s->tls_ctx);
-  for (size_t i = 0; i < h3s->nb_retired_tls; i++)
-    quic_tls_ctx_free(h3s->retired_tls[i]);
-  grpc_free(h3s->retired_tls);
+  tls_ctx_pool_free(&h3s->tls_pool);
   grpc_free(h3s);
   server->h3 = nullptr;
 }
 
-grpc_err http3_server_reload_tls(grpc_server *server, const grpc_tls_config *cfg) {
+grpc_err http3_server_tls_prepare(grpc_server *server, const grpc_tls_config *cfg, void **out) {
+  *out = nullptr;
   grpc_h3_server *h3s = server->h3;
   if (h3s == nullptr)
     return GRPC_OK;
-  grpc_quic_tls_ctx *ctx = quic_tls_server_ctx_new(cfg);
-  if (ctx == nullptr)
-    return GRPC_ERR_INVALID;
-  /* keep the old context for the connections created from it (not every backend refcounts) */
-  grpc_quic_tls_ctx **retired =
-      grpc_realloc(h3s->retired_tls, (h3s->nb_retired_tls + 1) * sizeof(*retired));
-  if (retired == nullptr) {
-    quic_tls_ctx_free(ctx);
+  if (tls_ctx_pool_reserve(&h3s->tls_pool) != GRPC_OK)
     return GRPC_ERR_NOMEM;
+  grpc_quic_tls_ctx *ctx = quic_tls_server_ctx_new(cfg);
+  if (ctx == nullptr) {
+    LOG_ERROR(server, "http3: cannot load the TLS configuration for QUIC\n");
+    return GRPC_ERR_INVALID;
   }
-  h3s->retired_tls = retired;
-  h3s->retired_tls[h3s->nb_retired_tls++] = h3s->tls_ctx;
-  h3s->tls_ctx = ctx;
+  *out = ctx;
   return GRPC_OK;
+}
+
+void http3_server_tls_install(grpc_server *server, void *ctx) {
+  if (server->h3 != nullptr && ctx != nullptr)
+    tls_ctx_pool_install(&server->h3->tls_pool, ctx, free_quic_ctx);
+}
+
+void http3_server_tls_discard(grpc_server *server, void *ctx) {
+  (void)server;
+  if (ctx != nullptr)
+    quic_tls_ctx_free(ctx);
 }
 
 uint16_t http3_server_port(const grpc_server *server) {

@@ -96,9 +96,15 @@ static int h2_submit_trailers(grpc_session *session, grpc_stream *stream, const 
 
 /* reset_stream op: RST_STREAM with PROTOCOL_ERROR or INTERNAL_ERROR. */
 static void h2_reset_stream(grpc_session *session, grpc_stream *stream, grpc_reset_reason reason) {
-  (void)nghttp2_submit_rst_stream(session->ngsession, NGHTTP2_FLAG_NONE, (i32)stream->stream_id,
-                                  reason == GRPC_RESET_PROTOCOL_ERROR ? NGHTTP2_PROTOCOL_ERROR
-                                                                      : NGHTTP2_INTERNAL_ERROR);
+  if (nghttp2_submit_rst_stream(session->ngsession, NGHTTP2_FLAG_NONE, (i32)stream->stream_id,
+                                reason == GRPC_RESET_PROTOCOL_ERROR
+                                    ? NGHTTP2_PROTOCOL_ERROR
+                                    : NGHTTP2_INTERNAL_ERROR) != 0) {
+    /* not even the reset could be queued (out of memory): drop the connection at the next flush
+     * (not now: the caller may be a handler still using this stream's call) */
+    session->close_on_flush = true;
+    session_schedule_flush(session);
+  }
 }
 
 /* hdr_incref / hdr_decref ops over nghttp2_rcbuf. */
@@ -122,6 +128,13 @@ static int h2_ping(grpc_session *session) {
   return nghttp2_submit_ping(session->ngsession, NGHTTP2_FLAG_NONE, ping_data) == 0 ? 0 : -1;
 }
 
+/* shutdown_notice op: GOAWAY with the largest stream id (nghttp2_submit_shutdown_notice()) and
+ * a PING to time the final GOAWAY by. */
+static void h2_shutdown_notice(grpc_session *session) {
+  if (nghttp2_submit_shutdown_notice(session->ngsession) == 0 && h2_ping(session) == 0)
+    session->ping_pending = true;
+}
+
 const grpc_transport_ops grpc_h2_transport_ops = {
     .name = "h2",
     .submit_headers = h2_submit_headers,
@@ -131,6 +144,7 @@ const grpc_transport_ops grpc_h2_transport_ops = {
     .hdr_incref = h2_hdr_incref,
     .hdr_decref = h2_hdr_decref,
     .goaway = h2_goaway,
+    .shutdown_notice = h2_shutdown_notice,
     .ping = h2_ping,
     /* flush and close: the TCP implementation in internal_helpers.c */
 };
@@ -144,6 +158,9 @@ const grpc_transport_ops grpc_h2_transport_ops = {
 static int on_begin_headers_callback(nghttp2_session *session, const nghttp2_frame *frame,
                                      void *user_data) {
   grpc_session *ezsession = user_data;
+  /* nghttp2 also calls this for a trailing HEADERS block: that belongs to the existing stream */
+  if (frame->hd.type != NGHTTP2_HEADERS || frame->headers.cat != NGHTTP2_HCAT_REQUEST)
+    return 0;
   grpc_stream *ezstream = stream_new(frame->hd.stream_id, &grpc_h2_transport_ops);
   if (ezstream == nullptr)
     return NGHTTP2_ERR_CALLBACK_FAILURE;
@@ -167,7 +184,9 @@ static int on_header_callback2([[maybe_unused]] nghttp2_session *session,
   grpc_session *ezsession = user_data;
   grpc_stream *ezstream =
       nghttp2_session_get_stream_user_data(ezsession->ngsession, frame->hd.stream_id);
-  if (frame->hd.type != NGHTTP2_HEADERS || ezstream == nullptr)
+  /* request trailers carry nothing gRPC uses: only the request header block is recorded */
+  if (frame->hd.type != NGHTTP2_HEADERS || frame->headers.cat != NGHTTP2_HCAT_REQUEST ||
+      ezstream == nullptr)
     return 0;
   nghttp2_vec vname = nghttp2_rcbuf_get_buf(name_rcbuf);
   nghttp2_vec vvalue = nghttp2_rcbuf_get_buf(value_rcbuf);
@@ -177,13 +196,19 @@ static int on_header_callback2([[maybe_unused]] nghttp2_session *session,
   return 0;
 }
 
-/* Handles a complete request HEADERS frame (END_HEADERS set) with stream_core_on_headers_end().
- * Always returns 0. */
+/* Handles a complete HEADERS block: the request headers go to stream_core_on_headers_end(); a
+ * trailing block (request trailers, always with END_STREAM) ends the request body like a final
+ * empty DATA frame would. Always returns 0. */
 static inline int on_frame_recv_headers(grpc_session *ezsession, const nghttp2_frame *frame) {
   grpc_stream *ezstream =
       nghttp2_session_get_stream_user_data(ezsession->ngsession, frame->hd.stream_id);
   if (ezstream == nullptr || !(frame->hd.flags & NGHTTP2_FLAG_END_HEADERS))
     return 0;
+  if (frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
+    if (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)
+      stream_core_on_data_end(ezsession, ezstream, true);
+    return 0;
+  }
   stream_core_on_headers_end(ezsession, ezstream, frame->hd.flags & NGHTTP2_FLAG_END_STREAM);
   return 0;
 }
@@ -217,13 +242,21 @@ static inline int on_frame_recv_data(grpc_session *ezsession, const nghttp2_fram
   return 0;
 }
 
-/* nghttp2 frame-sent callback, invoked after a frame has been serialized for sending. Only logs
- * the frame (compiled in with GRPC_TRACE). Returns 0. */
-static int on_frame_send_callback([[maybe_unused]] nghttp2_session *session,
-                                  const nghttp2_frame *frame, [[maybe_unused]] void *user_data) {
+/* nghttp2 frame-sent callback, invoked after a frame has been serialized for sending. Logs the
+ * frame (compiled in with GRPC_TRACE). When the response ended (END_STREAM on trailers, or on
+ * the last DATA frame for gRPC-Web) while the client is still sending its request, resets the
+ * stream with NO_ERROR, as gRPC servers do, so the client stops sending a request that will
+ * never be read. Returns 0. */
+static int on_frame_send_callback(nghttp2_session *session, const nghttp2_frame *frame,
+                                  [[maybe_unused]] void *user_data) {
 #ifdef GRPC_TRACE
   grpc_session *ezsession = user_data;
 #endif
+  if ((frame->hd.type == NGHTTP2_HEADERS || frame->hd.type == NGHTTP2_DATA) &&
+      (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) &&
+      nghttp2_session_get_stream_remote_close(session, frame->hd.stream_id) == 0)
+    (void)nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE, frame->hd.stream_id,
+                                    NGHTTP2_NO_ERROR);
 
   switch (frame->hd.type) {
   case NGHTTP2_SETTINGS:

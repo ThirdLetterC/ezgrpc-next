@@ -271,6 +271,101 @@ void test_message_all_codecs_and_errors(void) {
   grpc_message_free(orig);
 }
 
+#if defined(GRPC_ENABLE_ZLIB)
+/* Bytes after the end of a gzip/deflate stream: more gzip members are decoded (RFC 1952), anything
+ * else is rejected. */
+void test_zlib_trailing_data_and_gzip_members(void) {
+  uint8_t *a = nullptr, *b = nullptr, *out = nullptr;
+  size_t alen = 0, blen = 0, out_len = 0;
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_compress(GRPC_COMPRESS_GZIP, GRPC_COMPRESSION_LEVEL_DEFAULT,
+                                               (const uint8_t *)"first-", 6, &a, &alen));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_compress(GRPC_COMPRESS_GZIP, GRPC_COMPRESSION_LEVEL_DEFAULT,
+                                               (const uint8_t *)"second", 6, &b, &blen));
+  uint8_t *both = grpc_malloc(alen + blen + 4);
+  TEST_ASSERT_NOT_NULL(both);
+  memcpy(both, a, alen);
+  memcpy(both + alen, b, blen);
+  /* two members decode to both payloads */
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_decompress_limited(GRPC_COMPRESS_GZIP, both, alen + blen,
+                                                         &out, &out_len, 1024));
+  TEST_ASSERT_EQUAL_UINT64(12, out_len);
+  TEST_ASSERT_EQUAL_MEMORY("first-second", out, 12);
+  grpc_free(out);
+  out = nullptr;
+  /* the limit covers all members together */
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_LIMIT, grpc_decompress_limited(GRPC_COMPRESS_GZIP, both,
+                                                                alen + blen, &out, &out_len, 8));
+  /* garbage after a member is an error, not ignored */
+  memcpy(both + alen, "XYZW", 4);
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_CODEC, grpc_decompress_limited(GRPC_COMPRESS_GZIP, both, alen + 4,
+                                                                &out, &out_len, 1024));
+  grpc_free(a);
+  grpc_free(b);
+  /* a zlib (deflate) stream has a single member: trailing bytes are an error */
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_compress(GRPC_COMPRESS_DEFLATE, GRPC_COMPRESSION_LEVEL_DEFAULT,
+                                      (const uint8_t *)"only", 4, &a, &alen));
+  memcpy(both, a, alen);
+  memcpy(both + alen, "XY", 2);
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_CODEC, grpc_decompress_limited(GRPC_COMPRESS_DEFLATE, both,
+                                                                alen + 2, &out, &out_len, 1024));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_decompress_limited(GRPC_COMPRESS_DEFLATE, both, alen, &out, &out_len, 1024));
+  TEST_ASSERT_EQUAL_MEMORY("only", out, 4);
+  grpc_free(out);
+  grpc_free(a);
+  grpc_free(both);
+}
+#endif
+
+#if defined(GRPC_ENABLE_ZSTD)
+/* A zstd frame without a content size whose header asks for a 2^window_log window, holding one
+ * raw block with the byte 'A'. */
+static void zstd_frame(uint8_t out[10], int window_log) {
+  const uint8_t frame[10] = {0x28,
+                             0xB5,
+                             0x2F,
+                             0xFD,                              /* magic */
+                             0x00,                              /* no content size, no checksum */
+                             (uint8_t)((window_log - 10) << 3), /* window descriptor */
+                             0x09,
+                             0x00,
+                             0x00, /* last block, raw, 1 byte */
+                             'A'};
+  memcpy(out, frame, sizeof(frame));
+}
+
+/* The decoder's window is bounded by the output limit: a 10-byte frame cannot make it allocate a
+ * 128 MiB window whatever max_output is, while ordinary windows still decode. */
+void test_zstd_window_bounded_by_limit(void) {
+  uint8_t frame[10];
+  uint8_t *out = nullptr;
+  size_t out_len = 0;
+  /* the default 2 MiB window of a stream of unknown size decodes under any limit */
+  zstd_frame(frame, 21);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_decompress_limited(GRPC_COMPRESS_ZSTD, frame, sizeof(frame),
+                                                         &out, &out_len, 100));
+  TEST_ASSERT_EQUAL_UINT64(1, out_len);
+  TEST_ASSERT_EQUAL_UINT8('A', out[0]);
+  grpc_free(out);
+  /* a window far beyond the limit is refused before it is allocated */
+  zstd_frame(frame, 27);
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_ERR_LIMIT,
+      grpc_decompress_limited(GRPC_COMPRESS_ZSTD, frame, sizeof(frame), &out, &out_len, 4u << 20));
+  TEST_ASSERT_NULL(out);
+  zstd_frame(frame, 23);
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_ERR_LIMIT,
+      grpc_decompress_limited(GRPC_COMPRESS_ZSTD, frame, sizeof(frame), &out, &out_len, 100));
+  /* a limit that needs the window allows it */
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_decompress_limited(GRPC_COMPRESS_ZSTD, frame, sizeof(frame),
+                                                         &out, &out_len, 8u << 20));
+  TEST_ASSERT_EQUAL_UINT64(1, out_len);
+  grpc_free(out);
+}
+#endif
+
 int main(void) {
   UNITY_BEGIN();
 #if defined(GRPC_ENABLE_ZLIB)
@@ -282,5 +377,11 @@ int main(void) {
   RUN_TEST(test_decompression_limits);
 #endif
   RUN_TEST(test_message_all_codecs_and_errors);
+#if defined(GRPC_ENABLE_ZSTD)
+  RUN_TEST(test_zstd_window_bounded_by_limit);
+#endif
+#if defined(GRPC_ENABLE_ZLIB)
+  RUN_TEST(test_zlib_trailing_data_and_gzip_members);
+#endif
   return UNITY_END();
 }

@@ -7,8 +7,8 @@
  *
  * Server certificates load through tls_wolfssl_load_server_credentials(), shared with the HTTP/2
  * backend in grpc_tls_wolfssl.c. Contexts are TLS 1.3 only with ALPN "h3". wolfSSL objects do not
- * hold a reference on their context, so the server keeps retired contexts until it is freed
- * (http3_server_reload_tls()) and a client frees its context only after its connections.
+ * hold a reference on their context, so the server keeps a replaced context until its last
+ * connection ends (tls_ctx_pool.h) and a client frees its context only after its connections.
  */
 #include <limits.h>
 #include <stdbool.h>
@@ -190,8 +190,17 @@ int quic_tls_peer_subject(grpc_quic_tls_session *session, char *buf, size_t len)
   WOLFSSL_X509 *cert = wolfSSL_get_peer_certificate(session->ssl);
   if (cert == nullptr)
     return -1;
+  /* formatted into one byte more than the caller's buffer: a subject that fills it does not
+   * fit and is not reported at all (a truncated one could match a different, shorter subject) */
   WOLFSSL_X509_NAME *name = wolfSSL_X509_get_subject_name(cert);
-  char *res = name != nullptr ? wolfSSL_X509_NAME_oneline(name, buf, (int)len) : nullptr;
+  int res = -1;
+  char *tmp = len < INT_MAX ? grpc_malloc(len + 1) : nullptr;
+  if (name != nullptr && tmp != nullptr &&
+      wolfSSL_X509_NAME_oneline(name, tmp, (int)(len + 1)) != nullptr && strlen(tmp) < len) {
+    memcpy(buf, tmp, strlen(tmp) + 1);
+    res = 0;
+  }
+  grpc_free(tmp);
   wolfSSL_X509_free(cert);
-  return res != nullptr ? 0 : -1;
+  return res;
 }

@@ -36,6 +36,7 @@
 #include "common.h"
 #include "grpc_header.h"
 #include "grpc_msg_queue.h"
+#include "tls_ctx_pool.h"
 
 /* ---- logging ------------------------------------------------------------- */
 
@@ -145,6 +146,11 @@ struct grpc_transport_ops {
   /* Queue a graceful shutdown notice (HTTP/2 GOAWAY NO_ERROR / HTTP/3 GOAWAY): no new streams,
    * running ones may finish. */
   void (*goaway)(grpc_session *session);
+  /* Queue the first step of a graceful shutdown (gRPC's two-step GOAWAY): a notice that new
+   * streams will soon be refused, without naming the last stream yet, so requests already in
+   * flight are still accepted. HTTP/2 follows it with a PING whose acknowledgment
+   * (ping_pending turning false) shows the client has seen it. goaway() completes it. */
+  void (*shutdown_notice)(grpc_session *session);
   /* Queue a keepalive ping; 0 if one was queued. nullptr when the transport keeps the
    * connection alive by itself (QUIC). */
   int (*ping)(grpc_session *session);
@@ -184,7 +190,8 @@ struct grpc_call {
 
   /* Header views and transport buffer refs retained for the call lifetime. */
   grpc_header req_headers[CONFIG_STREAM_MAX_HEADERS];
-  void *req_header_refs[CONFIG_STREAM_MAX_HEADERS][2];
+  /* one block holding every name and value of req_headers (NUL-terminated copies) */
+  char *req_header_data;
   size_t nb_req_headers;
 
   /* Received messages not yet delivered to the application. */
@@ -277,6 +284,10 @@ struct grpc_stream {
   size_t hpath_len;
   const char *hgrpc_encoding;
   grpc_compression_algorithm grpc_encoding;
+  /* grpc-encoding names a codec this build cannot decode: compressed messages get UNIMPLEMENTED */
+  bool grpc_encoding_unsupported;
+  /* request messages parsed so far (a unary request may have only one) */
+  size_t nb_recv_messages;
   const char *hgrpc_accept_encoding;
   const char *hgrpc_timeout;
 
@@ -330,6 +341,8 @@ struct grpc_session {
   size_t nb_streams;
 
   struct grpc_tls_session *tls;
+  /* the server TLS context `tls` was created from (released to server->tls_pool) */
+  void *tls_ctx_used;
   bool is_tls : 1;
   bool tls_handshake_done : 1;
 
@@ -349,6 +362,8 @@ struct grpc_session {
   u64 last_activity_ms;
   u64 ping_sent_ms;
   u64 last_client_ping_ms;
+  /* when the connection last had no stream left (max_connection_idle_ms counts from here) */
+  u64 idle_since_ms;
   u64 goaway_sent_ms;
   uint32_t ping_strikes;
   bool ping_pending : 1;
@@ -368,6 +383,9 @@ struct grpc_session {
   grpc_session *flush_next;
   /* Output stopped because a buffer could not grow; server->flush_retry_timer flushes it again. */
   bool is_flush_blocked : 1;
+  /* a stream could not be reset for lack of memory: the next flush closes the connection, so its
+   * client does not wait for a response that will never come */
+  bool close_on_flush : 1;
 };
 
 /* ---- the server ------------------------------------------------------------ */
@@ -428,10 +446,14 @@ struct grpc_server {
   bool ipv4_listener_active : 1;
   bool ipv6_listener_active : 1;
   bool unix_listener_active : 1;
+  /* unix_path was bound by this server, so grpc_server_free() removes it */
+  bool unix_bound : 1;
   bool timer_active : 1;
   bool deadline_timer_active : 1;
   bool maintenance_timer_active : 1;
   bool flush_retry_timer_active : 1;
+  /* expire_deadlines() is walking the sessions: grpc_server_flush() must not close one now */
+  bool in_deadline_scan : 1;
   bool async_active : 1;
   bool is_tls : 1;
 
@@ -491,9 +513,8 @@ struct grpc_server {
   struct health_state *health;
   struct reflection_state *reflection;
 
-  struct grpc_tls_ctx *tls_ctx;
-  struct grpc_tls_ctx **retired_tls_ctxs;
-  size_t nb_retired_tls_ctxs;
+  /* the active TLS context and replaced ones still used by live connections */
+  tls_ctx_pool tls_pool;
 
   /* HTTP/3 listener state (grpc_http3_server.c), when config.http3.enable. */
   struct grpc_h3_server *h3;
@@ -570,3 +591,12 @@ grpc_message *message_create(u8 cflag, const void *data, size_t len);
  * GRPC_OK, GRPC_ERR_INVALID or GRPC_ERR_NOMEM; on error *out is nullptr. */
 grpc_err base64_decode(const char *in, size_t len, bool concatenated, uint8_t **out,
                        size_t *out_len);
+
+/* True if an application metadata entry may be sent (grpc_metadata.c): a key of lower-case
+ * letters, digits, '-', '_' and '.', not an HTTP connection field, content-type or te (nor, in a
+ * response, grpc-status, grpc-message or the encoding headers, which the library writes); a
+ * value of printable ASCII (0x20-0x7E), or Base64 text for keys ending in
+ * "-bin" (encoded with grpc_metadata_encode_bin()). CR, LF and other control bytes are never
+ * allowed, so a value cannot inject further fields. */
+bool metadata_entry_valid(const char *key, size_t klen, const char *value, size_t vlen,
+                          bool response);

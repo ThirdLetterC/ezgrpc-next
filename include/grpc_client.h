@@ -109,7 +109,10 @@ typedef struct grpc_client_response {
  * ``targets`` it succeeds if at least one target is reachable.
  * Returns nullptr on failure and writes the error code to ``*out_err`` if non-null
  * (GRPC_ERR_INVALID for a bad config, GRPC_ERR_IO when no connection could be made).
- * Release with grpc_client_free().
+ * Release with grpc_client_free(). On POSIX systems, if SIGPIPE still has its
+ * default disposition (which kills the process when writing to a connection
+ * the server closed), it is set to SIG_IGN; a handler the application installed
+ * is kept.
  */
 GRPC_API GRPC_NODISCARD grpc_client *grpc_client_new(const grpc_client_config *config,
                                                      grpc_err *out_err);

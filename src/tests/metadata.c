@@ -158,6 +158,45 @@ void test_metadata_base64_decode_internal(void) {
   TEST_ASSERT_NULL(out);
 }
 
+/* metadata an application may send: no header injection, no reserved names */
+void test_metadata_entry_validation(void) {
+#define OK_MD(k, v, resp) \
+  TEST_ASSERT_TRUE_MESSAGE(metadata_entry_valid(k, strlen(k), v, strlen(v), resp), k)
+#define BAD_MD(k, v, resp) \
+  TEST_ASSERT_FALSE_MESSAGE(metadata_entry_valid(k, strlen(k), v, strlen(v), resp), k)
+  OK_MD("x-trace", "abc 123 !~", true);
+  OK_MD("x.y_z-0", "", true);
+  OK_MD("x-blob-bin", "AAEC/w==", true);
+  OK_MD("grpc-status-details-bin", "CAU=", true); /* rich status details stay allowed */
+  OK_MD("grpc-timeout", "50m", false);            /* requests may set their own deadline */
+  BAD_MD("x-echo", "a\r\ngrpc-status: 0", true);  /* injection attempt */
+  BAD_MD("x-echo", "tab\there", true);
+  BAD_MD("x-echo", "caf\xc3\xa9", true); /* not ASCII */
+  BAD_MD("X-Upper", "v", true);
+  BAD_MD("x key", "v", true);
+  BAD_MD(":path", "/x", false);
+  BAD_MD("", "v", true);
+  BAD_MD("x-blob-bin", "not base64!", true);
+  /* a -bin value must be one well-formed Base64 value, like the decoder accepts */
+  OK_MD("x-blob-bin", "", true);
+  OK_MD("x-blob-bin", "Zg", true);
+  OK_MD("x-blob-bin", "Zm8=", true);
+  BAD_MD("x-blob-bin", "Z", true);        /* a lone final character */
+  BAD_MD("x-blob-bin", "Zg=", true);      /* partial padding */
+  BAD_MD("x-blob-bin", "Zg==Zg==", true); /* data after the padding */
+  BAD_MD("x-blob-bin", "Zm9v=", true);    /* padding after a complete group */
+  BAD_MD("x-blob-bin", "====", true);
+  BAD_MD("content-type", "text/plain", true);
+  BAD_MD("te", "trailers", false);
+  BAD_MD("connection", "close", false);
+  BAD_MD("grpc-status", "0", true);
+  BAD_MD("grpc-message", "ok", true);
+  BAD_MD("grpc-encoding", "gzip", true);
+  TEST_ASSERT_FALSE(metadata_entry_valid(nullptr, 0, "v", 1, true));
+#undef OK_MD
+#undef BAD_MD
+}
+
 void test_metadata_null_handling(void) {
   TEST_ASSERT_NULL(grpc_metadata_encode_bin(nullptr, 0, nullptr));
   TEST_ASSERT_NULL(grpc_metadata_decode_bin(nullptr, 0, nullptr));
@@ -175,6 +214,7 @@ int main(void) {
   RUN_TEST(test_metadata_decode_unpadded);
   RUN_TEST(test_metadata_decode_rejects_malformed);
   RUN_TEST(test_metadata_base64_decode_internal);
+  RUN_TEST(test_metadata_entry_validation);
   RUN_TEST(test_metadata_null_handling);
   return UNITY_END();
 }

@@ -3,9 +3,16 @@
 `ezGRPC-next` includes an HTTP/2 gRPC client (`include/grpc_client.h`) supporting:
 - Unary, server-streaming, client-streaming, and bidirectional streaming RPCs
 - TCP (IPv4, IPv6, hostnames) and Unix Domain Sockets / Windows named pipes
-- Client-side TLS & mTLS (CA file or PEM, SNI, client certificates)
-- Automatic retries with exponential backoff on transient `UNAVAILABLE` / transport failures
-- Round-robin client-side load balancing across multiple targets
+- Client-side TLS & mTLS (CA file or PEM, SNI, client certificates); the server certificate must
+  match the host name (or IP address, or `tls.server_name`) unless `insecure_skip_verify` is set
+- Automatic retries with exponential backoff on transient `UNAVAILABLE` / transport failures, only
+  until the server answers: once response headers or a message arrived the call is not sent again
+- Round-robin client-side load balancing across multiple targets; a connection the server closed
+  (GOAWAY, EOF, an idled-out QUIC connection) is replaced on the next call
+- `max_message_size` limits each received message; `grpc-accept-encoding` lists only the codecs the
+  build has, and a compressed response it cannot decode fails the call with `INTERNAL`
+- On POSIX systems `grpc_client_new()` sets `SIGPIPE` to ignored if it still has its default
+  disposition (an application's own handler is kept)
 
 ## Unary Calls, TLS/mTLS & Retries
 

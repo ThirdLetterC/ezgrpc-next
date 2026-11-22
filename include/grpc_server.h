@@ -64,6 +64,10 @@ typedef struct grpc_config {
   const char *unix_path;
   /** listen() backlog. Default 1024. */
   int backlog;
+  /** Let several servers (one per thread) bind the same port, the kernel spreading connections
+   * across them (SO_REUSEPORT, TCP and HTTP/3; Unix only). Off by default, so a server whose port
+   * is already in use fails to start instead of silently sharing it. */
+  bool reuse_port;
   /** Concurrent connections. Default 1024. */
   size_t max_connections;
   /** Concurrent calls per connection. Default 1024. */
@@ -159,7 +163,10 @@ typedef struct grpc_stream_handler {
  * Creates a server and starts listening. Returns nullptr on failure, after logging why.
  * Use grpc_server_new_ex() to also obtain a grpc_err code on failure.
  * Nothing is served until grpc_server_run() or grpc_server_poll() is called.
- * Release with grpc_server_free().
+ * Release with grpc_server_free(). On POSIX systems, if SIGPIPE still has its
+ * default disposition (which kills the process when writing to a connection
+ * the peer closed), it is set to SIG_IGN; a handler the application installed
+ * is kept.
  */
 GRPC_API GRPC_NODISCARD grpc_server *grpc_server_new(const grpc_config *config);
 
@@ -255,13 +262,19 @@ GRPC_API grpc_err grpc_server_run(grpc_server *server);
 GRPC_API void grpc_server_stop(grpc_server *server);
 
 /**
- * Gracefully drains the server: stops accepting new connections, sends HTTP/2
- * GOAWAY to all active clients, and polls until all in-flight calls finish or
- * ``timeout_ms`` elapses (-1: wait indefinitely, 0: non-blocking check).
+ * Gracefully drains the server: stops accepting new connections, shuts every
+ * connection down in gRPC's two steps (a GOAWAY notice plus a PING, then,
+ * once the client acknowledged it or after at most 1 s, the final GOAWAY; so
+ * requests already on their way are still served), and polls until all
+ * in-flight calls finish or ``timeout_ms`` elapses (-1: wait indefinitely, 0:
+ * non-blocking check, which sends the final GOAWAY at once).
  * Returns GRPC_OK once drained, or GRPC_ERR_TIMEOUT if active calls remain.
- * Must be called from the server thread, outside grpc_server_run(). Listeners
- * are not reopened and the stop flag is set, so follow it with
- * grpc_server_free().
+ * Calls on event routes (grpc_server_register_path()) need the application:
+ * when they produce events, drain returns GRPC_ERR_STATE with the events
+ * available from grpc_server_events(); handle them and call drain again (no
+ * second GOAWAY is sent). Must be called from the server thread, outside
+ * grpc_server_run(). Listeners are not reopened and the stop flag is set, so
+ * follow it with grpc_server_free().
  */
 GRPC_API grpc_err grpc_server_drain(grpc_server *server, int timeout_ms);
 

@@ -233,6 +233,83 @@ void test_status_details_hostile_lengths(void) {
   grpc_free(b64);
 }
 
+/* Base64 of `len` raw protobuf bytes, owned by the caller. */
+static char *b64_of(const uint8_t *raw, size_t len) {
+  size_t n = 0;
+  char *b = grpc_metadata_encode_bin(raw, len, &n);
+  TEST_ASSERT_NOT_NULL(b);
+  return b;
+}
+
+/* The lenient decoder reports the type URL and value of the same, first, detail entry. */
+void test_status_details_first_any_pairs_fields(void) {
+  /* [Any{type_url "A", value "valueA"}, Any{type_url "B"}] */
+  const uint8_t raw[] = {0x08, 0x03, 0x1A, 0x0B, 0x0A, 0x01, 'A',  0x12, 0x06, 'v',
+                         'a',  'l',  'u',  'e',  'A',  0x1A, 0x03, 0x0A, 0x01, 'B'};
+  char *b64 = b64_of(raw, sizeof(raw));
+  int32_t code = -1;
+  char *msg = nullptr, *url = nullptr;
+  uint8_t *val = nullptr;
+  size_t vlen = 0;
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_status_details_decode(b64, &code, &msg, &url, &val, &vlen));
+  TEST_ASSERT_EQUAL_INT32(3, code);
+  TEST_ASSERT_EQUAL_STRING("A", url);
+  TEST_ASSERT_EQUAL_UINT64(6, vlen);
+  TEST_ASSERT_EQUAL_MEMORY("valueA", val, 6);
+  grpc_free(msg);
+  grpc_free(url);
+  grpc_free(val);
+  grpc_free(b64);
+}
+
+/* Every protobuf wire type and field number is handled: fixed32/fixed64 and multi-byte tags are
+ * skipped, invalid input is refused by the strict decoder. */
+void test_status_details_wire_types(void) {
+  grpc_status_details all = {0};
+  /* code, an unknown fixed32 field, then an Any: the Any is not lost */
+  const uint8_t fixed32[] = {0x08, 0x03, 0x25, 0x01, 0x02, 0x03, 0x04, 0x1A, 0x03, 0x0A, 0x01, 'X'};
+  /* an unknown fixed64 field, and an unknown field 16 (two-byte tag) */
+  const uint8_t fixed64[] = {0x08, 0x05, 0x09, 1,    2,    3,    4,    5,    6,  7,
+                             8,    0x80, 0x01, 0x07, 0x1A, 0x03, 0x0A, 0x01, 'Y'};
+  const uint8_t *ok_inputs[] = {fixed32, fixed64};
+  const size_t ok_lens[] = {sizeof(fixed32), sizeof(fixed64)};
+  const char *ok_urls[] = {"X", "Y"};
+  for (size_t i = 0; i < 2; i++) {
+    char *b64 = b64_of(ok_inputs[i], ok_lens[i]);
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_status_details_decode_all(b64, &all));
+    TEST_ASSERT_EQUAL_UINT64(1, all.nb_details);
+    TEST_ASSERT_EQUAL_STRING(ok_urls[i], all.details[0].type_url);
+    grpc_status_details_free(&all);
+    char *url = nullptr;
+    TEST_ASSERT_EQUAL_INT(
+        GRPC_OK, grpc_status_details_decode(b64, nullptr, nullptr, &url, nullptr, nullptr));
+    TEST_ASSERT_EQUAL_STRING(ok_urls[i], url);
+    grpc_free(url);
+    grpc_free(b64);
+  }
+  /* malformed: wire type 7, a group (3), field number 0, a truncated varint, a truncated
+   * fixed32 */
+  const uint8_t wire7[] = {0x08, 0x03, 0x0F, 0xFF};
+  const uint8_t group[] = {0x08, 0x03, 0x0B};
+  const uint8_t field0[] = {0x00, 0x01};
+  const uint8_t trunc_varint[] = {0x08, 0x83};
+  const uint8_t trunc_fixed[] = {0x25, 0x01, 0x02};
+  const uint8_t *bad[] = {wire7, group, field0, trunc_varint, trunc_fixed};
+  const size_t bad_lens[] = {sizeof(wire7), sizeof(group), sizeof(field0), sizeof(trunc_varint),
+                             sizeof(trunc_fixed)};
+  for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+    char *b64 = b64_of(bad[i], bad_lens[i]);
+    TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_status_details_decode_all(b64, &all));
+    TEST_ASSERT_EQUAL_UINT64(0, all.nb_details);
+    TEST_ASSERT_NULL(all.message);
+    /* the lenient decoder stops there without failing */
+    int32_t code = -1;
+    TEST_ASSERT_EQUAL_INT(
+        GRPC_OK, grpc_status_details_decode(b64, &code, nullptr, nullptr, nullptr, nullptr));
+    grpc_free(b64);
+  }
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_status_details_roundtrip_with_any);
@@ -240,5 +317,7 @@ int main(void) {
   RUN_TEST(test_status_details_decode_all_multiple);
   RUN_TEST(test_status_details_unknown_fields_and_errors);
   RUN_TEST(test_status_details_hostile_lengths);
+  RUN_TEST(test_status_details_first_any_pairs_fields);
+  RUN_TEST(test_status_details_wire_types);
   return UNITY_END();
 }

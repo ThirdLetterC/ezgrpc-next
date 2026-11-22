@@ -14,8 +14,13 @@
  * :c:func:`grpc_call_send_metadata()` and :c:func:`grpc_call_add_trailers()`,
  * and returned by :c:func:`grpc_call_metadata_at()`.
  *
- * When sending, a length of 0 means ``strlen()``. Keys must be lowercase.
- * Keys ending in ``-bin`` carry Base64 encoded binary values.
+ * When sending, a length of 0 means ``strlen()``. Keys may contain only
+ * lower-case letters, digits, ``-``, ``_`` and ``.``; values only printable
+ * ASCII (0x20-0x7E, so no CR/LF). Keys ending in ``-bin`` carry Base64 encoded
+ * binary values (grpc_metadata_encode_bin()). HTTP connection fields,
+ * ``content-type`` and ``te`` are reserved, and so are ``grpc-status``,
+ * ``grpc-message``, ``grpc-encoding`` and ``grpc-accept-encoding`` in
+ * responses: such metadata is rejected with GRPC_ERR_INVALID.
  */
 typedef struct grpc_metadata {
   /** The header name. */

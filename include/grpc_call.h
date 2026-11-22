@@ -56,9 +56,12 @@ GRPC_API const char *grpc_call_method(const grpc_call *call);
 GRPC_API const char *grpc_call_peer(const grpc_call *call);
 
 /**
- * The verified TLS client certificate subject (e.g. ``"/CN=client"``), or
- * nullptr when TLS or client certificate authentication is not active. Always
- * nullptr with the rustls backend, which does not expose the subject.
+ * The verified TLS client certificate subject as ``"/K=V/K=V"`` in
+ * certificate order (e.g. ``"/O=org/CN=client"``, OpenSSL's one-line format,
+ * on every backend and transport), or nullptr when TLS or client certificate
+ * authentication is not active, or when the subject is longer than 255 bytes
+ * (it is never truncated). Always nullptr with the rustls backend, which does
+ * not expose the subject.
  */
 GRPC_API const char *grpc_call_peer_cert_subject(const grpc_call *call);
 
@@ -242,7 +245,10 @@ GRPC_API grpc_err grpc_call_add_trailers(grpc_call *call, const grpc_metadata *m
 /**
  * Ends the call with a status. ``message`` (may be nullptr) is sent as
  * ``grpc-message``; error statuses without one get the status name.
- * Every call must be finished exactly once, unless it is cancelled.
+ * Every call must be finished exactly once, unless it is cancelled. Returns
+ * GRPC_ERR_NOMEM when the status could not be built for lack of memory; the
+ * stream is then reset (the client sees the call fail at once) and the call is
+ * over, so it must not be finished again.
  */
 GRPC_API grpc_err grpc_call_finish(grpc_call *call, grpc_status status, const char *message);
 

@@ -10,6 +10,7 @@
  * through ALPN.
  */
 #include <limits.h>
+#include <string.h>
 #include "internal/grpc_threads.h"
 #include <wolfssl/options.h>
 #include <wolfssl/ssl.h>
@@ -249,8 +250,17 @@ int tls_backend_peer_subject(grpc_tls_session *tls, char *buf, size_t len) {
   WOLFSSL_X509 *cert = wolfSSL_get_peer_certificate(tls->ssl);
   if (cert == nullptr)
     return -1;
+  /* formatted into one byte more than the caller's buffer: a subject that fills it does not
+   * fit and is not reported at all (a truncated one could match a different, shorter subject) */
   WOLFSSL_X509_NAME *name = wolfSSL_X509_get_subject_name(cert);
-  char *res = name != nullptr ? wolfSSL_X509_NAME_oneline(name, buf, (int)len) : nullptr;
+  int res = -1;
+  char *tmp = len < INT_MAX ? grpc_malloc(len + 1) : nullptr;
+  if (name != nullptr && tmp != nullptr &&
+      wolfSSL_X509_NAME_oneline(name, tmp, (int)(len + 1)) != nullptr && strlen(tmp) < len) {
+    memcpy(buf, tmp, strlen(tmp) + 1);
+    res = 0;
+  }
+  grpc_free(tmp);
   wolfSSL_X509_free(cert);
-  return res != nullptr ? 0 : -1;
+  return res;
 }

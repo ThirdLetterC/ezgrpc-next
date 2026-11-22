@@ -8,11 +8,21 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 #include "internal/grpc_threads.h"
 #include "grpc.h"
 #include "test.h"
+#include "core.h"
+#if defined(GRPC_TLS_GNUTLS)
+#include <gnutls/gnutls.h>
+#endif
+#if defined(GRPC_TLS_RUSTLS)
+#include <rustls.h>
+#include "internal_helpers.h"
+#include "internal_tls.h"
+#endif
 #if defined(GRPC_TLS_OPENSSL) || defined(GRPC_TLS_LIBRESSL) || defined(GRPC_TLS_BORINGSSL) || \
     defined(GRPC_TLS_AWSLC)
 #define TLS_OPENSSL_FAMILY 1
@@ -127,6 +137,22 @@ void test_tls_invalid_files(void) {
   fx.server = new_tls_server("test_cert.pem", "test_key.pem", &err);
   TEST_ASSERT_NOT_NULL(fx.server);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, err);
+  grpc_server_free(fx.server);
+  fx.server = nullptr;
+
+  /* with both ca_file and ca_pem, every backend uses ca_file (ca_pem only without it): a valid
+   * file and an unusable PEM still start (rustls used to take ca_pem) */
+  fx.server = grpc_server_new_ex(&(grpc_config){.port = 0,
+                                                .ipv4_addr = "127.0.0.1",
+                                                .tls = {.cert_file = "test_cert.pem",
+                                                        .key_file = "test_key.pem",
+                                                        .ca_file = "test_cert.pem",
+                                                        .ca_pem = "not a certificate",
+                                                        .require_client_cert = true},
+                                                .log_level = GRPC_LOG_OFF},
+                                 &err);
+  TEST_ASSERT_NOT_NULL_MESSAGE(fx.server, "ca_pem was used although ca_file is set");
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, err);
 }
 
 static void *fail_realloc([[maybe_unused]] void *p, [[maybe_unused]] size_t n) {
@@ -152,17 +178,29 @@ void test_tls_server(void) {
   TEST_ASSERT_NOT_NULL(grpc_server_tls_native(server));
   TEST_ASSERT_TRUE(grpc_server_tls_native(server) != old_ctx);
 
-  /* If the reload runs out of memory, it fails and the active context (which live sessions may
-   * use) is left untouched rather than freed. Where the failure surfaces depends on the backend:
-   * retiring the old context (GRPC_ERR_NOMEM), or already building the new one when the backend
-   * loads certificates through the grpc allocator, as rustls does (GRPC_ERR_INVALID). */
+  /* A reload is all or nothing: when it fails, here because reallocations fail (where that
+   * surfaces depends on the backend: growing the retired list, or building the new context when
+   * the backend loads certificates through the grpc allocator, as rustls does), the active
+   * context is left untouched. Room to retire a context is reserved ahead, so it may also
+   * succeed; then it switched completely. */
   old_ctx = grpc_server_tls_native(server);
   grpc_set_allocator(&(grpc_allocator){.realloc = fail_realloc});
   grpc_err nomem = grpc_server_reload_tls(
       server, &(grpc_tls_config){.cert_file = "test_cert.pem", .key_file = "test_key.pem"});
   grpc_set_allocator(nullptr);
-  TEST_ASSERT_TRUE(nomem == GRPC_ERR_NOMEM || nomem == GRPC_ERR_INVALID);
-  TEST_ASSERT_EQUAL_PTR(old_ctx, grpc_server_tls_native(server));
+  if (nomem == GRPC_OK) {
+    TEST_ASSERT_TRUE(grpc_server_tls_native(server) != old_ctx);
+  } else {
+    TEST_ASSERT_TRUE(nomem == GRPC_ERR_NOMEM || nomem == GRPC_ERR_INVALID);
+    TEST_ASSERT_EQUAL_PTR(old_ctx, grpc_server_tls_native(server));
+  }
+
+  /* replaced contexts without connections are freed at once: reloads do not pile them up */
+  for (int i = 0; i < 50; i++)
+    TEST_ASSERT_EQUAL_INT(
+        GRPC_OK, grpc_server_reload_tls(server, &(grpc_tls_config){.cert_file = "test_cert.pem",
+                                                                   .key_file = "test_key.pem"}));
+  TEST_ASSERT_EQUAL_size_t(1, tls_ctx_pool_count(&server->tls_pool));
 
   grpc_server_free(server);
   fx.server = nullptr;
@@ -263,10 +301,19 @@ void test_tls_in_memory_pem_and_mtls(void) {
   char subject[256];
   subject_read(subject, sizeof(subject));
   TEST_ASSERT_NOT_NULL(strstr(subject, "localhost"));
-  grpc_client_free(fx.client);
-  fx.client = nullptr;
   /* the reloads below run on this thread, so it must own the server again */
   server_stop_thread();
+  /* a reload keeps the old context while a connection made from it is open, and frees it with
+   * that connection */
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_reload_tls(server, &(grpc_tls_config){.cert_file = "test_cert.pem",
+                                                                 .key_file = "test_key.pem"}));
+  TEST_ASSERT_EQUAL_size_t(2, tls_ctx_pool_count(&server->tls_pool));
+  grpc_client_free(fx.client);
+  fx.client = nullptr;
+  for (int i = 0; i < 200 && tls_ctx_pool_count(&server->tls_pool) > 1; i++)
+    (void)grpc_server_poll(server, 10);
+  TEST_ASSERT_EQUAL_size_t(1, tls_ctx_pool_count(&server->tls_pool));
 #endif
 
   /* Hot-reload with valid PEMs succeeds and swaps the native context; invalid fails safely. */
@@ -644,6 +691,270 @@ void test_tls_error_isolation(void) {
 }
 #endif
 
+#if defined(GRPC_TLS_OPENSSL) || defined(GRPC_TLS_LIBRESSL) || defined(GRPC_TLS_BORINGSSL) || \
+    defined(GRPC_TLS_AWSLC)
+static void plain_echo(grpc_call *call, const grpc_message *req, [[maybe_unused]] void *ud) {
+  (void)grpc_call_reply_data(call, req->data, req->len);
+}
+
+/* One unary call through a new TLS client; returns whether it succeeded. */
+static bool tls_call_ok(uint16_t port, const char *server_name) {
+  grpc_err err = GRPC_OK;
+  grpc_client *c = grpc_client_new(
+      &(grpc_client_config){
+          .host = "127.0.0.1",
+          .port = port,
+          .timeout_ms = 2000,
+          .tls = {.enable = true, .ca_file = "test_cert.pem", .server_name = server_name}},
+      &err);
+  if (c == nullptr)
+    return false;
+  grpc_client_response resp = {0};
+  grpc_err rc = grpc_client_unary(c, "/v.Svc/Echo", "x", 1, nullptr, 0, 2000, &resp);
+  bool ok = rc == GRPC_OK && resp.status == GRPC_STATUS_OK;
+  grpc_client_response_free(&resp);
+  grpc_client_free(c);
+  return ok;
+}
+
+/* The HTTP/2 client checks that the certificate was issued for the server's name, not only that
+ * it chains to a trusted CA. */
+void test_client_verifies_server_name(void) {
+  grpc_err err = GRPC_OK;
+  grpc_server *server = fx.server = new_tls_server("test_cert.pem", "test_key.pem", &err);
+  TEST_ASSERT_NOT_NULL(server);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/v.Svc/Echo", plain_echo, nullptr));
+  server_start();
+  uint16_t port = grpc_server_port(server);
+  TEST_ASSERT_TRUE_MESSAGE(tls_call_ok(port, "localhost"), "the right name was refused");
+  TEST_ASSERT_FALSE_MESSAGE(tls_call_ok(port, "evil.example.com"),
+                            "a certificate for another name was accepted");
+  /* by IP address: the certificate (CN=localhost) names no IP address */
+  TEST_ASSERT_FALSE_MESSAGE(tls_call_ok(port, nullptr),
+                            "a certificate without the IP address was accepted");
+}
+#endif
+
+#if defined(GRPC_TLS_OPENSSL) || defined(GRPC_TLS_LIBRESSL) || defined(GRPC_TLS_BORINGSSL) || \
+    defined(GRPC_TLS_AWSLC)
+static uint64_t mono_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+/* A reconnect made inside a call is bounded by that call's deadline, even when the client has no
+ * connect timeout of its own: a peer that accepts TCP but never answers the TLS handshake does
+ * not block the call forever. */
+void test_client_reconnect_bounded_by_call_deadline(void) {
+  grpc_err err = GRPC_OK;
+  grpc_server *server = fx.server = new_tls_server("test_cert.pem", "test_key.pem", &err);
+  TEST_ASSERT_NOT_NULL(server);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/v.Svc/Echo", plain_echo, nullptr));
+  server_start();
+  uint16_t port = grpc_server_port(server);
+  fx.client = grpc_client_new(
+      &(grpc_client_config){
+          .host = "127.0.0.1",
+          .port = port,
+          .timeout_ms = 0, /* no connect bound of the client's own */
+          .tls = {.enable = true, .ca_file = "test_cert.pem", .server_name = "localhost"}},
+      &err);
+  TEST_ASSERT_NOT_NULL(fx.client);
+  /* the server goes away; a listener that never speaks TLS takes its port */
+  server_stop_thread();
+  grpc_server_free(server);
+  fx.server = nullptr;
+  int lfd = socket(AF_INET, SOCK_STREAM, 0);
+  int one = 1;
+  setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  struct sockaddr_in sin = {.sin_family = AF_INET, .sin_port = htons(port)};
+  sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  TEST_ASSERT_EQUAL_INT(0, bind(lfd, (struct sockaddr *)&sin, sizeof(sin)));
+  TEST_ASSERT_EQUAL_INT(0, listen(lfd, 4));
+  grpc_client_response resp = {0};
+  uint64_t start = mono_ms();
+  grpc_err rc = grpc_client_unary(fx.client, "/v.Svc/Echo", "x", 1, nullptr, 0, 300, &resp);
+  uint64_t took = mono_ms() - start;
+  grpc_client_response_free(&resp);
+  close(lfd);
+  TEST_ASSERT_NOT_EQUAL_INT(GRPC_OK, rc);
+  TEST_ASSERT_TRUE_MESSAGE(took < 2000, "the reconnect ignored the call's deadline");
+}
+#endif
+
+#if defined(GRPC_TLS_GNUTLS)
+/* A GnuTLS client whose output is held back (to be sent together with an extra record) and whose
+ * input comes from a socket, non-blocking while output is pending so the handshake returns. */
+typedef struct held_client {
+  int fd;
+  uint8_t out[16384];
+  size_t out_len;
+} held_client;
+
+static ssize_t held_push(gnutls_transport_ptr_t ptr, const void *data, size_t n) {
+  held_client *c = ptr;
+  if (n > sizeof(c->out) - c->out_len) {
+    errno = ENOBUFS;
+    return -1;
+  }
+  memcpy(c->out + c->out_len, data, n);
+  c->out_len += n;
+  return (ssize_t)n;
+}
+
+static ssize_t held_pull(gnutls_transport_ptr_t ptr, void *data, size_t n) {
+  held_client *c = ptr;
+  if (c->out_len > 0) { /* output waiting to be sent first */
+    errno = EAGAIN;
+    return -1;
+  }
+  return recv(c->fd, data, n, 0);
+}
+
+/* Runs the client handshake until it is done or has output to send; returns the result. */
+static int held_step(gnutls_session_t cs) {
+  int rv;
+  do
+    rv = gnutls_handshake(cs);
+  while (rv == GNUTLS_E_INTERRUPTED);
+  return rv;
+}
+
+/* A non-fatal event during the server handshake (here a warning alert) with the client's next
+ * flight already buffered behind it must not stall the GnuTLS server: the handshake is retried at
+ * once instead of waiting for input that has already arrived. The client (TLS 1.2, where
+ * user_canceled is a warning) sends that alert and its second flight in one write; the server
+ * must finish the handshake. */
+void test_gnutls_handshake_continues_after_warning_alert(void) {
+  grpc_err err = GRPC_OK;
+  fx.server = new_tls_server("test_cert.pem", "test_key.pem", &err);
+  TEST_ASSERT_NOT_NULL(fx.server);
+  server_start();
+
+  static held_client hc;
+  memset(&hc, 0, sizeof(hc));
+  hc.fd = socket(AF_INET, SOCK_STREAM, 0);
+  TEST_ASSERT_TRUE(hc.fd >= 0);
+  struct sockaddr_in sin = {.sin_family = AF_INET, .sin_port = htons(grpc_server_port(fx.server))};
+  sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  TEST_ASSERT_EQUAL_INT(0, connect(hc.fd, (struct sockaddr *)&sin, sizeof(sin)));
+  struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
+  setsockopt(hc.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+  gnutls_certificate_credentials_t cred;
+  TEST_ASSERT_EQUAL_INT(0, gnutls_certificate_allocate_credentials(&cred));
+  gnutls_session_t cs;
+  TEST_ASSERT_EQUAL_INT(0, gnutls_init(&cs, GNUTLS_CLIENT));
+  TEST_ASSERT_EQUAL_INT(0,
+                        gnutls_priority_set_direct(cs, "NORMAL:-VERS-ALL:+VERS-TLS1.2", nullptr));
+  TEST_ASSERT_EQUAL_INT(0, gnutls_credentials_set(cs, GNUTLS_CRD_CERTIFICATE, cred));
+  (void)gnutls_server_name_set(cs, GNUTLS_NAME_DNS, "localhost", 9);
+  gnutls_datum_t alpn = {(unsigned char *)"h2", 2};
+  (void)gnutls_alpn_set_protocols(cs, &alpn, 1, 0);
+  gnutls_transport_set_ptr(cs, &hc);
+  gnutls_transport_set_push_function(cs, held_push);
+  gnutls_transport_set_pull_function(cs, held_pull);
+
+  /* ClientHello */
+  TEST_ASSERT_EQUAL_INT(GNUTLS_E_AGAIN, held_step(cs));
+  TEST_ASSERT_TRUE(hc.out_len > 0);
+  TEST_ASSERT_EQUAL_INT((int)hc.out_len, (int)send(hc.fd, hc.out, hc.out_len, MSG_NOSIGNAL));
+  hc.out_len = 0;
+  /* the server's flight in, the client's second flight out (held) */
+  int rv = held_step(cs);
+  TEST_ASSERT_EQUAL_INT_MESSAGE(GNUTLS_E_AGAIN, rv, gnutls_strerror(rv));
+  TEST_ASSERT_TRUE(hc.out_len > 0);
+  /* warning alert (user_canceled) and the second flight, in one write */
+  static uint8_t wire[16384 + 7];
+  const uint8_t alert[] = {0x15, 0x03, 0x03, 0x00, 0x02, 0x01, 90}; /* user_canceled */
+  memcpy(wire, alert, sizeof(alert));
+  memcpy(wire + sizeof(alert), hc.out, hc.out_len);
+  TEST_ASSERT_EQUAL_INT((int)(sizeof(alert) + hc.out_len),
+                        (int)send(hc.fd, wire, sizeof(alert) + hc.out_len, MSG_NOSIGNAL));
+  hc.out_len = 0;
+  /* the server's ChangeCipherSpec + Finished complete the handshake */
+  rv = held_step(cs);
+  gnutls_deinit(cs);
+  gnutls_certificate_free_credentials(cred);
+  close(hc.fd);
+  TEST_ASSERT_EQUAL_INT_MESSAGE(GNUTLS_E_SUCCESS, rv, "the server handshake stalled");
+}
+#endif
+
+#if defined(GRPC_TLS_RUSTLS)
+static uint32_t
+accept_any_server_cert([[maybe_unused]] void *userdata,
+                       [[maybe_unused]] const struct rustls_verify_server_cert_params *params) {
+  return RUSTLS_RESULT_OK; /* only the ClientHello is needed */
+}
+
+static rustls_io_result collect_tls(void *userdata, const uint8_t *buf, size_t n, size_t *out_n) {
+  grpc_buf *b = userdata;
+  if (buf_append(b, buf, n))
+    return ENOMEM;
+  *out_n = n;
+  return 0;
+}
+
+static void *fail_alloc([[maybe_unused]] size_t n) {
+  return nullptr;
+}
+static void *fail_calloc([[maybe_unused]] size_t a, [[maybe_unused]] size_t b) {
+  return nullptr;
+}
+
+/* When the output buffer cannot grow while rustls hands over ciphertext, the drain reports
+ * TLS_DRAIN_NOMEM (rustls keeps what it could not write, so a later drain continues) instead of
+ * an error that closes the connection. */
+void test_rustls_drain_out_of_memory_is_retryable(void) {
+  /* a real ClientHello */
+  struct rustls_client_config_builder *cb = rustls_client_config_builder_new();
+  TEST_ASSERT_NOT_NULL(cb);
+  TEST_ASSERT_EQUAL_INT(
+      RUSTLS_RESULT_OK,
+      rustls_client_config_builder_dangerous_set_certificate_verifier(cb, accept_any_server_cert));
+  const struct rustls_client_config *ccfg = nullptr;
+  TEST_ASSERT_EQUAL_INT(RUSTLS_RESULT_OK, rustls_client_config_builder_build(cb, &ccfg));
+  struct rustls_connection *client = nullptr;
+  TEST_ASSERT_EQUAL_INT(RUSTLS_RESULT_OK, rustls_client_connection_new(ccfg, "localhost", &client));
+  grpc_buf hello = {0};
+  size_t n = 0;
+  TEST_ASSERT_EQUAL_INT(0, rustls_connection_write_tls(client, collect_tls, &hello, &n));
+  TEST_ASSERT_TRUE(hello.len > 0);
+
+  /* the server session reads it and has its first flight to send */
+  grpc_tls_ctx *ctx = tls_backend_ctx_new(
+      &(grpc_tls_config){.cert_file = "test_cert.pem", .key_file = "test_key.pem"});
+  TEST_ASSERT_NOT_NULL(ctx);
+  grpc_tls_session *server = tls_backend_session_new(ctx);
+  TEST_ASSERT_NOT_NULL(server);
+  TEST_ASSERT_EQUAL_INT(0, tls_backend_feed(server, hello.data, hello.len));
+  TEST_ASSERT_TRUE(tls_backend_handshake(server) >= 0);
+
+  /* nothing can be allocated: the flight stays with rustls */
+  grpc_buf out = {0};
+  grpc_set_allocator(&(grpc_allocator){.malloc = fail_alloc,
+                                       .calloc = fail_calloc,
+                                       .realloc = fail_realloc,
+                                       .aligned_alloc = nullptr});
+  int drained = tls_backend_drain(server, &out);
+  grpc_set_allocator(nullptr);
+  TEST_ASSERT_EQUAL_INT(TLS_DRAIN_NOMEM, drained);
+  /* with memory again the same flight comes out */
+  TEST_ASSERT_EQUAL_INT(TLS_DRAIN_OK, tls_backend_drain(server, &out));
+  TEST_ASSERT_TRUE(out.len > 0);
+  TEST_ASSERT_EQUAL_HEX8(0x16, out.data[0]); /* a handshake record: the ServerHello */
+
+  buf_free(&out);
+  buf_free(&hello);
+  tls_backend_session_free(server);
+  tls_backend_ctx_free(ctx);
+  rustls_connection_free(client);
+  rustls_client_config_free(ccfg);
+}
+#endif
+
 int main(void) {
   /* unbuffered so a CTest timeout still shows which test was running */
   setvbuf(stdout, nullptr, _IONBF, 0);
@@ -655,9 +966,17 @@ int main(void) {
   RUN_TEST(test_tls_invalid_files);
   RUN_TEST(test_tls_server);
   RUN_TEST(test_tls_in_memory_pem_and_mtls);
+#if defined(GRPC_TLS_GNUTLS)
+  RUN_TEST(test_gnutls_handshake_continues_after_warning_alert);
+#endif
+#if defined(GRPC_TLS_RUSTLS)
+  RUN_TEST(test_rustls_drain_out_of_memory_is_retryable);
+#endif
 #if defined(GRPC_TLS_OPENSSL) || defined(GRPC_TLS_LIBRESSL) || defined(GRPC_TLS_BORINGSSL) || \
     defined(GRPC_TLS_AWSLC)
   RUN_TEST(test_client_server_mtls_end_to_end);
+  RUN_TEST(test_client_verifies_server_name);
+  RUN_TEST(test_client_reconnect_bounded_by_call_deadline);
   RUN_TEST(test_tls_error_isolation);
 #endif
   return UNITY_END();

@@ -84,6 +84,10 @@ struct h3c_conn {
   socklen_t remotelen;
   ngtcp2_ccerr ccerr;
   bool handshake_done;
+  /* when the last packet arrived (h3c_now()), to tell an idled-out connection from a live one */
+  ngtcp2_tstamp last_rx;
+  /* the server sent GOAWAY (or its shutdown notice): no new request goes on this connection */
+  bool goaway_received;
   /* Stream states whose RPC was freed before nghttp3 closed the stream. */
   h3c_stream *orphans;
   uint8_t rbuf[65536];
@@ -201,6 +205,16 @@ static nghttp3_ssize h3c_read_data(nghttp3_conn *conn, int64_t stream_id, nghttp
 }
 
 static const nghttp3_data_reader h3c_data_reader = {.read_data = h3c_read_data};
+
+/* nghttp3 shutdown: the server sent GOAWAY (or the shutdown notice that precedes it). Requests
+ * already open finish; the next call opens a new connection (h3c_usable()), since nghttp3 would
+ * refuse a new request on this one. */
+static int h3c_on_shutdown(nghttp3_conn *conn, int64_t id, void *conn_user_data) {
+  (void)conn;
+  (void)id;
+  ((h3c_conn *)conn_user_data)->goaway_received = true;
+  return 0;
+}
 
 /* acked_stream_data: frees fully acknowledged request chunks (orphaned ones at disconnect). */
 static int h3c_on_acked_stream_data(nghttp3_conn *conn, int64_t stream_id, uint64_t datalen,
@@ -338,6 +352,7 @@ static int h3c_on_reset_stream(nghttp3_conn *conn, int64_t stream_id, uint64_t a
 /* Creates the client nghttp3 connection with its control and QPACK streams. */
 static int h3c_setup(h3c_conn *hc) {
   nghttp3_callbacks callbacks = {
+      .shutdown = h3c_on_shutdown,
       .acked_stream_data = h3c_on_acked_stream_data,
       .stream_close = h3c_on_stream_close,
       .recv_data = h3c_on_recv_data,
@@ -479,6 +494,8 @@ static void h3c_arm_timer(h3c_conn *hc) {
   }
   ngtcp2_tstamp now = h3c_now();
   uint64_t ms = expiry > now ? (expiry - now + NGTCP2_MILLISECONDS - 1) / NGTCP2_MILLISECONDS : 0;
+  /* the loop clock stops between RPCs: refresh it so the timer fires `ms` from now */
+  uv_update_time(hc->timer.loop);
   uv_timer_start(&hc->timer, on_h3c_timer, ms, 0);
 }
 
@@ -577,12 +594,14 @@ static void on_h3c_read(uv_udp_t *udp, ssize_t nread, const uv_buf_t *buf,
                  .addrlen = hc->remotelen},
   };
   ngtcp2_pkt_info pi = {0};
-  int rv = ngtcp2_conn_read_pkt(hc->conn, &path, &pi, (const uint8_t *)buf->base, (size_t)nread,
-                                h3c_now());
+  ngtcp2_tstamp now = h3c_now();
+  int rv =
+      ngtcp2_conn_read_pkt(hc->conn, &path, &pi, (const uint8_t *)buf->base, (size_t)nread, now);
   if (rv != 0) {
     h3c_fail(hc, rv == NGTCP2_ERR_CRYPTO ? GRPC_ERR_IO : GRPC_ERR_CLOSED);
     return;
   }
+  hc->last_rx = now;
   h3c_flush(hc->s);
 }
 
@@ -772,6 +791,28 @@ void h3c_disconnect(client_subchannel *s) {
     uv_close((uv_handle_t *)&hc->timer, on_h3c_handle_closed);
 }
 
+bool h3c_usable(client_subchannel *s) {
+  h3c_conn *hc = s->h3c;
+  if (hc == nullptr || hc->conn == nullptr || hc->h3 == nullptr)
+    return false;
+  /* timers only run while an RPC drives the loop: catch up on an expiry that passed meanwhile
+   * (an idle timeout makes ngtcp2_conn_handle_expiry() fail) */
+  ngtcp2_tstamp now = h3c_now();
+  if (ngtcp2_conn_get_expiry(hc->conn) <= now && ngtcp2_conn_handle_expiry(hc->conn, now) != 0)
+    return false;
+  if (hc->goaway_received || ngtcp2_conn_in_closing_period(hc->conn) ||
+      ngtcp2_conn_in_draining_period(hc->conn))
+    return false;
+  /* ngtcp2's own idle timer allows at least three probe timeouts, which can be well past the
+   * idle timeout the server announced and enforces: a connection silent for that long is gone
+   * on the server's side, so do not send the next request into it */
+  const ngtcp2_transport_params *peer = ngtcp2_conn_get_remote_transport_params(hc->conn);
+  if (peer != nullptr && peer->max_idle_timeout > 0 && hc->last_rx > 0 &&
+      now - hc->last_rx >= peer->max_idle_timeout)
+    return false;
+  return true;
+}
+
 int h3c_submit_request(client_subchannel *s, grpc_client_stream *st, const grpc_nv *nva,
                        size_t nvlen) {
   h3c_conn *hc = s->h3c;
@@ -791,6 +832,14 @@ int h3c_submit_request(client_subchannel *s, grpc_client_stream *st, const grpc_
   if (nghttp3_conn_submit_request(hc->h3, stream_id, (const nghttp3_nv *)nva, nvlen,
                                   &h3c_data_reader, hs) != 0) {
     (void)ngtcp2_conn_shutdown_stream(hc->conn, 0, stream_id, NGHTTP3_H3_INTERNAL_ERROR);
+    /* nghttp3 may have created the stream before failing: then it holds hs as stream data and
+     * its close frees hs (h3c_stream_free() parks it as an orphan until then). If nghttp3 never
+     * knew the stream, no close will come: free hs now. */
+    if (nghttp3_conn_set_stream_user_data(hc->h3, stream_id, hs) != 0) {
+      hs->st = nullptr;
+      st->h3 = nullptr;
+      grpc_free(hs);
+    }
     return -1;
   }
   return 0;
@@ -806,6 +855,14 @@ void h3c_reset(client_subchannel *s, grpc_client_stream *st) {
     (void)ngtcp2_conn_shutdown_stream(s->h3c->conn, 0, st->stream_id, NGHTTP3_H3_REQUEST_CANCELLED);
 }
 
+size_t h3c_orphan_count(const client_subchannel *s) {
+  size_t n = 0;
+  for (const h3c_stream *hs = s->h3c != nullptr ? s->h3c->orphans : nullptr; hs != nullptr;
+       hs = hs->orphan_next)
+    n++;
+  return n;
+}
+
 void h3c_stream_free(grpc_client_stream *st) {
   h3c_stream *hs = st->h3;
   if (hs == nullptr)
@@ -814,7 +871,13 @@ void h3c_stream_free(grpc_client_stream *st) {
   hs->st = nullptr;
   h3c_conn *hc = st->sub != nullptr ? st->sub->h3c : nullptr;
   if (hc != nullptr && hc->h3 != nullptr && !hs->closed) {
-    /* nghttp3 may still retransmit the request bytes: keep the state until it closes the stream */
+    /* the RPC ends before the stream did (the server answered early, or a local error): tell the
+     * server to stop. nghttp3 may still retransmit the request bytes, so keep the state until it
+     * closes the stream. */
+    if (hc->conn != nullptr) {
+      (void)ngtcp2_conn_shutdown_stream(hc->conn, 0, st->stream_id, NGHTTP3_H3_REQUEST_CANCELLED);
+      h3c_flush(st->sub);
+    }
     hs->orphan_prev = nullptr;
     hs->orphan_next = hc->orphans;
     if (hc->orphans != nullptr)

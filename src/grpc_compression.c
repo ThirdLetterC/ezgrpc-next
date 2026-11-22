@@ -21,6 +21,7 @@
 #endif
 #if defined(GRPC_ENABLE_ZSTD)
 #include <zstd.h>
+#include <zstd_errors.h>
 #endif
 #if defined(GRPC_ENABLE_SNAPPY)
 #include <snappy-c.h>
@@ -83,7 +84,22 @@ static grpc_err zlib_codec(bool compress, bool gzip, int level, const uint8_t *i
       inflateEnd(&stream);
       return GRPC_ERR_LIMIT;
     }
-    if ((compress && status == Z_STREAM_END) || (!compress && status == Z_STREAM_END))
+    if (status == Z_STREAM_END && !compress && stream.avail_in > 0) {
+      /* more input after the end of the stream: further members of a multi-member gzip
+       * stream (RFC 1952) decode into the same output, under the same limit; anything else is
+       * corrupt input, and a zlib (deflate) stream has a single member */
+      uLong total_in = stream.total_in, total_out = stream.total_out;
+      if (!gzip || inflateReset(&stream) != Z_OK) {
+        grpc_free(buf);
+        inflateEnd(&stream);
+        return GRPC_ERR_CODEC;
+      }
+      /* inflateReset() zeroes the totals this loop uses as the output position */
+      stream.total_in = total_in;
+      stream.total_out = total_out;
+      continue;
+    }
+    if (status == Z_STREAM_END)
       break;
     if (status != Z_OK || (stream.total_in == before_in && stream.total_out == before_out)) {
       grpc_free(buf);
@@ -342,6 +358,17 @@ GRPC_API grpc_err grpc_decompress_limited(grpc_compression_algorithm algorithm, 
     ZSTD_DCtx *ctx = ZSTD_createDCtx();
     if (!ctx)
       return GRPC_ERR_NOMEM;
+    /* The decoder allocates the window a frame header asks for (up to 2^27 by default) before
+     * producing output, so a few bytes could make it allocate 128 MiB whatever max_output is.
+     * Bound the window by the output limit, but never below 2^21 (the window zstd uses at its
+     * default level when the size is unknown, so ordinary streams still decode). */
+    int window_log = 21;
+    while (window_log < 27 && ((size_t)1 << window_log) < max_output)
+      window_log++;
+    if (ZSTD_isError(ZSTD_DCtx_setParameter(ctx, ZSTD_d_windowLogMax, window_log))) {
+      ZSTD_freeDCtx(ctx);
+      return GRPC_ERR_CODEC;
+    }
     size_t max_cap = max_output < SIZE_MAX ? max_output + 1 : SIZE_MAX;
     size_t cap = max_cap < 4096 ? max_cap : 4096, used = 0;
     uint8_t *buf = grpc_malloc(cap);
@@ -373,6 +400,12 @@ GRPC_API grpc_err grpc_decompress_limited(grpc_compression_algorithm algorithm, 
       ZSTD_outBuffer output = {buf + used, cap - used, 0};
       size_t before = input.pos;
       remaining = ZSTD_decompressStream(ctx, &output, &input);
+      if (ZSTD_isError(remaining) &&
+          ZSTD_getErrorCode(remaining) == ZSTD_error_frameParameter_windowTooLarge) {
+        grpc_free(buf);
+        ZSTD_freeDCtx(ctx);
+        return GRPC_ERR_LIMIT; /* the frame needs more memory than the limit allows */
+      }
       if (ZSTD_isError(remaining) || (before == input.pos && output.pos == 0)) {
         grpc_free(buf);
         ZSTD_freeDCtx(ctx);

@@ -27,7 +27,7 @@ GRPC_API grpc_err grpc_reflection_enable(grpc_server *server);
 /**
  * Adds a serialized FileDescriptorProto, returned for ``symbol_or_filename``,
  * so that tools like ``grpcurl describe`` can show the schema. ``descriptor``
- * is copied; ``symbol_or_filename`` is truncated to 127 bytes. Call it from
+ * and ``symbol_or_filename`` are copied (at full length). Call it from
  * the server thread or before the server runs.
  */
 GRPC_API grpc_err grpc_reflection_add_file_descriptor(grpc_server *server,

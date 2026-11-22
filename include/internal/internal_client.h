@@ -37,6 +37,12 @@ struct grpc_client_stream {
   bool timed_out;
   grpc_err err;
   grpc_compression_algorithm resp_encoding;
+  /* the response's grpc-encoding names a codec this build cannot decode */
+  bool resp_encoding_unsupported;
+  /* a grpc-status header was received (it overrides the HTTP status mapping) */
+  bool grpc_status_seen;
+  /* the client rejected the response (stream_reject()): later headers do not change it */
+  bool rejected;
   grpc_buf send_buf;
   size_t send_off;
   grpc_buf recv_buf;
@@ -130,6 +136,15 @@ grpc_err h3c_connect(client_subchannel *s);
 
 /* Frees the QUIC connection and closes its handles (the caller then drains and closes the loop). */
 void h3c_disconnect(client_subchannel *s);
+
+/* True if the subchannel's QUIC connection can carry another request: not idled out (checked
+ * against the clock now, since its timers only run during RPCs), closing or draining. */
+bool h3c_usable(client_subchannel *s);
+
+/* Number of request stream states the connection keeps for streams whose RPC already ended but
+ * that nghttp3 has not closed yet. They go away as those streams close; tests use this to check
+ * that none is kept for a stream nghttp3 never knew. */
+size_t h3c_orphan_count(const client_subchannel *s);
 
 /* Opens a request stream, submits the headers with st->send_buf as the body source and sets
  * st->stream_id. Returns 0, or -1. */

@@ -158,9 +158,12 @@ static void on_sub_write(uv_write_t *req, int status) {
 static void sub_fail(client_subchannel *s, grpc_err err) {
   s->closed = true;
   s->fail_err = err;
-  if (s->active_stream != nullptr && !s->active_stream->stream_done) {
-    s->active_stream->err = err;
-    s->active_stream->stream_done = true;
+  grpc_client_stream *st = s->active_stream;
+  /* nghttp2 may have closed the stream just before (recorded as GRPC_ERR_CLOSED): the
+   * connection's failure is the cause to report */
+  if (st != nullptr && (st->err == GRPC_OK || st->err == GRPC_ERR_CLOSED)) {
+    st->err = err;
+    st->stream_done = true;
   }
 }
 
@@ -307,18 +310,89 @@ static int client_on_header([[maybe_unused]] nghttp2_session *session, const ngh
   return 0;
 }
 
+/* Parses a grpc-status value: 1-2 decimal digits naming a status 0..16; anything else (empty,
+ * signs, spaces, letters, out of range) is UNKNOWN, as the gRPC spec requires. */
+static grpc_status parse_grpc_status(const uint8_t *value, size_t len) {
+  if (len == 0 || len > 2)
+    return GRPC_STATUS_UNKNOWN;
+  unsigned v = 0;
+  for (size_t i = 0; i < len; i++) {
+    if (value[i] < '0' || value[i] > '9')
+      return GRPC_STATUS_UNKNOWN;
+    v = v * 10 + (unsigned)(value[i] - '0');
+  }
+  return v <= 16 ? (grpc_status)v : GRPC_STATUS_UNKNOWN;
+}
+
+/* The gRPC status for an HTTP status when the response carries no grpc-status (the gRPC spec's
+ * "HTTP to gRPC Status Code Mapping"). */
+static grpc_status status_from_http(unsigned http) {
+  switch (http) {
+  case 400:
+    return GRPC_STATUS_INTERNAL;
+  case 401:
+    return GRPC_STATUS_UNAUTHENTICATED;
+  case 403:
+    return GRPC_STATUS_PERMISSION_DENIED;
+  case 404:
+    return GRPC_STATUS_UNIMPLEMENTED;
+  case 429:
+  case 502:
+  case 503:
+  case 504:
+    return GRPC_STATUS_UNAVAILABLE;
+  default:
+    return GRPC_STATUS_UNKNOWN;
+  }
+}
+
+/* Decodes the percent-encoding of grpc-message (%XX; malformed escapes are kept as they are)
+ * into a NUL-terminated grpc_malloc string, or nullptr when out of memory. */
+static int hex_digit(uint8_t c) {
+  return c >= '0' && c <= '9'   ? c - '0'
+         : c >= 'A' && c <= 'F' ? c - 'A' + 10
+         : c >= 'a' && c <= 'f' ? c - 'a' + 10
+                                : -1;
+}
+
+static char *percent_decode(const uint8_t *value, size_t len) {
+  char *out = grpc_malloc(len + 1);
+  if (out == nullptr)
+    return nullptr;
+  size_t o = 0;
+  for (size_t i = 0; i < len; i++) {
+    int hi = value[i] == '%' && i + 2 < len ? hex_digit(value[i + 1]) : -1;
+    int lo = hi >= 0 ? hex_digit(value[i + 2]) : -1;
+    if (lo >= 0) {
+      out[o++] = (char)(hi * 16 + lo);
+      i += 2;
+    } else {
+      out[o++] = (char)value[i];
+    }
+  }
+  out[o] = '\0';
+  return out;
+}
+
 void client_resp_header(grpc_client_stream *st, const uint8_t *name, size_t namelen,
                         const uint8_t *value, size_t valuelen, bool trailer) {
-  if (namelen == 11 && memcmp(name, "grpc-status", 11) == 0) {
-    char tmp[16];
-    size_t n = valuelen < sizeof(tmp) - 1 ? valuelen : sizeof(tmp) - 1;
-    memcpy(tmp, value, n);
-    tmp[n] = '\0';
-    st->resp.status = (grpc_status)atoi(tmp);
+  if (st->rejected) /* the outcome is decided; trailers arriving after it do not change it */
+    return;
+  if (namelen == 7 && memcmp(name, ":status", 7) == 0) {
+    unsigned http = 0;
+    for (size_t i = 0; i < valuelen && value[i] >= '0' && value[i] <= '9'; i++)
+      http = http * 10 + (unsigned)(value[i] - '0');
+    /* without grpc-status, a non-200 response maps to a gRPC status (grpc-status overrides) */
+    if (http != 200 && !st->grpc_status_seen)
+      st->resp.status = status_from_http(http);
+  } else if (namelen == 11 && memcmp(name, "grpc-status", 11) == 0) {
+    st->resp.status = parse_grpc_status(value, valuelen);
+    st->grpc_status_seen = true;
   } else if (namelen == 12 && memcmp(name, "grpc-message", 12) == 0) {
     grpc_free(st->resp.status_message);
-    st->resp.status_message = grpc_strndup((const char *)value, valuelen);
+    st->resp.status_message = percent_decode(value, valuelen);
   } else if (namelen == 13 && memcmp(name, "grpc-encoding", 13) == 0) {
+    bool supported = true;
     if (valuelen == 4 && memcmp(value, "gzip", 4) == 0)
       st->resp_encoding = GRPC_COMPRESS_GZIP;
     else if (valuelen == 7 && memcmp(value, "deflate", 7) == 0)
@@ -327,8 +401,23 @@ void client_resp_header(grpc_client_stream *st, const uint8_t *name, size_t name
       st->resp_encoding = GRPC_COMPRESS_ZSTD;
     else if (valuelen == 6 && memcmp(value, "snappy", 6) == 0)
       st->resp_encoding = GRPC_COMPRESS_SNAPPY;
-    else
+    else {
       st->resp_encoding = GRPC_COMPRESS_IDENTITY;
+      supported = valuelen == 8 && memcmp(value, "identity", 8) == 0;
+    }
+#if !defined(GRPC_ENABLE_ZLIB)
+    if (st->resp_encoding == GRPC_COMPRESS_GZIP || st->resp_encoding == GRPC_COMPRESS_DEFLATE)
+      supported = false;
+#endif
+#if !defined(GRPC_ENABLE_ZSTD)
+    if (st->resp_encoding == GRPC_COMPRESS_ZSTD)
+      supported = false;
+#endif
+#if !defined(GRPC_ENABLE_SNAPPY)
+    if (st->resp_encoding == GRPC_COMPRESS_SNAPPY)
+      supported = false;
+#endif
+    st->resp_encoding_unsupported = !supported;
   }
 
   if (!trailer)
@@ -337,40 +426,66 @@ void client_resp_header(grpc_client_stream *st, const uint8_t *name, size_t name
     md_list_append(&st->resp.trailers, &st->resp.nb_trailers, name, namelen, value, valuelen);
 }
 
-/* Splits complete length-prefixed gRPC messages off the front of recv_buf. Compressed messages
- * (flag 1 with a known grpc-encoding) are decompressed within max_message_size; a flag of 1 with
- * identity encoding is passed through as-is. Each message goes to on_message (then freed) when
- * set, otherwise to recv_queue. Leaves a partial trailing message in recv_buf; on error sets
- * st->err and marks the stream done. */
+/* Fails the stream on a response it cannot accept: err for the caller, and an INTERNAL status
+ * (unless a limit was exceeded) with `why` as its message. */
+static void stream_reject(grpc_client_stream *st, grpc_err err, const char *why) {
+  st->err = err;
+  st->stream_done = true;
+  st->rejected = true;
+  if (err != GRPC_ERR_LIMIT && err != GRPC_ERR_NOMEM) {
+    st->resp.status = GRPC_STATUS_INTERNAL;
+    grpc_free(st->resp.status_message);
+    st->resp.status_message = grpc_strdup(why);
+  }
+}
+
+/* Splits complete length-prefixed gRPC messages off the front of recv_buf. Every message,
+ * including an incomplete one, must declare at most max_message_size bytes (GRPC_ERR_LIMIT
+ * otherwise, as soon as its prefix arrived). Compressed messages (flag 1) are decompressed with
+ * the response's grpc-encoding within max_message_size; a compressed message without a usable
+ * grpc-encoding, corrupt compressed data or a flag other than 0/1 fail the stream (status
+ * INTERNAL, GRPC_ERR_CODEC / GRPC_ERR_PROTOCOL), as the gRPC spec requires. Each message goes to
+ * on_message (then freed) when set, otherwise to recv_queue. Leaves a partial trailing message in
+ * recv_buf. */
 static void stream_drain_messages(grpc_client_stream *st) {
   client_subchannel *s = st->sub;
+  uint64_t max_size = s->parent->config.max_message_size;
   size_t off = 0;
   while (st->recv_buf.len - off >= 5) {
     uint8_t cflag = st->recv_buf.data[off];
     uint32_t mlen = ntohl(uread_u32(st->recv_buf.data + off + 1));
+    if (mlen > max_size) {
+      stream_reject(st, GRPC_ERR_LIMIT, "response message larger than max_message_size");
+      return;
+    }
+    if (cflag > 1) {
+      stream_reject(st, GRPC_ERR_PROTOCOL, "invalid compressed flag");
+      return;
+    }
     if (st->recv_buf.len - off < 5 + (size_t)mlen)
       break;
     const uint8_t *payload = st->recv_buf.data + off + 5;
     grpc_message *msg = nullptr;
-    if (cflag == 1 && st->resp_encoding != GRPC_COMPRESS_IDENTITY) {
+    if (cflag == 1) {
+      if (st->resp_encoding == GRPC_COMPRESS_IDENTITY || st->resp_encoding_unsupported) {
+        stream_reject(st, GRPC_ERR_CODEC, "compressed response without a supported grpc-encoding");
+        return;
+      }
       uint8_t *decomp = nullptr;
       size_t dlen = 0;
       grpc_err derr = grpc_decompress_limited(st->resp_encoding, payload, mlen, &decomp, &dlen,
-                                              s->parent->config.max_message_size);
-      if (derr == GRPC_OK) {
-        msg = message_create(0, decomp, dlen);
-        grpc_free(decomp);
-      } else {
-        st->err = derr;
-        st->stream_done = true;
+                                              (size_t)max_size);
+      if (derr != GRPC_OK) {
+        stream_reject(st, derr, "failed to decompress the response");
         return;
       }
+      msg = message_create(0, decomp, dlen);
+      grpc_free(decomp);
     } else {
-      msg = message_create(cflag, payload, mlen);
+      msg = message_create(0, payload, mlen);
     }
     if (msg == nullptr) {
-      st->err = GRPC_ERR_NOMEM;
-      st->stream_done = true;
+      stream_reject(st, GRPC_ERR_NOMEM, "out of memory");
       return;
     }
     if (st->on_message != nullptr) {
@@ -378,8 +493,7 @@ static void stream_drain_messages(grpc_client_stream *st) {
       grpc_message_free(msg);
     } else if (msg_queue_push(&st->recv_queue, msg) != GRPC_OK) {
       grpc_message_free(msg);
-      st->err = GRPC_ERR_NOMEM;
-      st->stream_done = true;
+      stream_reject(st, GRPC_ERR_NOMEM, "out of memory");
       return;
     }
     off += 5 + (size_t)mlen;
@@ -391,8 +505,8 @@ static void stream_drain_messages(grpc_client_stream *st) {
 }
 
 /* nghttp2 DATA callback: appends the active stream's bytes to recv_buf and extracts complete
- * messages. Fails the stream with GRPC_ERR_LIMIT once the buffered bytes would exceed
- * max_message_size plus the 5-byte prefix. */
+ * messages (stream_drain_messages() enforces max_message_size per message, so the buffer holds
+ * at most one allowed message plus one received chunk). */
 static int client_on_data_chunk([[maybe_unused]] nghttp2_session *session,
                                 [[maybe_unused]] uint8_t flags, int32_t stream_id,
                                 const uint8_t *data, size_t len, void *user_data) {
@@ -406,11 +520,6 @@ static int client_on_data_chunk([[maybe_unused]] nghttp2_session *session,
 int client_resp_data(grpc_client_stream *st, const uint8_t *data, size_t len) {
   if (st->stream_done)
     return 0;
-  if (st->recv_buf.len + len > st->sub->parent->config.max_message_size + 5) {
-    st->err = GRPC_ERR_LIMIT;
-    st->stream_done = true;
-    return 0;
-  }
   if (buf_append(&st->recv_buf, data, len)) {
     st->err = GRPC_ERR_NOMEM;
     st->stream_done = true;
@@ -451,12 +560,17 @@ static int client_on_stream_close([[maybe_unused]] nghttp2_session *session, int
 
 /* nghttp2 data-provider callback for the request body: copies queued bytes from send_buf, sets
  * EOF once the send side is half-closed and drained, and returns NGHTTP2_ERR_DEFERRED when there
- * is nothing to send yet (resumed by nghttp2_session_resume_data on the next send/close). */
-static ssize_t client_data_read([[maybe_unused]] nghttp2_session *session,
-                                [[maybe_unused]] int32_t stream_id, uint8_t *buf, size_t length,
-                                uint32_t *data_flags, nghttp2_data_source *source,
-                                [[maybe_unused]] void *user_data) {
-  grpc_client_stream *st = source->ptr;
+ * is nothing to send yet (resumed by nghttp2_session_resume_data on the next send/close). The
+ * stream is looked up through the subchannel rather than the data source, which may outlive it:
+ * once the application freed the stream (e.g. after the server answered before the whole
+ * request was sent) the callback fails it, and nghttp2 resets that stream. */
+static ssize_t client_data_read([[maybe_unused]] nghttp2_session *session, int32_t stream_id,
+                                uint8_t *buf, size_t length, uint32_t *data_flags,
+                                [[maybe_unused]] nghttp2_data_source *source, void *user_data) {
+  client_subchannel *s = user_data;
+  grpc_client_stream *st = s->active_stream;
+  if (st == nullptr || st->stream_id != stream_id)
+    return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
   size_t rem = st->send_buf.len - st->send_off;
   if (rem == 0) {
     if (st->send_closed) {
@@ -643,14 +757,35 @@ static void sub_disconnect(client_subchannel *s) {
   s->tls_obuf.len = 0;
 }
 
-/* Ensures the subchannel is connected, reconnecting from scratch if it was closed. Creates a
- * fresh loop, connects to the Unix path or to each resolved address in turn (IP literals skip
- * getaddrinfo, which otherwise blocks), performs the TLS handshake when configured, creates the
- * nghttp2 session and queues SETTINGS. The whole sequence is bounded by config.timeout_ms when
- * nonzero. Blocks the caller while it runs the private loop. Returns GRPC_OK, or GRPC_ERR_IO /
- * GRPC_ERR_NOMEM / GRPC_ERR_PROTOCOL after disconnecting again. */
-static grpc_err sub_connect(client_subchannel *s) {
-  if (s->connected && !s->closed && (s->ngsession != nullptr || s->h3c != nullptr))
+/* True if a connected subchannel can still carry a new RPC. Its loop only runs during RPCs, so
+ * this first catches up: refreshes the loop clock and handles what arrived meanwhile (an EOF, a
+ * GOAWAY), then asks the transport: nghttp2 refuses new streams after a GOAWAY, and a QUIC
+ * connection may have idled out. */
+static bool sub_usable(client_subchannel *s) {
+  if (!s->connected || s->closed || (s->ngsession == nullptr && s->h3c == nullptr))
+    return false;
+  /* QUIC first: whether the connection went silent for too long must be judged before reading
+   * the packets that queued up since the last call, which would look like fresh activity */
+  if (s->h3c != nullptr && !h3c_usable(s))
+    return false;
+  uv_update_time(&s->loop);
+  (void)uv_run(&s->loop, UV_RUN_NOWAIT);
+  if (s->closed)
+    return false;
+  if (s->h3c != nullptr) /* again: a GOAWAY may have arrived just now */
+    return h3c_usable(s);
+  return s->ngsession != nullptr && nghttp2_session_check_request_allowed(s->ngsession) != 0;
+}
+
+/* Ensures the subchannel is connected, reconnecting from scratch if it was closed or can no
+ * longer carry requests (sub_usable()). Creates a fresh loop, connects to the Unix path or to each
+ * resolved address in turn (IP literals skip getaddrinfo, which otherwise blocks), performs the
+ * TLS handshake when configured, creates the nghttp2 session and queues SETTINGS. The whole
+ * sequence is bounded by bound_ms when nonzero (the smaller of config.timeout_ms and the RPC's
+ * own deadline). Blocks the caller while it runs the private loop. Returns GRPC_OK, or
+ * GRPC_ERR_IO / GRPC_ERR_NOMEM / GRPC_ERR_PROTOCOL after disconnecting again. */
+static grpc_err sub_connect(client_subchannel *s, uint32_t bound_ms) {
+  if (sub_usable(s))
     return GRPC_OK;
   sub_disconnect(s);
   s->closed = false;
@@ -667,8 +802,8 @@ static grpc_err sub_connect(client_subchannel *s) {
   /* Bound connect + TLS handshake by the default deadline so an unresponsive
    * peer cannot block the caller forever. */
   s->connect_deadline_hit = false;
-  if (s->parent->config.timeout_ms > 0)
-    uv_timer_start(&s->timer, on_sub_connect_deadline, s->parent->config.timeout_ms, 0);
+  if (bound_ms > 0)
+    uv_timer_start(&s->timer, on_sub_connect_deadline, bound_ms, 0);
 
   if (s->parent->config.transport == GRPC_TRANSPORT_HTTP3) {
     if (h3c_connect(s) != GRPC_OK)
@@ -760,8 +895,18 @@ static grpc_err sub_connect(client_subchannel *s) {
     SSL_set_bio(s->ssl, rbio, wbio);
     const char *sni =
         s->parent->config.tls.server_name != nullptr ? s->parent->config.tls.server_name : s->host;
-    if (sni != nullptr && sni[0] != '\0')
-      (void)SSL_set_tlsext_host_name(s->ssl, sni);
+    if (sni != nullptr && sni[0] != '\0') {
+      /* the certificate must also be issued for this name (or IP address), not just chain to a
+       * trusted CA; SNI carries DNS names only */
+      unsigned char addr[16];
+      bool is_ip = uv_inet_pton(AF_INET, sni, addr) == 0 || uv_inet_pton(AF_INET6, sni, addr) == 0;
+      bool verify = !s->parent->config.tls.insecure_skip_verify;
+      if (!is_ip)
+        (void)SSL_set_tlsext_host_name(s->ssl, sni);
+      if (verify && (is_ip ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(s->ssl), sni) != 1
+                           : SSL_set1_host(s->ssl, sni) != 1))
+        goto fail_io;
+    }
     SSL_set_connect_state(s->ssl);
   }
 #endif
@@ -785,7 +930,11 @@ static grpc_err sub_connect(client_subchannel *s) {
 
   nghttp2_settings_entry iv[] = {
       {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100},
-      {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, s->parent->config.max_message_size},
+      /* a whole message fits the stream window, within HTTP/2's 2^31 - 1 limit */
+      {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,
+       s->parent->config.max_message_size > NGHTTP2_MAX_WINDOW_SIZE
+           ? (uint32_t)NGHTTP2_MAX_WINDOW_SIZE
+           : s->parent->config.max_message_size},
   };
   rv = nghttp2_submit_settings(s->ngsession, NGHTTP2_FLAG_NONE, iv, 2);
   if (rv != 0) {
@@ -884,7 +1033,9 @@ static grpc_err init_subchannel(client_subchannel *s, grpc_client *parent, const
     if (s->host == nullptr)
       return GRPC_ERR_NOMEM;
     s->port = port;
-    snprintf(s->authority, sizeof(s->authority), "%s:%u", s->host, s->port);
+    /* an IPv6 address is bracketed in the authority, as in a URL */
+    snprintf(s->authority, sizeof(s->authority),
+             strchr(s->host, ':') != nullptr ? "[%s]:%u" : "%s:%u", s->host, s->port);
   }
   return GRPC_OK;
 }
@@ -899,6 +1050,7 @@ static grpc_err init_subchannel(client_subchannel *s, grpc_client *parent, const
 GRPC_API grpc_client *grpc_client_new(const grpc_client_config *config, grpc_err *out_err) {
   if (out_err != nullptr)
     *out_err = GRPC_OK;
+  ignore_default_sigpipe();
   if (config == nullptr ||
       (config->nb_targets == 0 && config->unix_path == nullptr && config->port == 0) ||
       (config->nb_targets > 0 && config->targets == nullptr)) {
@@ -978,7 +1130,7 @@ GRPC_API grpc_client *grpc_client_new(const grpc_client_config *config, grpc_err
     bool any_ok = false;
     grpc_err last_err = GRPC_ERR_IO;
     for (size_t i = 0; i < c->nb_subs; i++) {
-      grpc_err cerr = sub_connect(&c->subs[i]);
+      grpc_err cerr = sub_connect(&c->subs[i], c->config.timeout_ms);
       if (cerr == GRPC_OK)
         any_ok = true;
       else
@@ -993,7 +1145,7 @@ GRPC_API grpc_client *grpc_client_new(const grpc_client_config *config, grpc_err
     err = init_subchannel(&c->subs[0], c, config->host, config->port, config->unix_path);
     if (err != GRPC_OK)
       goto fail;
-    err = sub_connect(&c->subs[0]);
+    err = sub_connect(&c->subs[0], c->config.timeout_ms);
     if (err != GRPC_OK)
       goto fail;
   }
@@ -1085,6 +1237,10 @@ static grpc_err frame_message_into(grpc_client *c, grpc_buf *dst, const void *da
     cflag = 1;
     body = comp_buf;
   }
+  if (body_len > UINT32_MAX) { /* the gRPC length prefix is 32 bits */
+    grpc_free(comp_buf);
+    return GRPC_ERR_LIMIT;
+  }
   uint8_t prefix[5];
   prefix[0] = cflag;
   uint32_t net_len = htonl((uint32_t)body_len);
@@ -1095,10 +1251,24 @@ static grpc_err frame_message_into(grpc_client *c, grpc_buf *dst, const void *da
 }
 
 /* Frees a stream and everything it owns, stopping the deadline timer and detaching it from its
- * subchannel. Does not send RST_STREAM (grpc_client_stream_cancel does that first). */
+ * subchannel. An HTTP/2 stream nghttp2 still has open (the server answered before the request
+ * was fully sent, or the client gave up on a local error) is reset with CANCEL so the server
+ * stops, and the data provider never reaches the freed stream. */
 static void stream_free_internal(grpc_client_stream *st) {
   if (st == nullptr)
     return;
+  client_subchannel *sub = st->sub;
+  if (sub != nullptr && sub->h3c == nullptr && sub->ngsession != nullptr && !sub->closed &&
+      st->stream_id > 0) {
+    nghttp2_stream *ns = nghttp2_session_find_stream(sub->ngsession, (int32_t)st->stream_id);
+    if (ns != nullptr && nghttp2_stream_get_state(ns) != NGHTTP2_STREAM_STATE_CLOSED) {
+      (void)nghttp2_submit_rst_stream(sub->ngsession, NGHTTP2_FLAG_NONE, (int32_t)st->stream_id,
+                                      NGHTTP2_CANCEL);
+      if (sub->active_stream == st)
+        sub->active_stream = nullptr;
+      sub_flush(sub);
+    }
+  }
   if (st->sub != nullptr) {
     if (st->sub->timer_initialized)
       uv_timer_stop(&st->sub->timer);
@@ -1128,11 +1298,19 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
       *out_err = GRPC_ERR_STATE;
     return nullptr;
   }
-  grpc_err err = sub_connect(s);
+  /* the RPC's deadline covers a reconnect too: bound it by that as well */
+  grpc_client *c = s->parent;
+  uint32_t eff_timeout = timeout_ms ? timeout_ms : c->config.timeout_ms;
+  uint64_t start_ms = uv_hrtime() / 1000000u;
+  grpc_err err = sub_connect(s, eff_timeout);
   if (err != GRPC_OK) {
     if (out_err != nullptr)
       *out_err = err;
     return nullptr;
+  }
+  if (eff_timeout > 0) {
+    uint64_t spent = uv_hrtime() / 1000000u - start_ms;
+    eff_timeout = spent < eff_timeout ? eff_timeout - (uint32_t)spent : 1;
   }
   grpc_client_stream *st = grpc_calloc(1, sizeof(*st));
   if (st == nullptr) {
@@ -1143,7 +1321,6 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
   st->sub = s;
   st->resp.status = GRPC_STATUS_UNKNOWN;
 
-  grpc_client *c = s->parent;
   const char *enc_name = nullptr;
   switch (c->config.compression) {
   case GRPC_COMPRESS_GZIP:
@@ -1161,10 +1338,15 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
   default:
     break;
   }
-  uint32_t eff_timeout = timeout_ms ? timeout_ms : c->config.timeout_ms;
+  /* grpc-timeout allows at most 8 digits: switch to a coarser unit, rounding up */
   char timeout_str[32] = {0};
-  if (eff_timeout > 0)
-    snprintf(timeout_str, sizeof(timeout_str), "%um", eff_timeout);
+  if (eff_timeout > 0) {
+    if (eff_timeout <= 99999999u)
+      snprintf(timeout_str, sizeof(timeout_str), "%um", eff_timeout);
+    else
+      snprintf(timeout_str, sizeof(timeout_str), "%uS",
+               eff_timeout / 1000u + (eff_timeout % 1000u != 0));
+  }
 
   const char *scheme =
       c->config.tls.enable || c->config.transport == GRPC_TRANSPORT_HTTP3 ? "https" : "http";
@@ -1186,9 +1368,20 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
   nva[n++] = (nghttp2_nv){(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16,
                           NGHTTP2_NV_FLAG_NONE};
   nva[n++] = (nghttp2_nv){(uint8_t *)"te", (uint8_t *)"trailers", 2, 8, NGHTTP2_NV_FLAG_NONE};
-  nva[n++] =
-      (nghttp2_nv){(uint8_t *)"grpc-accept-encoding",
-                   (uint8_t *)"gzip,deflate,zstd,snappy,identity", 20, 33, NGHTTP2_NV_FLAG_NONE};
+  /* only the codecs this build can decode */
+  static const char accept_encoding[] =
+#if defined(GRPC_ENABLE_ZLIB)
+      "gzip,deflate,"
+#endif
+#if defined(GRPC_ENABLE_ZSTD)
+      "zstd,"
+#endif
+#if defined(GRPC_ENABLE_SNAPPY)
+      "snappy,"
+#endif
+      "identity";
+  nva[n++] = (nghttp2_nv){(uint8_t *)"grpc-accept-encoding", (uint8_t *)accept_encoding, 20,
+                          sizeof(accept_encoding) - 1, NGHTTP2_NV_FLAG_NONE};
   if (enc_name != nullptr)
     nva[n++] = (nghttp2_nv){(uint8_t *)"grpc-encoding", (uint8_t *)enc_name, 13, strlen(enc_name),
                             NGHTTP2_NV_FLAG_NONE};
@@ -1205,6 +1398,13 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
     }
     size_t klen = metadata[i].key_len ? metadata[i].key_len : strlen(metadata[i].key);
     size_t vlen = metadata[i].value_len ? metadata[i].value_len : strlen(metadata[i].value);
+    if (!metadata_entry_valid(metadata[i].key, klen, metadata[i].value, vlen, false)) {
+      grpc_free(nva);
+      stream_free_internal(st);
+      if (out_err != nullptr)
+        *out_err = GRPC_ERR_INVALID;
+      return nullptr;
+    }
     nva[n++] = (nghttp2_nv){(uint8_t *)metadata[i].key, (uint8_t *)metadata[i].value, klen, vlen,
                             NGHTTP2_NV_FLAG_NONE};
   }
@@ -1226,8 +1426,12 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
     return nullptr;
   }
   st->stream_id = sid;
-  if (eff_timeout > 0)
+  if (eff_timeout > 0) {
+    /* the loop clock stops between RPCs: refresh it, or the deadline counts from the end of the
+     * previous call */
+    uv_update_time(&s->loop);
     uv_timer_start(&s->timer, on_sub_timeout, eff_timeout, 0);
+  }
   sub_flush(s);
   if (out_err != nullptr)
     *out_err = GRPC_OK;
@@ -1394,12 +1598,13 @@ static grpc_err execute_with_retries(grpc_client *c, const char *method, const v
       (req_data == nullptr && req_len > 0) || (metadata == nullptr && nb_metadata > 0))
     return GRPC_ERR_INVALID;
 
-  uint32_t max_attempts = 1 + c->config.max_retries;
+  /* 64-bit: max_retries = UINT32_MAX must not wrap to zero attempts */
+  uint64_t max_attempts = 1 + (uint64_t)c->config.max_retries;
   uint32_t backoff = c->config.retry_backoff_ms;
   grpc_err last_err = GRPC_OK;
   delivery_counter dc = {.on_message = on_message, .userdata = userdata};
 
-  for (uint32_t attempt = 0; attempt < max_attempts; attempt++) {
+  for (uint64_t attempt = 0; attempt < max_attempts; attempt++) {
     if (attempt > 0) {
       grpc_client_response_free(out);
       sleep_ms(backoff);
@@ -1432,7 +1637,10 @@ static grpc_err execute_with_retries(grpc_client *c, const char *method, const v
     last_err = grpc_client_stream_finish(st, out);
     bool transient = (last_err == GRPC_ERR_IO || last_err == GRPC_ERR_CLOSED) ||
                      (last_err == GRPC_OK && out->status == GRPC_STATUS_UNAVAILABLE);
-    if (!transient || dc.delivered > 0)
+    /* once the server answered (response headers or a message), the call is committed: it may
+     * have run, so it is never sent again, and what arrived is kept */
+    bool committed = out->nb_headers > 0 || out->message != nullptr || dc.delivered > 0;
+    if (!transient || committed)
       return last_err;
   }
   return last_err;

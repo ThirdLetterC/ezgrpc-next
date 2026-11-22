@@ -24,6 +24,13 @@
 #include <string.h>
 #include <time.h>
 
+#ifndef _WIN32
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
+#endif
+
 #include "core.h"
 #include "grpc_timeout.h"
 #include "internal_helpers.h"
@@ -347,8 +354,9 @@ static void grpc_winsock_init(void) {
 #endif
 
 /* Creates a TCP socket for family (AF_INET or AF_INET6), binds it to addr:port and listens with
- * backlog. Sets SO_REUSEADDR, SO_REUSEPORT where available, and IPV6_V6ONLY for IPv6 so that the
- * IPv4 and IPv6 listeners can share a port. If bound_port is not nullptr it receives the port
+ * backlog. Sets SO_REUSEADDR (on Windows SO_EXCLUSIVEADDRUSE instead, since its SO_REUSEADDR lets
+ * another socket take the port), SO_REUSEPORT with config.reuse_port, and IPV6_V6ONLY for IPv6
+ * so that the IPv4 and IPv6 listeners can share a port. If bound_port is not nullptr it receives the port
  * actually bound, which resolves port 0. Returns the socket, or GRPC_INVALID_SOCKET after
  * logging and storing GRPC_ERR_INVALID or GRPC_ERR_IO in *out_err (if not nullptr). */
 static uv_os_sock_t open_listener(grpc_server *server, int family, const char *addr, uint16_t port,
@@ -393,10 +401,16 @@ static uv_os_sock_t open_listener(grpc_server *server, int family, const char *a
       *out_err = GRPC_ERR_IO;
     return GRPC_INVALID_SOCKET;
   }
+#ifdef _WIN32
+  (void)setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&(int){1}, sizeof(int));
+#else
+  /* only allows rebinding over TIME_WAIT connections, never a port another socket listens on */
   (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&(int){1}, sizeof(int));
+#endif
 #ifdef SO_REUSEPORT
-  /* lets one server per thread share the port; the kernel spreads connections */
-  (void)setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (const char *)&(int){1}, sizeof(int));
+  /* opt-in: lets one server per thread share the port, the kernel spreading connections */
+  if (server->config.reuse_port)
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, (const char *)&(int){1}, sizeof(int));
 #endif
   if (family == AF_INET6)
     (void)setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&(int){1}, sizeof(int));
@@ -484,9 +498,10 @@ static void on_maintenance_timer(uv_timer_t *handle) {
       continue;
     }
 
-    /* 3. Max connection idle (no active streams) */
-    if (cfg->max_connection_idle_ms > 0 && s->nb_streams == 0 && now >= s->last_activity_ms &&
-        (now - s->last_activity_ms) >= cfg->max_connection_idle_ms) {
+    /* 3. Max connection idle: no stream for max_connection_idle_ms (counted from when the last one
+     * ended, so a slow call does not count as idle time) */
+    if (cfg->max_connection_idle_ms > 0 && s->nb_streams == 0 && now >= s->idle_since_ms &&
+        (now - s->idle_since_ms) >= cfg->max_connection_idle_ms) {
       s->ops->goaway(s);
       s->goaway_sent = true;
       s->goaway_sent_ms = now;
@@ -533,6 +548,29 @@ static void on_async(uv_async_t *handle) {
   run_posted(server);
 }
 
+#ifndef _WIN32
+/* Removes a Unix socket file left behind by a server that is gone, so it can be bound again: only
+ * a socket that refuses connections is removed. A live server's socket, or anything that is not
+ * a socket, is left alone; binding then fails. */
+static void remove_stale_unix_socket(const char *path) {
+  struct stat st;
+  if (lstat(path, &st) != 0 || !S_ISSOCK(st.st_mode))
+    return;
+  struct sockaddr_un sun = {.sun_family = AF_UNIX};
+  size_t len = strlen(path);
+  if (len >= sizeof(sun.sun_path))
+    return;
+  memcpy(sun.sun_path, path, len + 1);
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0)
+    return;
+  bool live = connect(fd, (struct sockaddr *)&sun, sizeof(sun)) == 0 || errno != ECONNREFUSED;
+  close(fd);
+  if (!live)
+    (void)unlink(path);
+}
+#endif
+
 /* Copies the config and fills in defaults, validates the log level, frame and message limits
  * and TLS settings, then binds the sockets before setting up the loop, timers, async handle,
  * listeners, nghttp2 callbacks, the shared read buffer and the session slots. Addresses are
@@ -543,6 +581,7 @@ static void on_async(uv_async_t *handle) {
 GRPC_API grpc_server *grpc_server_new_ex(const grpc_config *config, grpc_err *out_err) {
   if (out_err != nullptr)
     *out_err = GRPC_OK;
+  ignore_default_sigpipe();
   if (config == nullptr) {
     if (out_err != nullptr)
       *out_err = GRPC_ERR_INVALID;
@@ -656,15 +695,28 @@ GRPC_API grpc_server *grpc_server_new_ex(const grpc_config *config, grpc_err *ou
       goto err;
   }
 
+  /* With port 0 the IPv4 listener picks the port and IPv6 takes the same one, which may happen
+   * to be in use on IPv6: then both start over with a new port (a few times). */
   uint16_t bound_port = cfg->port;
-  if (server->ipv4_addr != nullptr &&
-      (server->ipv4_sockfd = open_listener(server, AF_INET, server->ipv4_addr, bound_port,
-                                           cfg->backlog, &bound_port, &err)) == GRPC_INVALID_SOCKET)
-    goto err;
-  if (server->ipv6_addr != nullptr &&
-      (server->ipv6_sockfd = open_listener(server, AF_INET6, server->ipv6_addr, bound_port,
-                                           cfg->backlog, &bound_port, &err)) == GRPC_INVALID_SOCKET)
-    goto err;
+  for (int attempt = 0;; attempt++) {
+    bound_port = cfg->port;
+    if (server->ipv4_addr != nullptr &&
+        (server->ipv4_sockfd = open_listener(server, AF_INET, server->ipv4_addr, bound_port,
+                                             cfg->backlog, &bound_port, &err)) ==
+            GRPC_INVALID_SOCKET)
+      goto err;
+    if (server->ipv6_addr == nullptr ||
+        (server->ipv6_sockfd = open_listener(server, AF_INET6, server->ipv6_addr, bound_port,
+                                             cfg->backlog, &bound_port, &err)) !=
+            GRPC_INVALID_SOCKET)
+      break;
+    bool retry =
+        cfg->port == 0 && server->ipv4_addr != nullptr && err == GRPC_ERR_IO && attempt < 7;
+    if (!retry)
+      goto err;
+    grpc_socket_close(server->ipv4_sockfd);
+    server->ipv4_sockfd = GRPC_INVALID_SOCKET;
+  }
   cfg->port = bound_port;
 
   err = GRPC_ERR_IO;
@@ -704,14 +756,16 @@ GRPC_API grpc_server *grpc_server_new_ex(const grpc_config *config, grpc_err *ou
   }
   if (server->unix_path != nullptr) {
 #ifndef _WIN32
-    (void)unlink(server->unix_path);
+    remove_stale_unix_socket(server->unix_path);
 #endif
     if (uv_pipe_init(&server->loop, &server->unix_listener, 0) != 0)
       goto err;
     server->unix_listener.data = server;
     server->unix_listener_active = true;
-    if (uv_pipe_bind(&server->unix_listener, server->unix_path) != 0 ||
-        uv_listen((uv_stream_t *)&server->unix_listener, cfg->backlog, on_listener_connection) != 0)
+    if (uv_pipe_bind(&server->unix_listener, server->unix_path) != 0)
+      goto err;
+    server->unix_bound = true;
+    if (uv_listen((uv_stream_t *)&server->unix_listener, cfg->backlog, on_listener_connection) != 0)
       goto err;
   }
   if (cfg->keepalive_time_ms > 0 || cfg->max_connection_idle_ms > 0 ||
@@ -854,7 +908,8 @@ GRPC_API void grpc_server_free(grpc_server *server) {
   grpc_free(server->ipv6_addr);
   if (server->unix_path != nullptr) {
 #ifndef _WIN32
-    (void)unlink(server->unix_path);
+    if (server->unix_bound) /* never another server's socket */
+      (void)unlink(server->unix_path);
 #endif
     grpc_free(server->unix_path);
   }
@@ -887,12 +942,21 @@ GRPC_API grpc_err grpc_server_set_log_level(grpc_server *server, grpc_log_level 
  * runs libuv once (blocking for at most timeout_ms; 0 does not block, negative blocks until
  * something happens), dispatches the calls that became ready and flushes the responses. Returns
  * the number of events now available from grpc_server_events(). */
+static int server_poll(grpc_server *server, int timeout_ms, bool keep_events);
+
 GRPC_API int grpc_server_poll(grpc_server *server, int timeout_ms) {
   if (server == nullptr)
     return GRPC_ERR_INVALID;
+  return server_poll(server, timeout_ms, false);
+}
 
-  server_clear_events(server);
-  server->ready_events = 0;
+/* grpc_server_poll(); with keep_events (grpc_server_drain()) the events of earlier iterations are
+ * kept, so none is lost before the application sees it. */
+static int server_poll(grpc_server *server, int timeout_ms, bool keep_events) {
+  if (!keep_events) {
+    server_clear_events(server);
+    server->ready_events = 0;
+  }
 
   /* write everything queued since the last poll, one write per connection */
   server_flush_sessions(server);
@@ -990,22 +1054,62 @@ GRPC_API grpc_err grpc_server_drain(grpc_server *server, int timeout_ms) {
 
   http3_server_stop_accepting(server);
 
-  /* Send GOAWAY on every active session. */
+  uint64_t deadline = timeout_ms > 0 ? grpc_time_now_ms() + (uint64_t)timeout_ms : 0;
+  /* like a poll, drain starts by releasing the events of the previous one */
+  server_clear_events(server);
+  server->ready_events = 0;
+
+  /* gRPC's two-step graceful shutdown on every session that has not been told yet: first a
+   * notice (GOAWAY with the largest stream id, plus a PING over HTTP/2), so requests already on
+   * their way are still accepted; once the client acknowledged the PING (at most 1 s, and never
+   * past the drain deadline) the final GOAWAY names the last stream. A second GOAWAY on a
+   * session that had one would be a protocol error (and aborts nghttp3). */
+  bool noticed = false;
   for (size_t i = 0; i < server->nb_sessions; i++) {
     grpc_session *s = &server->sessions[i];
-    if (s->is_active && !s->is_closing && s->ops != nullptr) {
+    if (s->is_active && !s->is_closing && s->ops != nullptr && !s->goaway_sent &&
+        s->ops->shutdown_notice != nullptr) {
+      s->ops->shutdown_notice(s);
+      session_schedule_flush(s);
+      noticed = true;
+    }
+  }
+  server_flush_sessions(server);
+  if (noticed && timeout_ms != 0) {
+    uint64_t notice_end = grpc_time_now_ms() + 1000;
+    if (timeout_ms > 0 && deadline < notice_end)
+      notice_end = deadline;
+    for (;;) {
+      bool waiting = false;
+      for (size_t i = 0; i < server->nb_sessions && !waiting; i++) {
+        grpc_session *s = &server->sessions[i];
+        waiting = s->is_active && !s->is_closing && !s->goaway_sent && s->ping_pending;
+      }
+      uint64_t now = grpc_time_now_ms();
+      if (!waiting || now >= notice_end)
+        break;
+      uint64_t rem = notice_end - now;
+      int res = server_poll(server, rem > 100 ? 100 : (int)rem, true);
+      if (res < 0)
+        return (grpc_err)res;
+    }
+  }
+  uint64_t goaway_ms = grpc_time_now_ms();
+  for (size_t i = 0; i < server->nb_sessions; i++) {
+    grpc_session *s = &server->sessions[i];
+    if (s->is_active && !s->is_closing && s->ops != nullptr && !s->goaway_sent) {
       s->ops->goaway(s);
+      s->goaway_sent = true;
+      s->goaway_sent_ms = goaway_ms;
       session_schedule_flush(s);
     }
   }
   server_flush_sessions(server);
   atomic_store(&server->stop, true);
-
-  uint64_t deadline = timeout_ms > 0 ? grpc_time_now_ms() + (uint64_t)timeout_ms : 0;
   while (server_active_streams(server) > 0) {
     int wait_ms = -1;
     if (timeout_ms == 0) {
-      (void)grpc_server_poll(server, 0);
+      (void)server_poll(server, 0, true);
       break;
     }
     if (timeout_ms > 0) {
@@ -1015,9 +1119,13 @@ GRPC_API grpc_err grpc_server_drain(grpc_server *server, int timeout_ms) {
       uint64_t rem = deadline - now;
       wait_ms = rem > 100 ? 100 : (int)rem;
     }
-    int res = grpc_server_poll(server, wait_ms);
+    int res = server_poll(server, wait_ms, true);
     if (res < 0)
       return (grpc_err)res;
+    /* calls on event routes need the application: hand the events back, it answers them and
+     * calls grpc_server_drain() again */
+    if (server->nb_events > 0)
+      return GRPC_ERR_STATE;
   }
 
   server_flush_sessions(server);
@@ -1046,9 +1154,11 @@ GRPC_API grpc_err grpc_server_post(grpc_server *server, void (*fn)(void *arg), v
   return GRPC_OK;
 }
 
-/* Writes the output of every session queued for flushing now instead of at the next poll. */
+/* Writes the output of every session queued for flushing now instead of at the next poll. While
+ * the deadline scan runs (an on_done callback of an expired call) the output stays queued: the
+ * poll writes it as soon as the scan is over, and the scan's walk over the sessions stays safe. */
 GRPC_API void grpc_server_flush(grpc_server *server) {
-  if (server != nullptr)
+  if (server != nullptr && !server->in_deadline_scan)
     server_flush_sessions(server);
 }
 

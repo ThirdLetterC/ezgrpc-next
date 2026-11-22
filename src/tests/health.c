@@ -18,10 +18,10 @@ void test_health_status_get_set(void) {
   TEST_ASSERT_NOT_NULL(server);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_health_enable(server));
 
-  /* everything is SERVING until told otherwise */
+  /* the server is SERVING until told otherwise; a service with no status set is unknown */
   TEST_ASSERT_EQUAL_INT(GRPC_HEALTH_SERVING, grpc_health_get_status(server, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_HEALTH_SERVING, grpc_health_get_status(server, ""));
-  TEST_ASSERT_EQUAL_INT(GRPC_HEALTH_SERVING, grpc_health_get_status(server, "any.Service"));
+  TEST_ASSERT_EQUAL_INT(GRPC_HEALTH_SERVICE_UNKNOWN, grpc_health_get_status(server, "any.Service"));
 
   grpc_health_set_status(server, nullptr, GRPC_HEALTH_NOT_SERVING);
   TEST_ASSERT_EQUAL_INT(GRPC_HEALTH_NOT_SERVING, grpc_health_get_status(server, nullptr));

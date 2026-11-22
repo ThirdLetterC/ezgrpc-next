@@ -12,6 +12,11 @@
  * holds a reference on its SSL_CTX, so freeing a context never invalidates live sessions.
  */
 #include <limits.h>
+#ifdef _WIN32
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#endif
 #include <stdbool.h>
 #include <string.h>
 #include <openssl/err.h>
@@ -190,9 +195,15 @@ grpc_quic_tls_session *quic_tls_session_new(grpc_quic_tls_ctx *ctx,
     if (SSL_set_alpn_protos(session->ssl, H3_ALPN, sizeof(H3_ALPN)) != 0)
       goto fail;
     if (sni != nullptr && sni[0] != '\0') {
-      (void)SSL_set_tlsext_host_name(session->ssl, sni);
-      /* verify the certificate against the name too (ignored when verification is off) */
-      if (SSL_get_verify_mode(session->ssl) != SSL_VERIFY_NONE && !SSL_set1_host(session->ssl, sni))
+      /* verify the certificate against the name (or IP address) too, when verification is on;
+       * SNI carries DNS names only */
+      unsigned char addr[16];
+      bool is_ip = inet_pton(AF_INET, sni, addr) == 1 || inet_pton(AF_INET6, sni, addr) == 1;
+      if (!is_ip)
+        (void)SSL_set_tlsext_host_name(session->ssl, sni);
+      if (SSL_get_verify_mode(session->ssl) != SSL_VERIFY_NONE &&
+          (is_ip ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(session->ssl), sni) != 1
+                 : SSL_set1_host(session->ssl, sni) != 1))
         goto fail;
     }
   }
@@ -232,10 +243,19 @@ int quic_tls_peer_subject(grpc_quic_tls_session *session, char *buf, size_t len)
   X509 *cert = SSL_get_peer_certificate(session->ssl);
   if (cert == nullptr)
     return -1;
+  /* a subject that does not fit is not reported at all: a truncated one could match a
+   * different, shorter subject */
   X509_NAME *subject = X509_get_subject_name(cert);
-  char *res = subject != nullptr
-                  ? X509_NAME_oneline(subject, buf, (int)(len > INT_MAX ? INT_MAX : len))
-                  : nullptr;
+  char *full = subject != nullptr ? X509_NAME_oneline(subject, nullptr, 0) : nullptr;
   X509_free(cert);
-  return res != nullptr ? 0 : -1;
+  if (full == nullptr)
+    return -1;
+  size_t n = strlen(full);
+  int res = -1;
+  if (n < len) {
+    memcpy(buf, full, n + 1);
+    res = 0;
+  }
+  OPENSSL_free(full);
+  return res;
 }

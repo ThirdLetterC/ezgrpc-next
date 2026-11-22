@@ -10,6 +10,8 @@
  * instead of blocking.
  */
 #include <errno.h>
+#include <stdio.h>
+#include <string.h>
 #include <gnutls/gnutls.h>
 #include <gnutls/x509.h>
 #include "core.h"
@@ -203,11 +205,19 @@ int tls_backend_drain(grpc_tls_session *tls, grpc_buf *out) {
 /* Runs gnutls_handshake() on the ciphertext fed so far. Returns 1 when complete, -1 on a fatal
  * error, and 0 on any non-fatal result (GNUTLS_E_AGAIN when more input is needed). */
 int tls_backend_handshake(grpc_tls_session *tls) {
-  int ret = gnutls_handshake(tls->session);
-  if (ret == GNUTLS_E_SUCCESS) {
-    return 1;
+  /* GNUTLS_E_AGAIN means more ciphertext is needed; other non-fatal codes (an interrupted call,
+   * a warning alert) mean "call again now": waiting for input instead could stall the handshake
+   * with its input already buffered. Bounded, so a peer cannot keep it spinning. */
+  for (int tries = 0; tries < 16; tries++) {
+    int ret = gnutls_handshake(tls->session);
+    if (ret == GNUTLS_E_SUCCESS)
+      return 1;
+    if (ret == GNUTLS_E_AGAIN)
+      return 0;
+    if (gnutls_error_is_fatal(ret))
+      return -1;
   }
-  return gnutls_error_is_fatal(ret) ? -1 : 0;
+  return 0;
 }
 
 /* Decrypts up to `len` bytes into `buf`. Returns the byte count, -2 on GNUTLS_E_AGAIN (more
@@ -254,23 +264,96 @@ void tls_backend_close_notify(grpc_tls_session *tls) {
   (void)gnutls_bye(tls->session, GNUTLS_SHUT_WR);
 }
 
-/* Writes the RFC 4514 distinguished name of the peer's leaf certificate into `buf`. Returns 0 on
- * success, -1 if there is no peer certificate, it cannot be parsed, or `buf` is too small (the
- * name is not truncated). */
-int tls_backend_peer_subject(grpc_tls_session *tls, char *buf, size_t len) {
+/* OpenSSL's short names for the usual subject attributes; others print as their OID. */
+static const struct {
+  const char *oid;
+  const char *name;
+} subject_attr_names[] = {
+    {"2.5.4.3", "CN"},
+    {"2.5.4.4", "SN"},
+    {"2.5.4.5", "serialNumber"},
+    {"2.5.4.6", "C"},
+    {"2.5.4.7", "L"},
+    {"2.5.4.8", "ST"},
+    {"2.5.4.9", "street"},
+    {"2.5.4.10", "O"},
+    {"2.5.4.11", "OU"},
+    {"2.5.4.12", "title"},
+    {"2.5.4.17", "postalCode"},
+    {"2.5.4.42", "GN"},
+    {"1.2.840.113549.1.9.1", "emailAddress"},
+    {"0.9.2342.19200300.100.1.1", "UID"},
+    {"0.9.2342.19200300.100.1.25", "DC"},
+};
+
+/* Appends n bytes to buf[*off]; false when they do not fit (with room for the NUL). */
+static bool subject_put(char *buf, size_t len, size_t *off, const char *s, size_t n) {
+  if (n >= len - *off)
+    return false;
+  memcpy(buf + *off, s, n);
+  *off += n;
+  return true;
+}
+
+int tls_gnutls_peer_subject(gnutls_session_t session, char *buf, size_t len) {
+  if (len == 0)
+    return -1;
   unsigned int list_size = 0;
-  const gnutls_datum_t *certs = gnutls_certificate_get_peers(tls->session, &list_size);
+  const gnutls_datum_t *certs = gnutls_certificate_get_peers(session, &list_size);
   if (certs == nullptr || list_size == 0)
     return -1;
   gnutls_x509_crt_t crt;
   if (gnutls_x509_crt_init(&crt) < 0)
     return -1;
   int res = -1;
-  if (gnutls_x509_crt_import(crt, &certs[0], GNUTLS_X509_FMT_DER) >= 0) {
-    size_t sz = len;
-    if (gnutls_x509_crt_get_dn(crt, buf, &sz) == GNUTLS_E_SUCCESS)
-      res = 0;
+  gnutls_x509_dn_t dn;
+  if (gnutls_x509_crt_import(crt, &certs[0], GNUTLS_X509_FMT_DER) < 0 ||
+      gnutls_x509_crt_get_subject(crt, &dn) < 0)
+    goto out;
+  size_t off = 0;
+  for (int irdn = 0;; irdn++) {
+    gnutls_x509_ava_st ava;
+    int rv = gnutls_x509_dn_get_rdn_ava(dn, irdn, 0, &ava);
+    if (rv == GNUTLS_E_ASN1_ELEMENT_NOT_FOUND)
+      break;
+    if (rv < 0)
+      goto out;
+    for (int iava = 0; rv >= 0; rv = gnutls_x509_dn_get_rdn_ava(dn, irdn, ++iava, &ava)) {
+      /* the OID is text; its datum may count a terminating NUL */
+      size_t oid_len = strnlen((const char *)ava.oid.data, ava.oid.size);
+      const char *name = nullptr;
+      for (size_t k = 0; k < sizeof(subject_attr_names) / sizeof(subject_attr_names[0]); k++) {
+        if (strlen(subject_attr_names[k].oid) == oid_len &&
+            memcmp(subject_attr_names[k].oid, ava.oid.data, oid_len) == 0) {
+          name = subject_attr_names[k].name;
+          break;
+        }
+      }
+      if (!subject_put(buf, len, &off, iava == 0 ? "/" : "+", 1) ||
+          !subject_put(buf, len, &off, name != nullptr ? name : (const char *)ava.oid.data,
+                       name != nullptr ? strlen(name) : oid_len) ||
+          !subject_put(buf, len, &off, "=", 1))
+        goto out;
+      for (unsigned int b = 0; b < ava.value.size; b++) {
+        unsigned char ch = ava.value.data[b];
+        char esc[5];
+        bool printable = ch >= 0x20 && ch <= 0x7E;
+        if (!printable)
+          snprintf(esc, sizeof(esc), "\\x%02X", ch);
+        if (!subject_put(buf, len, &off, printable ? (const char *)&ava.value.data[b] : esc,
+                         printable ? 1 : 4))
+          goto out;
+      }
+    }
   }
+  buf[off] = '\0';
+  res = 0;
+out:
   gnutls_x509_crt_deinit(crt);
   return res;
+}
+
+/* Writes the subject of the peer certificate (see tls_gnutls_peer_subject()). */
+int tls_backend_peer_subject(grpc_tls_session *tls, char *buf, size_t len) {
+  return tls_gnutls_peer_subject(tls->session, buf, len);
 }

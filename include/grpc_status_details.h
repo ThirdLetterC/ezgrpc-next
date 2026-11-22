@@ -66,9 +66,10 @@ GRPC_API GRPC_NODISCARD char *grpc_status_details_encode(int32_t code, const cha
  * ``*out_message``, ``*out_type_url``, and ``*out_detail_value`` are allocated
  * with grpc_malloc() and must be freed with grpc_free(). Every output pointer
  * may be nullptr to skip that field; fields that are absent are set to nullptr
- * / 0. Decoding is lenient: malformed or truncated fields are skipped.
- * Returns GRPC_ERR_INVALID if ``base64_str`` is nullptr (the outputs are then
- * left untouched).
+ * / 0. The type URL and value always come from the same (first) detail entry.
+ * Decoding is lenient: it stops at a malformed field and keeps what was read.
+ * Returns GRPC_ERR_INVALID if ``base64_str`` is nullptr or not Base64 (the
+ * outputs are then left untouched).
  */
 GRPC_API GRPC_NODISCARD grpc_err grpc_status_details_decode(const char *base64_str,
                                                             int32_t *out_code, char **out_message,
@@ -79,8 +80,10 @@ GRPC_API GRPC_NODISCARD grpc_err grpc_status_details_decode(const char *base64_s
 /**
  * Decodes a 'grpc-status-details-bin' base64 string with all Any detail entries.
  * Release the populated struct with grpc_status_details_free(). Unlike
- * grpc_status_details_decode(), a message or entry overrunning the input fails
- * with GRPC_ERR_INVALID; on any error ``*out`` is freed and zeroed.
+ * grpc_status_details_decode(), input that is not a valid google.rpc.Status
+ * fails with GRPC_ERR_INVALID: a truncated field, field number 0, a wire type
+ * protobuf does not allow, or a field overrunning the input. Unknown fields
+ * are skipped. On any error ``*out`` is freed and zeroed.
  */
 GRPC_API GRPC_NODISCARD grpc_err grpc_status_details_decode_all(const char *base64_str,
                                                                 grpc_status_details *out);

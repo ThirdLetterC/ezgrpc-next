@@ -43,8 +43,12 @@ GRPC_API grpc_err grpc_health_set_status(grpc_server *server, const char *servic
                                          grpc_health_status status);
 
 /**
- * Returns the status of a service, or of the whole server when ``service`` is
- * nullptr or "". Safe to call from any thread. Returns GRPC_HEALTH_UNKNOWN if
- * health checking was never enabled or set on ``server``.
+ * Returns the status set for a service, or of the whole server when
+ * ``service`` is nullptr or "". Safe to call from any thread. Returns
+ * GRPC_HEALTH_SERVICE_UNKNOWN for a service whose status was never set, and
+ * GRPC_HEALTH_UNKNOWN if health checking was never enabled or set on
+ * ``server``. (The Check and Watch RPCs additionally report a service the
+ * server has routes for as SERVING; Check answers any other service with
+ * NOT_FOUND, as the gRPC health protocol requires.)
  */
 GRPC_API grpc_health_status grpc_health_get_status(grpc_server *server, const char *service);

@@ -70,10 +70,21 @@ void http3_server_free(grpc_server *server) {
   (void)server;
 }
 
-grpc_err http3_server_reload_tls(grpc_server *server, const grpc_tls_config *cfg) {
+grpc_err http3_server_tls_prepare(grpc_server *server, const grpc_tls_config *cfg, void **out) {
   (void)server;
   (void)cfg;
+  *out = nullptr;
   return GRPC_OK;
+}
+
+void http3_server_tls_install(grpc_server *server, void *ctx) {
+  (void)server;
+  (void)ctx;
+}
+
+void http3_server_tls_discard(grpc_server *server, void *ctx) {
+  (void)server;
+  (void)ctx;
 }
 
 uint16_t http3_server_port(const grpc_server *server) {
@@ -95,6 +106,14 @@ grpc_err h3c_connect(client_subchannel *s) {
 }
 void h3c_disconnect(client_subchannel *s) {
   (void)s;
+}
+bool h3c_usable(client_subchannel *s) {
+  (void)s;
+  return false;
+}
+size_t h3c_orphan_count(const client_subchannel *s) {
+  (void)s;
+  return 0;
 }
 int h3c_submit_request(client_subchannel *s, grpc_client_stream *st, const grpc_nv *nva,
                        size_t nvlen) {

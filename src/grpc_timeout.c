@@ -133,7 +133,12 @@ static void on_deadline_timer(uv_timer_t *timer) {
   grpc_server *server = timer->data;
   server->ready_events++;
   server->next_deadline_ms = UINT64_MAX;
+  /* call_abort() runs the application's on_done callbacks; a grpc_server_flush() from there
+   * could close a session (on a write error) while it is being walked, so flushes wait until the
+   * scan is over (the poll writes them right after) */
+  server->in_deadline_scan = true;
   u64 next = expire_deadlines(server, grpc_time_now_ms());
+  server->in_deadline_scan = false;
   if (next != UINT64_MAX)
     server_arm_deadline(server, next);
 }

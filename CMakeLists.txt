@@ -354,6 +354,19 @@ if(GRPC_BUILD_TESTS)
   foreach(name IN LISTS grpc_unit_tests)
     grpc_add_unit_test(${name} "src/tests/${name}.c")
   endforeach()
+  if(NOT WIN32)
+    # the client against a scripted raw HTTP/2 server
+    grpc_add_unit_test(client_raw src/tests/client_raw.c)
+  endif()
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT _grpc_sanitizers)
+    # port 0 on IPv4 + IPv6 retries when IPv6 finds the port taken (a preloaded bind() shim
+    # simulates that; sanitizer runtimes must come first in the preload order, so not with them)
+    add_library(test_bind_v6_busy MODULE src/tests/shims/bind_v6_busy.c)
+    target_link_libraries(test_bind_v6_busy PRIVATE ${CMAKE_DL_LIBS})
+    grpc_add_unit_test(port_retry src/tests/port_retry.c DEPENDS test_bind_v6_busy)
+    set_tests_properties(port_retry PROPERTIES
+      ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:test_bind_v6_busy>")
+  endif()
   target_compile_definitions(test_api PRIVATE "GRPC_LICENSE_FILE=\"${CMAKE_CURRENT_SOURCE_DIR}/LICENSE\"")
 
   if(GRPC_BUILD_SHARED)
@@ -395,12 +408,39 @@ if(GRPC_BUILD_TESTS)
   if(GRPC_TLS_ENABLED)
     set(tls_test_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/tls-tests")
     grpc_add_certificate(test_tls_certificates "${tls_test_dir}" test_cert.pem test_key.pem)
+    # A client certificate (CN=attacker) from a rogue CA that shares the trusted CA's name
+    # (CN=localhost) but not its key: mTLS must reject it on every backend and transport.
+    add_custom_command(OUTPUT "${tls_test_dir}/forged_cert.pem" "${tls_test_dir}/forged_key.pem"
+      COMMAND "${GRPC_HOST_OPENSSL_EXECUTABLE}" req -batch -x509 -newkey rsa:2048 -nodes
+        -keyout rogue_ca_key.pem -out rogue_ca_cert.pem -days 365 -subj /CN=localhost
+      COMMAND "${GRPC_HOST_OPENSSL_EXECUTABLE}" req -batch -new -newkey rsa:2048 -nodes
+        -keyout forged_key.pem -out forged.csr -subj /CN=attacker
+      COMMAND "${GRPC_HOST_OPENSSL_EXECUTABLE}" x509 -req -in forged.csr -CA rogue_ca_cert.pem
+        -CAkey rogue_ca_key.pem -set_serial 1 -days 365 -out forged_cert.pem
+      WORKING_DIRECTORY "${tls_test_dir}" VERBATIM)
+    add_custom_target(test_tls_forged_certificates
+      DEPENDS "${tls_test_dir}/forged_cert.pem" "${tls_test_dir}/forged_key.pem")
+    add_dependencies(test_tls_forged_certificates test_tls_certificates)
     grpc_add_unit_test(tls src/tests/tls.c
       DEFINITIONS "EXPECTED_TLS_BACKEND=\"${_tls_backend}\""
-      WORKING_DIRECTORY "${tls_test_dir}" DEPENDS test_tls_certificates)
+      WORKING_DIRECTORY "${tls_test_dir}" DEPENDS test_tls_certificates test_tls_forged_certificates)
+    # backend-specific checks use the TLS library's own API (e.g. a GnuTLS client)
+    target_link_libraries(test_tls PRIVATE ${GRPC_TLS_LIBRARIES})
+    if(RUSTLS_INCLUDE_DIR)
+      target_include_directories(test_tls PRIVATE "${RUSTLS_INCLUDE_DIR}")
+    endif()
     if(GRPC_HTTP3_ENABLED)
       grpc_add_unit_test(http3 src/tests/http3.c
+        WORKING_DIRECTORY "${tls_test_dir}" DEPENDS test_tls_certificates test_tls_forged_certificates)
+      # HTTP/3 client allocation failures (one at a time, on the client's thread)
+      grpc_add_unit_test(http3_oom src/tests/http3_oom.c
         WORKING_DIRECTORY "${tls_test_dir}" DEPENDS test_tls_certificates)
+      if(NOT WIN32)
+        # a raw ngtcp2 client (needs the QUIC libraries' headers) against the server
+        grpc_add_unit_test(http3_raw src/tests/http3_raw.c
+          WORKING_DIRECTORY "${tls_test_dir}" DEPENDS test_tls_certificates)
+        target_link_libraries(test_http3_raw PRIVATE ${GRPC_HTTP3_TARGETS} ${GRPC_TLS_LIBRARIES})
+      endif()
     endif()
   endif()
 endif()

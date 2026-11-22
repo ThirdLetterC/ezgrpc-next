@@ -40,7 +40,7 @@ static size_t pb_write_varint(uint8_t *buf, uint64_t v) {
  * Encodes grpc.channelz.v1.GetServersResponse:
  *   repeated Server server = 1;
  *   bool end = 2;
- * Server { ServerRef ref = 1 { int64 server_id = 1; string name = 2; };
+ * Server { ServerRef ref = 1 { int64 server_id = 5; string name = 6; };
  *          ServerData data = 2 { int64 calls_started = 2; int64 calls_succeeded = 3;
  *                                int64 calls_failed = 4; }; }
  */
@@ -50,14 +50,14 @@ static void channelz_get_servers(grpc_call *call, [[maybe_unused]] const grpc_me
   grpc_server_stats st = {0};
   (void)grpc_server_get_stats(server, &st);
 
-  /* ServerRef { server_id = 1, name = "ezGRPC-next" } */
+  /* ServerRef { server_id = 5: 1, name = 6: "ezGRPC-next" } (grpc.channelz.v1 numbers) */
   const char *name = "ezGRPC-next";
   size_t name_len = strlen(name);
   uint8_t ref_buf[64];
   size_t ref_len = 0;
-  ref_buf[ref_len++] = (1 << 3) | 0;
+  ref_buf[ref_len++] = (5 << 3) | 0;
   ref_len += pb_write_varint(ref_buf + ref_len, 1);
-  ref_buf[ref_len++] = (2 << 3) | 2;
+  ref_buf[ref_len++] = (6 << 3) | 2;
   ref_len += pb_write_varint(ref_buf + ref_len, name_len);
   memcpy(ref_buf + ref_len, name, name_len);
   ref_len += name_len;
@@ -111,7 +111,7 @@ static void channelz_get_servers(grpc_call *call, [[maybe_unused]] const grpc_me
  * encodes it into a grpc_malloc buffer; replies RESOURCE_EXHAUSTED if that allocation fails.
  *
  * Encodes grpc.channelz.v1.GetServerSocketsResponse:
- *   repeated SocketRef socket_ref = 1 { int64 socket_id = 1; string name = 2; };
+ *   repeated SocketRef socket_ref = 1 { int64 socket_id = 3; string name = 4; };
  *   bool end = 2;
  */
 static void channelz_get_server_sockets(grpc_call *call,
@@ -141,10 +141,10 @@ static void channelz_get_server_sockets(grpc_call *call,
     size_t inner = 1 + pb_varint_len(i + 1) + (plen > 0 ? 1 + pb_varint_len(plen) + plen : 0);
     resp[off++] = (1 << 3) | 2;
     off += pb_write_varint(resp + off, inner);
-    resp[off++] = (1 << 3) | 0;
+    resp[off++] = (3 << 3) | 0; /* SocketRef.socket_id */
     off += pb_write_varint(resp + off, i + 1);
     if (plen > 0) {
-      resp[off++] = (2 << 3) | 2;
+      resp[off++] = (4 << 3) | 2; /* SocketRef.name */
       off += pb_write_varint(resp + off, plen);
       memcpy(resp + off, peer, plen);
       off += plen;

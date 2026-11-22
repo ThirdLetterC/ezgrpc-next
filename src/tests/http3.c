@@ -507,7 +507,8 @@ void test_http3_compression_and_mtls(void) {
                         grpc_client_unary(client, "/h3.Svc/WhoAmI", "", 0, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   fx_read(fx.peer_subject, seen, sizeof(seen));
-  TEST_ASSERT_NOT_NULL(strstr(seen, "localhost"));
+  /* the same one-line format on every TLS backend */
+  TEST_ASSERT_EQUAL_STRING("/CN=localhost", seen);
   grpc_client_response_free(&resp);
   client_free(client);
 
@@ -518,6 +519,34 @@ void test_http3_compression_and_mtls(void) {
     grpc_err rpc = grpc_client_unary(client, "/h3.Svc/Echo", "x", 1, nullptr, 0, 1000, &resp);
     TEST_ASSERT_TRUE(rpc != GRPC_OK || resp.status != GRPC_STATUS_OK);
     grpc_client_response_free(&resp);
+    client_free(client);
+  }
+
+  /* a certificate from a rogue CA with the trusted CA's name is refused too (the GnuTLS QUIC
+   * server used to check only that some certificate was sent) */
+  client = grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
+                                                 .port = grpc_server_http3_port(server),
+                                                 .timeout_ms = 2000,
+                                                 .transport = GRPC_TRANSPORT_HTTP3,
+                                                 .tls = {.enable = true,
+                                                         .ca_file = "test_cert.pem",
+                                                         .cert_file = "forged_cert.pem",
+                                                         .key_file = "forged_key.pem",
+                                                         .server_name = "localhost"}},
+                           &err);
+  if (client != nullptr) {
+    track(client);
+    pthread_mutex_lock(&fx.lock);
+    fx.peer_subject[0] = '\0';
+    pthread_mutex_unlock(&fx.lock);
+    grpc_err rpc = grpc_client_unary(client, "/h3.Svc/WhoAmI", "", 0, nullptr, 0, 1000, &resp);
+    TEST_ASSERT_TRUE_MESSAGE(rpc != GRPC_OK || resp.status != GRPC_STATUS_OK,
+                             "a forged client certificate was accepted");
+    grpc_client_response_free(&resp);
+    char who[256];
+    fx_read(fx.peer_subject, who, sizeof(who));
+    TEST_ASSERT_NULL(strstr(who, "attacker"));
+    client_free(client);
   }
 }
 
@@ -798,6 +827,80 @@ void test_http3_config_errors(void) {
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_IO, err);
 }
 
+/* After the server drops an idle QUIC connection, the next call opens a new one (the client's
+ * timers only run during calls, so it must notice the idle timeout itself). */
+void test_http3_reconnect_after_idle(void) {
+  grpc_config cfg = h3_config();
+  cfg.http3.max_idle_timeout_ms = 300;
+  grpc_server *server = fixture_start(cfg);
+  grpc_err err = GRPC_OK;
+  grpc_client *client = new_h3_client(server, &err);
+  TEST_ASSERT_NOT_NULL(client);
+  for (int i = 0; i < 2; i++) {
+    if (i > 0)
+      sleep_ms(1000);
+    grpc_client_response resp = {0};
+    uint64_t start = now_ms();
+    TEST_ASSERT_EQUAL_INT(
+        GRPC_OK, grpc_client_unary(client, "/h3.Svc/Echo", "x", 1, nullptr, 0, 3000, &resp));
+    TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+    TEST_ASSERT_TRUE_MESSAGE(now_ms() - start < 2000, "the call waited on a dead connection");
+    grpc_client_response_free(&resp);
+  }
+  client_free(client);
+}
+
+/* After the server's GOAWAY (here from max_connection_age) the next calls open a new connection
+ * instead of failing on the old one, which no longer accepts requests. */
+void test_http3_reconnect_after_goaway(void) {
+  grpc_config cfg = h3_config();
+  cfg.max_connection_age_ms = 300;
+  grpc_server *server = fixture_start(cfg);
+  grpc_err err = GRPC_OK;
+  grpc_client *client = new_h3_client(server, &err);
+  TEST_ASSERT_NOT_NULL(client);
+  for (int i = 0; i < 4; i++) {
+    sleep_ms(i == 0 ? 0 : 700); /* the age limit's GOAWAY goes out in between */
+    grpc_client_response resp = {0};
+    TEST_ASSERT_EQUAL_INT(
+        GRPC_OK, grpc_client_unary(client, "/h3.Svc/Echo", "x", 1, nullptr, 0, 3000, &resp));
+    TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+    grpc_client_response_free(&resp);
+  }
+  client_free(client);
+}
+
+static void *h3_fail_realloc([[maybe_unused]] void *p, [[maybe_unused]] size_t n) {
+  return nullptr;
+}
+
+/* grpc_server_reload_tls() is all or nothing: when the QUIC side cannot be switched (here it
+ * cannot grow its list of replaced contexts), the TCP side keeps its context too. */
+void test_http3_reload_tls_is_atomic(void) {
+  grpc_server *server = grpc_server_new(&(grpc_config){
+      .port = 0,
+      .ipv4_addr = "127.0.0.1",
+      .tls = {.cert_file = "test_cert.pem", .key_file = "test_key.pem"},
+      .http3 = {.enable = true},
+      .log_level = GRPC_LOG_OFF,
+  });
+  TEST_ASSERT_NOT_NULL(server);
+  void *tcp_ctx = grpc_server_tls_native(server);
+  TEST_ASSERT_NOT_NULL(tcp_ctx);
+  grpc_set_allocator(&(grpc_allocator){.realloc = h3_fail_realloc});
+  grpc_err err = grpc_server_reload_tls(
+      server, &(grpc_tls_config){.cert_file = "test_cert.pem", .key_file = "test_key.pem"});
+  grpc_set_allocator(nullptr);
+  TEST_ASSERT_TRUE(err == GRPC_ERR_NOMEM || err == GRPC_ERR_INVALID);
+  TEST_ASSERT_EQUAL_PTR(tcp_ctx, grpc_server_tls_native(server));
+  /* and with memory both switch */
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_reload_tls(server, &(grpc_tls_config){.cert_file = "test_cert.pem",
+                                                                 .key_file = "test_key.pem"}));
+  TEST_ASSERT_TRUE(grpc_server_tls_native(server) != tcp_ctx);
+  grpc_server_free(server);
+}
+
 int main(void) {
   setvbuf(stdout, nullptr, _IONBF, 0);
   UNITY_BEGIN();
@@ -811,5 +914,8 @@ int main(void) {
   RUN_TEST(test_http3_hostile_health);
   RUN_TEST(test_http3_drain);
   RUN_TEST(test_http3_config_errors);
+  RUN_TEST(test_http3_reload_tls_is_atomic);
+  RUN_TEST(test_http3_reconnect_after_idle);
+  RUN_TEST(test_http3_reconnect_after_goaway);
   return UNITY_END();
 }

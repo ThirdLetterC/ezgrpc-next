@@ -28,7 +28,13 @@ void http3_server_free(grpc_server *server);
 /* Builds a QUIC TLS context from `cfg` and makes it the one new connections use (the old one is
  * retired until the server is freed). GRPC_ERR_INVALID if it does not load; GRPC_OK when HTTP/3
  * is not enabled. */
-grpc_err http3_server_reload_tls(grpc_server *server, const grpc_tls_config *cfg);
+/* grpc_server_reload_tls() for HTTP/3, in two steps so the reload is all or nothing: prepare
+ * builds the new QUIC TLS context into *out (nullptr without HTTP/3) and reserves what install
+ * needs, returning GRPC_ERR_INVALID or GRPC_ERR_NOMEM on failure; install then switches to it and
+ * cannot fail; discard drops a prepared context that will not be installed. */
+grpc_err http3_server_tls_prepare(grpc_server *server, const grpc_tls_config *cfg, void **out);
+void http3_server_tls_install(grpc_server *server, void *ctx);
+void http3_server_tls_discard(grpc_server *server, void *ctx);
 
 /* The bound UDP port, or 0. */
 uint16_t http3_server_port(const grpc_server *server);
