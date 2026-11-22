@@ -644,7 +644,12 @@ void test_null_empty_bodies(void) {
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/n.Svc/Stream", null_stream, nullptr));
   start_server(0);
 
-  for (int compressed = 0; compressed < 2; compressed++) {
+#if defined(GRPC_ENABLE_ZLIB)
+  const int passes = 2; /* identity, then gzip */
+#else
+  const int passes = 1;
+#endif
+  for (int compressed = 0; compressed < passes; compressed++) {
     grpc_err err = GRPC_OK;
     grpc_client *client =
         grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
