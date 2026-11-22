@@ -39,7 +39,8 @@ GRPC_API grpc_err grpc_server_add_interceptor(grpc_server *server,
   }
 
   size_t new_nb = server->nb_interceptors + 1;
-  grpc_interceptor *new_arr = grpc_realloc(server->interceptors, new_nb * sizeof(grpc_interceptor));
+  grpc_interceptor *new_arr =
+      grpc_realloc_array(server->interceptors, new_nb, sizeof(grpc_interceptor));
   if (new_arr == nullptr) {
     return GRPC_ERR_NOMEM;
   }
@@ -136,7 +137,7 @@ void interceptors_run_on_done(grpc_call *call, grpc_status status) {
 void interceptors_free(grpc_server *server) {
   for (size_t i = 0; i < server->nb_interceptors; i++) {
     const grpc_interceptor *inc = &server->interceptors[i];
-    grpc_free((void *)inc->path_prefix);
+    grpc_free(grpc_unconst(inc->path_prefix));
     if (inc->userdata_free != nullptr)
       inc->userdata_free(inc->userdata);
   }

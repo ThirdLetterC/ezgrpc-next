@@ -112,7 +112,7 @@ GRPC_API grpc_err grpc_reflection_add_file_descriptor(grpc_server *server,
     return GRPC_ERR_NOMEM;
 
   descriptor_entry *entries =
-      grpc_realloc(state->entries, (state->nb_entries + 1) * sizeof(*entries));
+      grpc_realloc_array(state->entries, (state->nb_entries + 1), sizeof(*entries));
   if (entries == nullptr)
     return GRPC_ERR_NOMEM;
   state->entries = entries;
@@ -144,7 +144,7 @@ typedef struct service_name {
  * point into the routes). Returns nullptr when out of memory. */
 static service_name *collect_services(grpc_server *server, size_t *count) {
   *count = 0;
-  service_name *services = grpc_malloc((server->nb_routes + 1) * sizeof(*services));
+  service_name *services = grpc_malloc_array((server->nb_routes + 1), sizeof(*services));
   if (services == nullptr)
     return nullptr;
   for (size_t i = 0; i < server->nb_routes; i++) {

@@ -66,14 +66,18 @@ static grpc_err nv_list_add(nv_list *list, const char *name, size_t namelen, con
                             size_t valuelen) {
   if (list->len == list->cap) {
     size_t cap = list->cap ? list->cap * 2 : 4;
-    grpc_nv *nva = grpc_realloc(list->nva, cap * sizeof(*nva));
+    grpc_nv *nva = grpc_realloc_array(list->nva, cap, sizeof(*nva));
     if (nva == nullptr)
       return GRPC_ERR_NOMEM;
     list->nva = nva;
     list->cap = cap;
   }
-  /* name and value share one allocation, freed through the name */
-  u8 *block = grpc_malloc(namelen + valuelen + 2);
+  /* name and value share one allocation, freed through the name; the lengths come from the
+   * application, so their sum is checked */
+  size_t block_len;
+  if (grpc_size_add(namelen, valuelen, &block_len) || grpc_size_add(block_len, 2, &block_len))
+    return GRPC_ERR_NOMEM;
+  u8 *block = grpc_malloc(block_len);
   if (block == nullptr)
     return GRPC_ERR_NOMEM;
   memcpy(block, name, namelen);
@@ -116,9 +120,12 @@ grpc_err nv_list_add_metadata(nv_list *list, const grpc_metadata *metadata, size
 }
 
 grpc_nv *call_nva_dup(const grpc_nv *nva, size_t nvlen) {
-  size_t size = nvlen * sizeof(*nva);
+  size_t size;
+  if (grpc_size_mul(nvlen, sizeof(*nva), &size))
+    return nullptr;
   for (size_t i = 0; i < nvlen; i++)
-    size += nva[i].namelen + nva[i].valuelen;
+    if (grpc_size_add(size, nva[i].namelen, &size) || grpc_size_add(size, nva[i].valuelen, &size))
+      return nullptr;
   grpc_nv *copy = grpc_malloc(size);
   if (copy == nullptr)
     return nullptr;

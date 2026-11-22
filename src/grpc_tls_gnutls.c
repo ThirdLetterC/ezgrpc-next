@@ -79,10 +79,9 @@ bool tls_gnutls_load_server_credentials(gnutls_certificate_credentials_t cred,
                                         const grpc_tls_config *cfg) {
   int key_res = -1;
   if (cfg->cert_pem != nullptr && cfg->key_pem != nullptr) {
-    gnutls_datum_t c = {.data = (unsigned char *)cfg->cert_pem,
+    gnutls_datum_t c = {.data = grpc_unconst(cfg->cert_pem),
                         .size = (unsigned int)cfg->cert_pem_len};
-    gnutls_datum_t k = {.data = (unsigned char *)cfg->key_pem,
-                        .size = (unsigned int)cfg->key_pem_len};
+    gnutls_datum_t k = {.data = grpc_unconst(cfg->key_pem), .size = (unsigned int)cfg->key_pem_len};
     key_res = gnutls_certificate_set_x509_key_mem(cred, &c, &k, GNUTLS_X509_FMT_PEM);
   } else if (cfg->cert_file != nullptr && cfg->key_file != nullptr) {
     key_res = gnutls_certificate_set_x509_key_file(cred, cfg->cert_file, cfg->key_file,
@@ -95,7 +94,7 @@ bool tls_gnutls_load_server_credentials(gnutls_certificate_credentials_t cred,
     if (cfg->ca_file != nullptr) {
       ca_res = gnutls_certificate_set_x509_trust_file(cred, cfg->ca_file, GNUTLS_X509_FMT_PEM);
     } else {
-      gnutls_datum_t ca = {.data = (unsigned char *)cfg->ca_pem,
+      gnutls_datum_t ca = {.data = grpc_unconst(cfg->ca_pem),
                            .size = (unsigned int)cfg->ca_pem_len};
       ca_res = gnutls_certificate_set_x509_trust_mem(cred, &ca, GNUTLS_X509_FMT_PEM);
     }
@@ -164,7 +163,7 @@ grpc_tls_session *tls_backend_session_new(grpc_tls_ctx *ctx) {
   }
 
   /* clients that do not offer h2 still connect, as with the other backends */
-  gnutls_datum_t alpn = {.data = (unsigned char *)"h2", .size = 2};
+  gnutls_datum_t alpn = {.data = grpc_unconst("h2"), .size = 2};
   if (gnutls_priority_set(tls->session, ctx->priority) < 0 ||
       gnutls_credentials_set(tls->session, GNUTLS_CRD_CERTIFICATE, ctx->cred) < 0 ||
       gnutls_alpn_set_protocols(tls->session, &alpn, 1, GNUTLS_ALPN_SERVER_PRECEDENCE) < 0) {

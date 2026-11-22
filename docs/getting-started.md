@@ -143,6 +143,8 @@ Put personal presets in `CMakeUserPresets.json` (ignored by git).
 | `-DGRPC_TRACE=ON` | Enables per-frame HTTP/2 trace logging |
 | `-DGRPC_ASAN=ON` | Builds with AddressSanitizer (GCC/Clang); same as `-DGRPC_SANITIZE=address` |
 | `-DGRPC_SANITIZE=<list>` | Sanitizers for the library, tests and examples (GCC/Clang), e.g. `address;undefined` or `thread` |
+| `-DGRPC_HARDENING=OFF` | Drops the library's hardening (on by default, GCC/Clang): stack protector, stack-clash protection, CET (`-fcf-protection`), zero-initialized locals, `_FORTIFY_SOURCE=3` in optimized builds, and RELRO / `BIND_NOW` / non-executable stack for the shared library. `_FORTIFY_SOURCE` is not passed on to programs that link the library |
+| `-DGRPC_WERROR=ON` | Treats warnings in the library's sources as errors. The library builds with a strict set (`-Wextra -Wconversion -Wsign-conversion -Wshadow -Wcast-qual -Wcast-align=strict -Wformat=2 ...`) |
 | `-DGRPC_BUILD_TESTS=OFF` | Skips unit tests |
 | `-DGRPC_BUILD_INTEGRATION_TESTS=OFF` | Skips Python client integration tests |
 | `-DGRPC_BUILD_EXAMPLES=OFF` | Skips example server targets |

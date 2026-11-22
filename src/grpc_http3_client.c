@@ -107,7 +107,7 @@ static void h3c_arm_timer(h3c_conn *hc) {
 
 /* Sends one datagram on the connected socket; a full buffer drops it (QUIC retransmits). */
 static void h3c_send(h3c_conn *hc, const uint8_t *data, size_t len) {
-  uv_buf_t buf = uv_buf_init((char *)data, (unsigned int)len);
+  uv_buf_t buf = uv_buf_init(grpc_unconst(data), (unsigned int)len);
   (void)uv_udp_try_send(&hc->udp, &buf, 1, nullptr);
 }
 
@@ -195,8 +195,8 @@ static void on_h3c_read(uv_udp_t *udp, ssize_t nread, const uv_buf_t *buf,
     return;
   ngtcp2_path path = {
       .local = {.addr = (ngtcp2_sockaddr *)&hc->local, .addrlen = hc->locallen},
-      .remote = {.addr = (ngtcp2_sockaddr *)(addr != nullptr ? (const void *)addr
-                                                             : (const void *)&hc->remote),
+      .remote = {.addr =
+                     grpc_unconst(addr != nullptr ? (const void *)addr : (const void *)&hc->remote),
                  .addrlen = hc->remotelen},
   };
   ngtcp2_pkt_info pi = {0};

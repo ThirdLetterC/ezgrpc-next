@@ -10,6 +10,7 @@
  * context and the HTTP/3 QUIC context. Loop thread only.
  */
 #include <stddef.h>
+#include "common.h"
 #include "grpc_defs.h"
 #include "grpc_error.h"
 #include "grpc_mem.h"
@@ -33,7 +34,7 @@ static inline grpc_err tls_ctx_pool_reserve(tls_ctx_pool *pool) {
   if (pool->nb_retired < pool->cap_retired)
     return GRPC_OK;
   size_t cap = pool->cap_retired > 0 ? pool->cap_retired * 2 : 4;
-  tls_ctx_entry *r = grpc_realloc(pool->retired, cap * sizeof(*r));
+  tls_ctx_entry *r = grpc_realloc_array(pool->retired, cap, sizeof(*r));
   if (r == nullptr)
     return GRPC_ERR_NOMEM;
   pool->retired = r;

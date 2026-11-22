@@ -277,7 +277,7 @@ grpc_err sub_connect(client_subchannel *s, uint32_t bound_ms) {
       bool is_ip = uv_inet_pton(AF_INET, sni, addr) == 0 || uv_inet_pton(AF_INET6, sni, addr) == 0;
       bool verify = !s->parent->config.tls.insecure_skip_verify;
       if (!is_ip)
-        (void)SSL_set_tlsext_host_name(s->ssl, sni);
+        (void)SSL_set_tlsext_host_name(s->ssl, grpc_unconst(sni)); /* a macro casting to void * */
       if (verify && (is_ip ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(s->ssl), sni) != 1
                            : SSL_set1_host(s->ssl, sni) != 1))
         goto fail_io;

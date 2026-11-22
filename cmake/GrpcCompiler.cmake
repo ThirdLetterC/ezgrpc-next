@@ -21,6 +21,53 @@ else()
     set(GRPC_C_STANDARD_FLAG -std=c2x)
   endif()
 endif()
+# Stricter warnings for the library's own sources (not tests, examples or bundled code). Each flag
+# is checked, since GCC and Clang support different sets.
+set(GRPC_STRICT_WARNING_FLAGS)
+if(NOT MSVC)
+  foreach(flag IN ITEMS
+      -Wextra -Wconversion -Wsign-conversion -Wshadow -Wcast-qual -Wcast-align=strict -Wvla
+      -Wformat=2 -Wformat-overflow=2 -Wformat-truncation=2 -Wstrict-prototypes
+      -Wmissing-prototypes -Wold-style-definition -Wimplicit-fallthrough -Wpointer-arith -Wundef
+      -Wwrite-strings -Walloca -Wduplicated-cond -Wduplicated-branches -Wlogical-op
+      -Wredundant-decls -Wnull-dereference)
+    string(MAKE_C_IDENTIFIER "GRPC_HAS_WARNING${flag}" _grpc_flag_var)
+    check_c_compiler_flag("${flag}" ${_grpc_flag_var})
+    if(${_grpc_flag_var})
+      list(APPEND GRPC_STRICT_WARNING_FLAGS "${flag}")
+    endif()
+  endforeach()
+endif()
+
+# Hardening for the library and its bundled code (GRPC_HARDENING). _FORTIFY_SOURCE needs an
+# optimized build (glibc warns otherwise), and the toolchain may already define it.
+set(GRPC_HARDENING_COMPILE_FLAGS)
+set(GRPC_HARDENING_LINK_FLAGS)
+if(GRPC_HARDENING AND NOT MSVC)
+  foreach(flag IN ITEMS
+      -fstack-protector-strong -fstack-clash-protection -fcf-protection=full
+      -ftrivial-auto-var-init=zero)
+    string(MAKE_C_IDENTIFIER "GRPC_HAS_FLAG${flag}" _grpc_flag_var)
+    check_c_compiler_flag("${flag}" ${_grpc_flag_var})
+    if(${_grpc_flag_var})
+      list(APPEND GRPC_HARDENING_COMPILE_FLAGS "${flag}")
+    endif()
+  endforeach()
+  set(_grpc_optimized "$<CONFIG:Release,RelWithDebInfo,MinSizeRel>")
+  list(APPEND GRPC_HARDENING_COMPILE_FLAGS
+    "$<${_grpc_optimized}:-U_FORTIFY_SOURCE>" "$<${_grpc_optimized}:-D_FORTIFY_SOURCE=3>")
+  if(NOT APPLE AND NOT WIN32)
+    include(CheckLinkerFlag)
+    foreach(flag IN ITEMS -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack)
+      string(MAKE_C_IDENTIFIER "GRPC_HAS_LINK${flag}" _grpc_flag_var)
+      check_linker_flag(C "${flag}" ${_grpc_flag_var})
+      if(${_grpc_flag_var})
+        list(APPEND GRPC_HARDENING_LINK_FLAGS "${flag}")
+      endif()
+    endforeach()
+  endif()
+endif()
+
 include(CMakePushCheckState)
 cmake_push_check_state()
 string(APPEND CMAKE_REQUIRED_FLAGS " ${GRPC_C_STANDARD_FLAG}")

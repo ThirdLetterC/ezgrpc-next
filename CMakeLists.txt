@@ -46,6 +46,9 @@ option(GRPC_BUILD_INTEGRATION_TESTS "Register Python gRPC integration tests" ${_
 option(GRPC_BUILD_DEVELOPER_TARGETS "Add source formatting targets" ${GRPC_IS_TOP_LEVEL})
 option(GRPC_INSTALL "Generate CMake install and pkg-config targets" ${GRPC_IS_TOP_LEVEL})
 option(GRPC_IPO "Enable interprocedural optimization in optimized configurations" OFF)
+option(GRPC_WERROR "Treat warnings in the library's sources as errors" OFF)
+option(GRPC_HARDENING
+  "Build the library with stack protection, _FORTIFY_SOURCE=3, CET and RELRO (GCC/Clang)" ON)
 option(GRPC_ASAN "Build with AddressSanitizer (same as GRPC_SANITIZE=address)" OFF)
 set(GRPC_SANITIZE "" CACHE STRING
   "Sanitizers for the library, tests and examples (GCC/Clang), e.g. address;undefined or thread")
@@ -160,13 +163,18 @@ endif()
 
 add_library(grpc_objects OBJECT ${GRPC_SOURCES})
 set_target_properties(grpc_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(grpc_objects PUBLIC include "${GRPC_GENERATED_INCLUDE_DIR}"
-  PRIVATE "${ulog_SOURCE_DIR}/include")
+target_include_directories(grpc_objects PUBLIC include "${GRPC_GENERATED_INCLUDE_DIR}")
+# bundled code: its headers are not held to the library's warning flags
+target_include_directories(grpc_objects SYSTEM PRIVATE "${ulog_SOURCE_DIR}/include")
 if(MSVC)
   target_include_directories(grpc_objects BEFORE PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated/ulog")
 endif()
 target_include_directories(grpc_objects PRIVATE include/internal)
-target_compile_options(grpc_objects PRIVATE ${GRPC_WARNING_FLAGS})
+target_compile_options(grpc_objects PRIVATE ${GRPC_WARNING_FLAGS} ${GRPC_STRICT_WARNING_FLAGS}
+  ${GRPC_HARDENING_COMPILE_FLAGS})
+if(GRPC_WERROR)
+  target_compile_options(grpc_objects PRIVATE $<IF:$<C_COMPILER_ID:MSVC>,/WX,-Werror>)
+endif()
 target_link_libraries(grpc_objects PRIVATE grpc_build_options)
 if(NOT MSVC)
   target_compile_options(grpc_objects PRIVATE -fvisibility=hidden)
@@ -175,7 +183,8 @@ if(NOT GRPC_HAS_C23_CONSTEXPR)
   # Clang 18 accepts -std=c23 but does not yet implement C23 constexpr.
   target_compile_definitions(grpc_objects PRIVATE constexpr=const)
 endif()
-set(GRPC_PUBLIC_COMPILE_DEFINITIONS _GNU_SOURCE _FORTIFY_SOURCE=2)
+# _FORTIFY_SOURCE is not imposed on users; the library sets it for itself (GRPC_HARDENING)
+set(GRPC_PUBLIC_COMPILE_DEFINITIONS _GNU_SOURCE)
 if(NOT GRPC_HAS_NULLPTR)
   list(APPEND GRPC_PUBLIC_COMPILE_DEFINITIONS "$<$<COMPILE_LANGUAGE:C>:nullptr=((void*)0)>")
 endif()
@@ -229,6 +238,7 @@ endif()
     # dependencies from a custom prefix (GRPC_TLS_PREFIX: OpenSSL 3.5, ngtcp2, ...) stay findable
     # after install; system library directories are never added
     set_target_properties(grpc_shared PROPERTIES INSTALL_RPATH_USE_LINK_PATH ON)
+    target_link_options(grpc_shared PRIVATE ${GRPC_HARDENING_LINK_FLAGS})
   if(WIN32)
     # The DLL import library and the static archive must not both be grpc.lib.
     set_target_properties(grpc_shared PROPERTIES ARCHIVE_OUTPUT_NAME grpc_dll

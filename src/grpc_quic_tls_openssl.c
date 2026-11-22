@@ -200,7 +200,8 @@ grpc_quic_tls_session *quic_tls_session_new(grpc_quic_tls_ctx *ctx,
       unsigned char addr[16];
       bool is_ip = inet_pton(AF_INET, sni, addr) == 1 || inet_pton(AF_INET6, sni, addr) == 1;
       if (!is_ip)
-        (void)SSL_set_tlsext_host_name(session->ssl, sni);
+        (void)SSL_set_tlsext_host_name(session->ssl,
+                                       grpc_unconst(sni)); /* a macro casting to void * */
       if (SSL_get_verify_mode(session->ssl) != SSL_VERIFY_NONE &&
           (is_ip ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(session->ssl), sni) != 1
                  : SSL_set1_host(session->ssl, sni) != 1))

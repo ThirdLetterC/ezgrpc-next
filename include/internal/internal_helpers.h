@@ -57,7 +57,9 @@ void stream_link(grpc_session *session, grpc_stream *stream);
 void stream_unlink(grpc_session *session, grpc_stream *stream);
 
 /* printf-style write of "[timestamp] " plus the message to `fp`, ignoring log levels. */
-void ezflog(FILE *fp, const char *fmt, ...);
+void ezflog(FILE *fp, const char *fmt, ...) GRPC_PRINTF_FORMAT(2, 3);
+/* Print `len` bytes at `vdata` to stdout as hex pairs and printable characters (debugging). */
+void ezdump(void *vdata, size_t len);
 /* Write the local date and time into `buf` (at most `len` bytes) and return `buf`. */
 char *ezgetdt(char *buf, size_t len);
 
@@ -66,9 +68,12 @@ char *ezgetdt(char *buf, size_t len);
 static inline int buf_reserve(grpc_buf *buf, size_t extra) {
   if (buf->cap - buf->len >= extra)
     return 0;
+  size_t need; /* len + extra, which must not wrap */
+  if (grpc_size_add(buf->len, extra, &need))
+    return 1;
   size_t cap = buf->cap ? buf->cap : 4096;
-  while (cap - buf->len < extra)
-    cap *= 2;
+  while (cap < need)
+    cap = cap > SIZE_MAX / 2 ? need : cap * 2; /* past half the range, take exactly `need` */
   /* the library allocator, never libc: on MSVC grpc_free() is _aligned_free(), so
    * buffers must come from the same family (e.g. server->tls_obuf is grpc_free()d) */
   u8 *data = grpc_realloc(buf->data, cap);
@@ -79,8 +84,11 @@ static inline int buf_reserve(grpc_buf *buf, size_t extra) {
   return 0;
 }
 
-/* Append `len` bytes of `data` to `buf`. Returns 0 on success, 1 when out of memory. */
+/* Append `len` bytes of `data` to `buf` (`data` may be null when `len` is 0). Returns 0 on
+ * success, 1 when out of memory. */
 static inline int buf_append(grpc_buf *buf, const void *data, size_t len) {
+  if (len == 0) /* memcpy() with a null pointer is undefined even for 0 bytes */
+    return 0;
   if (buf_reserve(buf, len))
     return 1;
   memcpy(buf->data + buf->len, data, len);

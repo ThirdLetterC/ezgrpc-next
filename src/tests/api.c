@@ -377,6 +377,43 @@ void test_call_null_safety(void) {
   grpc_call_unref(nullptr);
 }
 
+/* Size arithmetic that would wrap fails instead of producing a small buffer. Each case used to
+ * hang (buf_reserve doubling past SIZE_MAX) or overrun the heap (a wrapped allocation size). */
+void test_size_safety(void) {
+  size_t r = 7;
+  TEST_ASSERT_FALSE(grpc_size_add(1, 2, &r));
+  TEST_ASSERT_EQUAL_size_t(3, r);
+  TEST_ASSERT_TRUE(grpc_size_add(SIZE_MAX, 1, &r));
+  TEST_ASSERT_EQUAL_size_t(3, r); /* unchanged on overflow */
+  TEST_ASSERT_FALSE(grpc_size_mul(0, SIZE_MAX, &r));
+  TEST_ASSERT_EQUAL_size_t(0, r);
+  TEST_ASSERT_TRUE(grpc_size_mul(SIZE_MAX / 2 + 1, 2, &r));
+  TEST_ASSERT_NULL(grpc_malloc_array(SIZE_MAX / 4 + 1, 8));
+  int *p = grpc_malloc_array(4, sizeof(int));
+  TEST_ASSERT_NOT_NULL(p);
+  TEST_ASSERT_NULL(grpc_realloc_array(p, SIZE_MAX / 2 + 1, sizeof(int)));
+  p[3] = 1; /* still owned after the refused realloc */
+  grpc_free(p);
+
+  grpc_buf b = {0};
+  TEST_ASSERT_EQUAL_INT(0, buf_append(&b, nullptr, 0)); /* no memcpy from a null pointer */
+  TEST_ASSERT_NULL(b.data);
+  TEST_ASSERT_EQUAL_INT(0, buf_append(&b, "0123456789", 10));
+  TEST_ASSERT_EQUAL_INT(1, buf_reserve(&b, SIZE_MAX - 5)); /* len + extra wraps */
+  TEST_ASSERT_EQUAL_size_t(10, b.len);
+  TEST_ASSERT_EQUAL_MEMORY("0123456789", b.data, 10);
+  buf_free(&b);
+
+  /* a length the data cannot have: refused before anything is read */
+  const uint8_t small[4] = {1, 2, 3, 4};
+  size_t olen = 0;
+  TEST_ASSERT_NULL(grpc_metadata_encode_bin(small, SIZE_MAX, &olen));
+  TEST_ASSERT_NULL(grpc_metadata_encode_bin(small, SIZE_MAX / 4 * 3, &olen));
+  char *ok = grpc_metadata_encode_bin(small, sizeof(small), &olen);
+  TEST_ASSERT_EQUAL_STRING("AQIDBA==", ok);
+  grpc_free(ok);
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_config_validation);
@@ -387,5 +424,6 @@ int main(void) {
   RUN_TEST(test_strings);
   RUN_TEST(test_messages);
   RUN_TEST(test_call_null_safety);
+  RUN_TEST(test_size_safety);
   return UNITY_END();
 }

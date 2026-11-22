@@ -201,13 +201,13 @@ GRPC_API void grpc_client_response_free(grpc_client_response *response) {
   grpc_free(response->status_message);
   grpc_message_free(response->message);
   for (size_t i = 0; i < response->nb_headers; i++) {
-    grpc_free((void *)response->headers[i].key);
-    grpc_free((void *)response->headers[i].value);
+    grpc_free(grpc_unconst(response->headers[i].key));
+    grpc_free(grpc_unconst(response->headers[i].value));
   }
   grpc_free(response->headers);
   for (size_t i = 0; i < response->nb_trailers; i++) {
-    grpc_free((void *)response->trailers[i].key);
-    grpc_free((void *)response->trailers[i].value);
+    grpc_free(grpc_unconst(response->trailers[i].key));
+    grpc_free(grpc_unconst(response->trailers[i].value));
   }
   grpc_free(response->trailers);
   *response = (grpc_client_response){0};
@@ -357,7 +357,10 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
 
   const char *scheme =
       c->config.tls.enable || c->config.transport == GRPC_TRANSPORT_HTTP3 ? "https" : "http";
-  nghttp2_nv *nva = grpc_malloc((9 + nb_metadata) * sizeof(*nva));
+  /* up to 9 fixed headers, then the application's metadata */
+  size_t nb_nva;
+  grpc_nv *nva =
+      grpc_size_add(nb_metadata, 9, &nb_nva) ? nullptr : grpc_malloc_array(nb_nva, sizeof(*nva));
   if (nva == nullptr) {
     stream_free_internal(st);
     if (out_err != nullptr)
@@ -365,16 +368,12 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
     return nullptr;
   }
   size_t n = 0;
-  nva[n++] = (nghttp2_nv){(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE};
-  nva[n++] = (nghttp2_nv){(uint8_t *)":scheme", (uint8_t *)scheme, 7, strlen(scheme),
-                          NGHTTP2_NV_FLAG_NONE};
-  nva[n++] =
-      (nghttp2_nv){(uint8_t *)":path", (uint8_t *)method, 5, strlen(method), NGHTTP2_NV_FLAG_NONE};
-  nva[n++] = (nghttp2_nv){(uint8_t *)":authority", (uint8_t *)s->authority, 10,
-                          strlen(s->authority), NGHTTP2_NV_FLAG_NONE};
-  nva[n++] = (nghttp2_nv){(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16,
-                          NGHTTP2_NV_FLAG_NONE};
-  nva[n++] = (nghttp2_nv){(uint8_t *)"te", (uint8_t *)"trailers", 2, 8, NGHTTP2_NV_FLAG_NONE};
+  nva[n++] = grpc_nv_make(":method", 7, "POST", 4);
+  nva[n++] = grpc_nv_make(":scheme", 7, scheme, strlen(scheme));
+  nva[n++] = grpc_nv_make(":path", 5, method, strlen(method));
+  nva[n++] = grpc_nv_make(":authority", 10, s->authority, strlen(s->authority));
+  nva[n++] = grpc_nv_make("content-type", 12, "application/grpc", 16);
+  nva[n++] = grpc_nv_make("te", 2, "trailers", 8);
   /* only the codecs this build can decode */
   static const char accept_encoding[] =
 #if defined(GRPC_ENABLE_ZLIB)
@@ -387,14 +386,11 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
       "snappy,"
 #endif
       "identity";
-  nva[n++] = (nghttp2_nv){(uint8_t *)"grpc-accept-encoding", (uint8_t *)accept_encoding, 20,
-                          sizeof(accept_encoding) - 1, NGHTTP2_NV_FLAG_NONE};
+  nva[n++] = grpc_nv_make("grpc-accept-encoding", 20, accept_encoding, sizeof(accept_encoding) - 1);
   if (enc_name != nullptr)
-    nva[n++] = (nghttp2_nv){(uint8_t *)"grpc-encoding", (uint8_t *)enc_name, 13, strlen(enc_name),
-                            NGHTTP2_NV_FLAG_NONE};
+    nva[n++] = grpc_nv_make("grpc-encoding", 13, enc_name, strlen(enc_name));
   if (eff_timeout > 0)
-    nva[n++] = (nghttp2_nv){(uint8_t *)"grpc-timeout", (uint8_t *)timeout_str, 12,
-                            strlen(timeout_str), NGHTTP2_NV_FLAG_NONE};
+    nva[n++] = grpc_nv_make("grpc-timeout", 12, timeout_str, strlen(timeout_str));
   for (size_t i = 0; i < nb_metadata; i++) {
     if (metadata[i].key == nullptr || metadata[i].value == nullptr) {
       grpc_free(nva);
@@ -412,18 +408,16 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
         *out_err = GRPC_ERR_INVALID;
       return nullptr;
     }
-    nva[n++] = (nghttp2_nv){(uint8_t *)metadata[i].key, (uint8_t *)metadata[i].value, klen, vlen,
-                            NGHTTP2_NV_FLAG_NONE};
+    nva[n++] = grpc_nv_make(metadata[i].key, klen, metadata[i].value, vlen);
   }
 
   s->active_stream = st;
   int64_t sid;
   if (s->h3c != nullptr) {
-    static_assert(sizeof(grpc_nv) == sizeof(nghttp2_nv), "grpc_nv must match nghttp2_nv");
-    sid = h3c_submit_request(s, st, (const grpc_nv *)nva, n) == 0 ? st->stream_id : -1;
+    sid = h3c_submit_request(s, st, nva, n) == 0 ? st->stream_id : -1;
   } else {
     nghttp2_data_provider dp = {.source.ptr = st, .read_callback = client_data_read};
-    sid = nghttp2_submit_request(s->ngsession, nullptr, nva, n, &dp, st);
+    sid = nghttp2_submit_request(s->ngsession, nullptr, (const nghttp2_nv *)nva, n, &dp, st);
   }
   grpc_free(nva);
   if (sid < 0) {

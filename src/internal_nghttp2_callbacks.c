@@ -30,15 +30,6 @@
 #include "grpc_stream_core.h"
 #include <stddef.h>
 
-/* The grpc_nv used by the call layer must be usable as an nghttp2_nv array as is. */
-static_assert(sizeof(grpc_nv) == sizeof(nghttp2_nv) &&
-                  offsetof(grpc_nv, name) == offsetof(nghttp2_nv, name) &&
-                  offsetof(grpc_nv, value) == offsetof(nghttp2_nv, value) &&
-                  offsetof(grpc_nv, namelen) == offsetof(nghttp2_nv, namelen) &&
-                  offsetof(grpc_nv, valuelen) == offsetof(nghttp2_nv, valuelen) &&
-                  offsetof(grpc_nv, flags) == offsetof(nghttp2_nv, flags),
-              "grpc_nv must match nghttp2_nv");
-
 /* ----------- HTTP/2 TRANSPORT OPS ------------------*/
 
 /* nghttp2 data source read callback, installed by h2_start_data(). nghttp2 calls it from

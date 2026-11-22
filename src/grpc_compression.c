@@ -17,6 +17,7 @@
 #include "grpc_mem.h"
 
 #if defined(GRPC_ENABLE_ZLIB)
+#define ZLIB_CONST /* next_in is const: zlib never writes the input */
 #include <zlib.h>
 #endif
 #if defined(GRPC_ENABLE_ZSTD)
@@ -71,7 +72,7 @@ static grpc_err zlib_codec(bool compress, bool gzip, int level, const uint8_t *i
     (compress ? deflateEnd : inflateEnd)(&stream);
     return GRPC_ERR_NOMEM;
   }
-  stream.next_in = (Bytef *)in;
+  stream.next_in = (const Bytef *)in;
   stream.avail_in = (uInt)in_len;
   int status = Z_OK;
   do {
@@ -161,7 +162,7 @@ static int compress_into(grpc_compression_algorithm algorithm, int level, const 
     int window = algorithm == GRPC_COMPRESS_GZIP ? 15 + 16 : 15;
     if (deflateInit2(&stream, level, Z_DEFLATED, window, 8, Z_DEFAULT_STRATEGY) != Z_OK)
       return 2;
-    stream.next_in = (Bytef *)in;
+    stream.next_in = (const Bytef *)in;
     stream.avail_in = (uInt)in_len;
     stream.next_out = out;
     stream.avail_out = (uInt)out_cap;
@@ -227,6 +228,8 @@ static int compress_into(grpc_compression_algorithm algorithm, int level, const 
  * algorithm is unknown or compiled out, the level is invalid for it (snappy only accepts the
  * default), or the bound does not fit zlib's uInt. */
 static size_t compression_bound(grpc_compression_algorithm algorithm, int level, size_t len) {
+  (void)level; /* unused when every codec is compiled out */
+  (void)len;
   switch (algorithm) {
   case GRPC_COMPRESS_GZIP:
   case GRPC_COMPRESS_DEFLATE:

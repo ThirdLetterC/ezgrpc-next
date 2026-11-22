@@ -51,14 +51,6 @@ static const uint32_t DEFAULT_MAX_FRAME_SIZE = 16u * 1024;
 
 /* ---- setup ---------------------------------------------------------------------- */
 
-#ifdef _WIN32
-/* Initializes Winsock 2.2 before the first socket is created; run once through uv_once(). */
-static void grpc_winsock_init(void) {
-  WSADATA data;
-  WSAStartup(MAKEWORD(2, 2), &data);
-}
-#endif
-
 /* libuv timer callback, every 250 ms when keepalive or connection age/idle limits are
  * configured. Per open session it closes the connection on a keepalive PING timeout or once a
  * GOAWAY's grace period ends (or no streams remain), sends GOAWAY when max_connection_age or
@@ -369,7 +361,7 @@ GRPC_API grpc_server *grpc_server_new_ex(const grpc_config *config, grpc_err *ou
 
   server->nb_sessions = cfg->max_connections;
   server->sessions = grpc_calloc(server->nb_sessions, sizeof(*server->sessions));
-  server->free_sessions = grpc_malloc(server->nb_sessions * sizeof(*server->free_sessions));
+  server->free_sessions = grpc_malloc_array(server->nb_sessions, sizeof(*server->free_sessions));
   if (server->sessions == nullptr || server->free_sessions == nullptr)
     goto err;
   /* lowest index on top */

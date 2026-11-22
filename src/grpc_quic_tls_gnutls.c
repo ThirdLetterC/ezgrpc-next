@@ -38,7 +38,9 @@ struct grpc_quic_tls_session {
   gnutls_session_t session;
 };
 
-static const gnutls_datum_t H3_ALPN = {.data = (unsigned char *)"h3", .size = 2};
+/* gnutls_datum_t.data is not const, though GnuTLS only reads the ALPN protocol names */
+static unsigned char h3_alpn_id[] = {'h', '3'};
+static const gnutls_datum_t H3_ALPN = {.data = h3_alpn_id, .size = sizeof(h3_alpn_id)};
 
 int quic_tls_init(void) {
   return 0; /* gnutls initialises itself when the library loads */
@@ -90,7 +92,7 @@ grpc_quic_tls_ctx *quic_tls_client_ctx_new(const grpc_quic_tls_client_config *cf
       rv = gnutls_certificate_set_x509_trust_file(ctx->cred, cfg->ca_file, GNUTLS_X509_FMT_PEM);
     } else if (cfg->ca_pem != nullptr) {
       size_t len = cfg->ca_pem_len ? cfg->ca_pem_len : strlen(cfg->ca_pem);
-      gnutls_datum_t ca = {.data = (unsigned char *)cfg->ca_pem, .size = (unsigned int)len};
+      gnutls_datum_t ca = {.data = grpc_unconst(cfg->ca_pem), .size = (unsigned int)len};
       rv = len <= UINT_MAX
                ? gnutls_certificate_set_x509_trust_mem(ctx->cred, &ca, GNUTLS_X509_FMT_PEM)
                : -1;

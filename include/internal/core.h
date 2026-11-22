@@ -23,6 +23,7 @@
 #endif
 
 #include <assert.h>
+#include <stddef.h>
 #include "internal/grpc_threads.h"
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -45,18 +46,22 @@
 #endif
 /* Log a timestamped line for `server` if `level` passes its threshold; usually reached through
  * the LOG_* macros. Does nothing for a nullptr server. Safe from any thread. */
-void server_log(grpc_server *server, grpc_log_level level, const char *fmt, ...);
+void server_log(grpc_server *server, grpc_log_level level, const char *fmt, ...)
+    GRPC_PRINTF_FORMAT(3, 4);
 
-#define LOG_ERROR(server, fmt, ...) \
-  server_log(server, GRPC_LOG_ERROR, "error: " fmt __VA_OPT__(, ) __VA_ARGS__)
-#define LOG_WARNING(server, fmt, ...) \
-  server_log(server, GRPC_LOG_WARNING, "warning: " fmt __VA_OPT__(, ) __VA_ARGS__)
-#define LOG_INFO(server, ...)  server_log(server, GRPC_LOG_INFO, __VA_ARGS__)
-#define LOG_DEBUG(server, ...) server_log(server, GRPC_LOG_DEBUG, __VA_ARGS__)
+/* server_log() at GRPC_LOG_TRACE with "@func: " before the message (LOG_TRACE). */
+void server_log_trace(grpc_server *server, const char *func, const char *fmt, ...)
+    GRPC_PRINTF_FORMAT(3, 4);
+
+/* The format string is the first variadic argument (a string literal, joined to the prefix), so
+ * that a call without further arguments needs no empty __VA_ARGS__. */
+#define LOG_ERROR(server, ...)   server_log(server, GRPC_LOG_ERROR, "error: " __VA_ARGS__)
+#define LOG_WARNING(server, ...) server_log(server, GRPC_LOG_WARNING, "warning: " __VA_ARGS__)
+#define LOG_INFO(server, ...)    server_log(server, GRPC_LOG_INFO, __VA_ARGS__)
+#define LOG_DEBUG(server, ...)   server_log(server, GRPC_LOG_DEBUG, __VA_ARGS__)
 /* Per-frame logs are compiled in only with T=1. */
 #ifdef GRPC_TRACE
-#define LOG_TRACE(server, fmt, ...) \
-  server_log(server, GRPC_LOG_TRACE, "@%s: " fmt, __func__ __VA_OPT__(, ) __VA_ARGS__)
+#define LOG_TRACE(server, ...) server_log_trace(server, __func__, __VA_ARGS__)
 #else
 #define LOG_TRACE(server, ...) \
   do {                         \
@@ -111,6 +116,36 @@ struct grpc_nv {
   size_t valuelen;
   uint8_t flags;
 };
+
+/* Arrays of grpc_nv are handed to nghttp2 (server and client) as nghttp2_nv arrays as they are. */
+static_assert(sizeof(grpc_nv) == sizeof(nghttp2_nv) &&
+                  offsetof(grpc_nv, name) == offsetof(nghttp2_nv, name) &&
+                  offsetof(grpc_nv, value) == offsetof(nghttp2_nv, value) &&
+                  offsetof(grpc_nv, namelen) == offsetof(nghttp2_nv, namelen) &&
+                  offsetof(grpc_nv, valuelen) == offsetof(nghttp2_nv, valuelen) &&
+                  offsetof(grpc_nv, flags) == offsetof(nghttp2_nv, flags),
+              "grpc_nv must match nghttp2_nv");
+
+/* Returns p without its const qualifier. Only for C APIs that take a non-const pointer but do not
+ * write through it (nghttp2 / nghttp3 header entries, uv_buf_t for writes, ngtcp2 paths), and for
+ * freeing memory the library allocated but hands out through a const pointer. Used instead of a
+ * cast so that -Wcast-qual keeps flagging every other removal of const. */
+static inline void *grpc_unconst(const void *p) {
+  union {
+    const void *c;
+    void *m;
+  } u = {.c = p};
+  return u.m;
+}
+
+/* A header entry whose name and value are only read (nghttp2 and nghttp3 never write them). */
+static inline grpc_nv grpc_nv_make(const char *name, size_t namelen, const char *value,
+                                   size_t valuelen) {
+  return (grpc_nv){grpc_unconst(name), grpc_unconst(value), namelen, valuelen, 0};
+}
+
+/* grpc_nv_make() for a string-literal name and value. */
+#define GRPC_NV(name, value) grpc_nv_make("" name, sizeof(name) - 1, "" value, sizeof(value) - 1)
 
 /* Why a transport should reset a request stream (mapped to the protocol's error code). */
 typedef enum grpc_reset_reason {

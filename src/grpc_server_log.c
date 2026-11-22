@@ -135,22 +135,26 @@ void logger_server_remove(grpc_server *server) {
  * LOG_* macros. Does nothing when server is nullptr, logging is off or level is more verbose
  * than the server's level. Lines are cut to 1023 bytes. Safe from any thread: the level is
  * atomic and ulog is locked. */
-void server_log(grpc_server *server, grpc_log_level level, const char *fmt, ...) {
+/* server_log() and server_log_trace(): `func` (or nullptr) is written as "@func: " before the
+ * message. */
+static void server_vlog(grpc_server *server, grpc_log_level level, const char *func,
+                        const char *fmt, va_list ap) GRPC_PRINTF_FORMAT(4, 0);
+static void server_vlog(grpc_server *server, grpc_log_level level, const char *func,
+                        const char *fmt, va_list ap) {
   if (server == nullptr)
     return;
   int log_level = atomic_load(&server->log_level);
-  if (log_level == GRPC_LOG_OFF || level > log_level)
+  if (log_level == GRPC_LOG_OFF || (int)level > log_level)
     return;
 
   /* one write per line, so that lines of several servers do not interleave */
   char line[1024];
   char dt[128] = {};
-  int n = snprintf(line, sizeof(line), "[%s] ", ezgetdt(dt, sizeof(dt)));
-  va_list ap;
-  va_start(ap, fmt);
+  int n = func != nullptr
+              ? snprintf(line, sizeof(line), "[%s] @%s: ", ezgetdt(dt, sizeof(dt)), func)
+              : snprintf(line, sizeof(line), "[%s] ", ezgetdt(dt, sizeof(dt)));
   if (n >= 0 && (size_t)n < sizeof(line))
     vsnprintf(line + n, sizeof(line) - (size_t)n, fmt, ap);
-  va_end(ap);
 
   switch (level) {
   case GRPC_LOG_ERROR:
@@ -171,6 +175,20 @@ void server_log(grpc_server *server, grpc_log_level level, const char *fmt, ...)
   default:
     break;
   }
+}
+
+void server_log(grpc_server *server, grpc_log_level level, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  server_vlog(server, level, nullptr, fmt, ap);
+  va_end(ap);
+}
+
+void server_log_trace(grpc_server *server, const char *func, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  server_vlog(server, GRPC_LOG_TRACE, func, fmt, ap);
+  va_end(ap);
 }
 
 /* Changes the ulog topic level and the server's atomic level together under log_level_mutex so

@@ -39,8 +39,8 @@ static void async_op_free(async_op *op) {
   if (op == nullptr)
     return;
   for (size_t i = 0; i < op->metadata_count; i++) {
-    grpc_free((void *)op->metadata[i].key);
-    grpc_free((void *)op->metadata[i].value);
+    grpc_free(grpc_unconst(op->metadata[i].key));
+    grpc_free(grpc_unconst(op->metadata[i].value));
   }
   grpc_free(op->metadata);
   grpc_free(op->text);

@@ -81,7 +81,7 @@ grpc_quic_conn *h3_cid_lookup(grpc_h3_server *h3s, const uint8_t *data, size_t l
 int h3_cid_add(grpc_quic_conn *qc, const ngtcp2_cid *cid) {
   if (qc->nb_cids == qc->cap_cids) {
     size_t cap = qc->cap_cids ? qc->cap_cids * 2 : 8;
-    ngtcp2_cid *cids = grpc_realloc(qc->cids, cap * sizeof(*cids));
+    ngtcp2_cid *cids = grpc_realloc_array(qc->cids, cap, sizeof(*cids));
     if (cids == nullptr)
       return -1;
     qc->cids = cids;
@@ -116,7 +116,7 @@ void h3_cid_remove(grpc_quic_conn *qc, const ngtcp2_cid *cid) {
 
 void h3_udp_send(grpc_server *server, uv_udp_t *udp, const struct sockaddr *to, const uint8_t *data,
                  size_t len) {
-  uv_buf_t buf = uv_buf_init((char *)data, (unsigned int)len);
+  uv_buf_t buf = uv_buf_init(grpc_unconst(data), (unsigned int)len);
   int rv = uv_udp_try_send(udp, &buf, 1, to);
   if (rv >= 0)
     atomic_fetch_add(&server->stat_bytes_sent, (uint64_t)len);
@@ -145,9 +145,12 @@ void qc_send(grpc_quic_conn *qc, const ngtcp2_path *path, const uint8_t *data, s
 
 /* Deep-copies nva into one allocation (array, then names and values). */
 static grpc_nv *nv_copy(const grpc_nv *nva, size_t nvlen) {
-  size_t size = nvlen * sizeof(*nva);
+  size_t size;
+  if (grpc_size_mul(nvlen, sizeof(*nva), &size))
+    return nullptr;
   for (size_t i = 0; i < nvlen; i++)
-    size += nva[i].namelen + nva[i].valuelen;
+    if (grpc_size_add(size, nva[i].namelen, &size) || grpc_size_add(size, nva[i].valuelen, &size))
+      return nullptr;
   grpc_nv *copy = grpc_malloc(size ? size : 1);
   if (copy == nullptr)
     return nullptr;

@@ -349,8 +349,8 @@ GRPC_API void grpc_status_details_free(grpc_status_details *details) {
     return;
   grpc_free(details->message);
   for (size_t i = 0; i < details->nb_details; i++) {
-    grpc_free((void *)details->details[i].type_url);
-    grpc_free((void *)details->details[i].value);
+    grpc_free(grpc_unconst(details->details[i].type_url));
+    grpc_free(grpc_unconst(details->details[i].value));
   }
   grpc_free(details->details);
   *details = (grpc_status_details){};
@@ -418,7 +418,7 @@ GRPC_API grpc_err grpc_status_details_decode_all(const char *base64_str, grpc_st
       seek = any_end;
       if (out->nb_details == cap) {
         size_t next_cap = cap ? cap * 2 : 4;
-        grpc_status_detail_entry *arr = grpc_realloc(out->details, next_cap * sizeof(*arr));
+        grpc_status_detail_entry *arr = grpc_realloc_array(out->details, next_cap, sizeof(*arr));
         if (arr == nullptr) {
           any_fields_free(&a);
           err = GRPC_ERR_NOMEM;

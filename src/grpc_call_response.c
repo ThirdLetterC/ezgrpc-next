@@ -18,6 +18,8 @@
  * 0x20..0x7e and '%' itself become %XX. Returns a grpc_malloc()'d NUL-terminated string and
  * stores its length in *len, or nullptr on allocation failure. */
 static char *encode_grpc_message(const char *message, size_t *len) {
+  if (strlen(message) > (SIZE_MAX - 1) / 3) /* each byte may take 3 */
+    return nullptr;
   size_t n = 0;
   for (const u8 *p = (const u8 *)message; *p; p++)
     n += (*p < 0x20 || *p > 0x7e || *p == '%') ? 3 : 1;
@@ -41,8 +43,6 @@ static char *encode_grpc_message(const char *message, size_t *len) {
 }
 
 /* Builds a grpc_nv from two string literals, so sizeof() gives their lengths at compile time. */
-#define GRPC_NV(name, value) \
-  ((grpc_nv){(uint8_t *)(name), (uint8_t *)(value), sizeof(name) - 1, sizeof(value) - 1, 0})
 
 /* Submits the response HEADERS: :status, content-type (grpc, grpc-web or grpc-web-text),
  * grpc-accept-encoding with the codecs compiled in, grpc-encoding unless call->compression is
@@ -71,9 +71,8 @@ static grpc_err submit_response_headers(grpc_call *call, bool end_stream, const 
                                              : "application/grpc";
   grpc_nv base[] = {
       GRPC_NV(":status", "200"),
-      {(uint8_t *)"content-type", (uint8_t *)ctype, 12, strlen(ctype), 0},
-      {(uint8_t *)"grpc-accept-encoding", (uint8_t *)accepted, sizeof("grpc-accept-encoding") - 1,
-       0, 0},
+      grpc_nv_make("content-type", 12, ctype, strlen(ctype)),
+      grpc_nv_make("grpc-accept-encoding", sizeof("grpc-accept-encoding") - 1, accepted, 0),
       GRPC_NV("grpc-encoding", "gzip"),
       GRPC_NV("access-control-allow-origin", "*"),
       GRPC_NV("access-control-expose-headers",
@@ -94,7 +93,7 @@ static grpc_err submit_response_headers(grpc_call *call, bool end_stream, const 
     break;
   }
   base[2].valuelen = strlen(accepted);
-  base[3].value = (uint8_t *)encoding;
+  base[3].value = grpc_unconst(encoding);
   base[3].valuelen = strlen(encoding);
   size_t nb_base = call->compression != GRPC_COMPRESS_IDENTITY ? 4 : 3;
   size_t nb_cors = call->is_grpc_web ? 2 : 0;
@@ -105,7 +104,7 @@ static grpc_err submit_response_headers(grpc_call *call, bool end_stream, const 
                       ? 1
                       : 0;
   size_t total = nb_base + nb_cors + nb_alt + call->headers.len + nb_extra;
-  grpc_nv *nva = grpc_malloc(total * sizeof(*nva));
+  grpc_nv *nva = grpc_malloc_array(total, sizeof(*nva));
   if (nva == nullptr)
     return GRPC_ERR_NOMEM;
   size_t off = 0;
@@ -116,7 +115,7 @@ static grpc_err submit_response_headers(grpc_call *call, bool end_stream, const 
     off += nb_cors;
   }
   if (nb_alt > 0)
-    nva[off++] = (grpc_nv){(uint8_t *)"alt-svc", (uint8_t *)alt_svc, 7, strlen(alt_svc), 0};
+    nva[off++] = grpc_nv_make("alt-svc", 7, alt_svc, strlen(alt_svc));
   if (call->headers.len > 0) {
     memcpy(nva + off, call->headers.nva, call->headers.len * sizeof(*nva));
     off += call->headers.len;
@@ -133,13 +132,11 @@ static grpc_err submit_response_headers(grpc_call *call, bool end_stream, const 
   return GRPC_OK;
 }
 
-#undef GRPC_NV
-
 grpc_err call_finish_internal(grpc_call *call, grpc_status status, const char *message) {
   if (call->stream == nullptr)
     return GRPC_ERR_CLOSED;
-  char grpc_status[16];
-  int status_len = snprintf(grpc_status, sizeof(grpc_status), "%d", (int)status);
+  char status_str[16];
+  int status_len = snprintf(status_str, sizeof(status_str), "%d", (int)status);
   if (message == nullptr && status != GRPC_STATUS_OK)
     message = grpc_status_str(status);
 
@@ -152,16 +149,16 @@ grpc_err call_finish_internal(grpc_call *call, grpc_status status, const char *m
   }
 
   /* grpc-status, grpc-message and the application's trailers */
-  size_t total = 1 + (encoded != nullptr) + call->trailers.len;
-  grpc_nv *nva = grpc_malloc(total * sizeof(*nva));
+  size_t total = (encoded != nullptr ? 2 : 1) + call->trailers.len;
+  grpc_nv *nva = grpc_malloc_array(total, sizeof(*nva));
   if (nva == nullptr) {
     grpc_free(encoded);
     return GRPC_ERR_NOMEM;
   }
   size_t n = 0;
-  nva[n++] = (grpc_nv){(uint8_t *)"grpc-status", (uint8_t *)grpc_status, 11, (size_t)status_len, 0};
+  nva[n++] = grpc_nv_make("grpc-status", 11, status_str, (size_t)status_len);
   if (encoded != nullptr)
-    nva[n++] = (grpc_nv){(uint8_t *)"grpc-message", (uint8_t *)encoded, 12, message_len, 0};
+    nva[n++] = grpc_nv_make("grpc-message", 12, encoded, message_len);
   if (call->trailers.len > 0)
     memcpy(nva + n, call->trailers.nva, call->trailers.len * sizeof(*nva));
   n += call->trailers.len;

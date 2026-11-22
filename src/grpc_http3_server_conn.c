@@ -416,7 +416,7 @@ static void on_udp_read(uv_udp_t *udp, ssize_t nread, const uv_buf_t *buf,
   ngtcp2_path path = {
       .local = {.addr = (ngtcp2_sockaddr *)(on_v6 ? &h3s->local6 : &h3s->local4),
                 .addrlen = on_v6 ? sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in)},
-      .remote = {.addr = (ngtcp2_sockaddr *)addr, .addrlen = addrlen},
+      .remote = {.addr = grpc_unconst(addr), .addrlen = addrlen},
   };
   ngtcp2_pkt_info pi = {0};
   rv = ngtcp2_conn_read_pkt(qc->conn, &path, &pi, data, len, h3_now());

@@ -24,6 +24,9 @@ GRPC_API char *grpc_metadata_encode_bin(const uint8_t *data, size_t in_len, size
     return nullptr;
   }
 
+  /* 4 output bytes per 3 input bytes (rounded up), plus the NUL; in_len is the caller's */
+  if (in_len > (SIZE_MAX - 1) / 4 * 3 - 2)
+    return nullptr;
   size_t olen = 4 * ((in_len + 2) / 3);
   char *out = grpc_malloc(olen + 1);
   if (out == nullptr) {

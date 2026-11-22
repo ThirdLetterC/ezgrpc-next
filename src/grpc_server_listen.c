@@ -26,10 +26,18 @@
 #include "internal_server.h"
 #include "ulog/ulog.h"
 
+#ifdef _WIN32
+/* Initializes Winsock 2.2 before the first socket is created; run once through uv_once(). */
+static void grpc_winsock_init(void) {
+  WSADATA data;
+  WSAStartup(MAKEWORD(2, 2), &data);
+}
+#endif
+
 uv_os_sock_t server_open_listener(grpc_server *server, int family, const char *addr, uint16_t port,
                                   int backlog, uint16_t *bound_port, grpc_err *out_err) {
   struct sockaddr_storage ss = {};
-  int sslen;
+  socklen_t sslen;
   if (family == AF_INET) {
     struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
     sin->sin_family = AF_INET;

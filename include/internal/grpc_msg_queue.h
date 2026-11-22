@@ -10,6 +10,7 @@
  */
 #include <assert.h>
 #include <stdint.h>
+#include "common.h"
 #include "grpc_defs.h"
 #include "grpc_error.h"
 #include "grpc_mem.h"
@@ -60,7 +61,7 @@ static inline grpc_err msg_queue_reserve(grpc_msg_queue *q, size_t need) {
       return GRPC_ERR_NOMEM;
     cap *= 2;
   }
-  grpc_message **items = grpc_malloc(cap * sizeof(*items));
+  grpc_message **items = grpc_malloc_array(cap, sizeof(*items));
   if (items == nullptr)
     return GRPC_ERR_NOMEM;
   for (size_t i = 0; i < q->count; i++) {

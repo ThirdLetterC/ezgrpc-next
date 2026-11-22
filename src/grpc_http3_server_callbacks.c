@@ -216,6 +216,7 @@ static int h3_on_end_stream(nghttp3_conn *conn, int64_t stream_id, void *conn_us
 static int h3_on_stream_close(nghttp3_conn *conn, int64_t stream_id, uint64_t app_error_code,
                               void *conn_user_data, void *stream_user_data) {
   (void)conn;
+  (void)stream_id;
   (void)app_error_code;
   grpc_quic_conn *qc = conn_user_data;
   grpc_stream *stream = stream_user_data;

@@ -22,7 +22,7 @@
  * Allocation failures drop the entry silently. */
 static void md_list_append(grpc_metadata **arr, size_t *count, const uint8_t *name, size_t nlen,
                            const uint8_t *val, size_t vlen) {
-  grpc_metadata *next = grpc_realloc(*arr, (*count + 1) * sizeof(*next));
+  grpc_metadata *next = grpc_realloc_array(*arr, (*count + 1), sizeof(*next));
   if (next == nullptr)
     return;
   *arr = next;

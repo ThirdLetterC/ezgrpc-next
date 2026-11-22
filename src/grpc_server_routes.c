@@ -58,7 +58,7 @@ grpc_err server_add_route(grpc_server *server, const char *path, route_kind kind
     /* routes are never moved: calls point to them */
     if (server->nb_routes == server->cap_routes) {
       size_t cap = server->cap_routes ? server->cap_routes * 2 : 16;
-      grpc_route **routes = grpc_realloc(server->routes, cap * sizeof(*routes));
+      grpc_route **routes = grpc_realloc_array(server->routes, cap, sizeof(*routes));
       if (routes == nullptr)
         return GRPC_ERR_NOMEM;
       server->routes = routes;

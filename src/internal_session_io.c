@@ -91,7 +91,9 @@ static void session_set_peer(grpc_session *ezsession) {
                          &namelen) != 0) {
     return;
   }
-  ezsession->socklen = namelen;
+  if (namelen < 0)
+    return;
+  ezsession->socklen = (socklen_t)namelen;
   format_peer((const struct sockaddr *)&ezsession->sockaddr, ezsession->peer,
               sizeof(ezsession->peer));
 }
@@ -99,15 +101,18 @@ static void session_set_peer(grpc_session *ezsession) {
 void format_peer(const struct sockaddr *sa, char *out, size_t out_len) {
   char addr[INET6_ADDRSTRLEN] = "";
   switch (sa->sa_family) {
+  /* copied into properly aligned structures: `sa` only guarantees struct sockaddr's alignment */
   case AF_INET: {
-    const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
-    inet_ntop(AF_INET, &sin->sin_addr.s_addr, addr, sizeof(addr));
-    snprintf(out, out_len, "%s:%u", addr, ntohs(sin->sin_port));
+    struct sockaddr_in sin;
+    memcpy(&sin, sa, sizeof(sin));
+    inet_ntop(AF_INET, &sin.sin_addr.s_addr, addr, sizeof(addr));
+    snprintf(out, out_len, "%s:%u", addr, ntohs(sin.sin_port));
   } break;
   case AF_INET6: {
-    const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)sa;
-    inet_ntop(AF_INET6, sin6->sin6_addr.s6_addr, addr, sizeof(addr));
-    snprintf(out, out_len, "[%s]:%u", addr, ntohs(sin6->sin6_port));
+    struct sockaddr_in6 sin6;
+    memcpy(&sin6, sa, sizeof(sin6));
+    inet_ntop(AF_INET6, sin6.sin6_addr.s6_addr, addr, sizeof(addr));
+    snprintf(out, out_len, "[%s]:%u", addr, ntohs(sin6.sin6_port));
   } break;
   default:
     break;

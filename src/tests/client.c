@@ -621,6 +621,74 @@ void test_hostile_protobuf_lengths(void) {
 }
 
 /* Without HTTP/3 support built in, asking for it fails cleanly with GRPC_ERR_UNSUPPORTED. */
+/* Empty bodies passed as a null pointer with length 0 (on both ends). Under UBSan this checks
+ * that no path hands the null pointer on to memcpy(), which is undefined behaviour even for 0
+ * bytes. */
+static void null_reply(grpc_call *call, [[maybe_unused]] const grpc_message *req,
+                       [[maybe_unused]] void *userdata) {
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_call_reply_data(call, nullptr, 0));
+}
+
+static void null_stream(grpc_call *call, [[maybe_unused]] const grpc_message *req,
+                        [[maybe_unused]] void *userdata) {
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_call_send_data(call, nullptr, 0));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_call_send_data_async(call, nullptr, 0));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_call_finish_async(call, GRPC_STATUS_OK, nullptr));
+}
+
+void test_null_empty_bodies(void) {
+  grpc_server *server = fx.servers[0] = grpc_server_new(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
+  TEST_ASSERT_NOT_NULL(server);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/n.Svc/Reply", null_reply, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/n.Svc/Stream", null_stream, nullptr));
+  start_server(0);
+
+  for (int compressed = 0; compressed < 2; compressed++) {
+    grpc_err err = GRPC_OK;
+    grpc_client *client =
+        grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
+                                              .port = grpc_server_port(server),
+                                              .timeout_ms = 3000,
+                                              .compression = compressed ? GRPC_COMPRESS_GZIP
+                                                                        : GRPC_COMPRESS_IDENTITY},
+                        &err);
+    TEST_ASSERT_NOT_NULL(client);
+
+    grpc_client_response resp = {0};
+    TEST_ASSERT_EQUAL_INT(
+        GRPC_OK, grpc_client_unary(client, "/n.Svc/Reply", nullptr, 0, nullptr, 0, 3000, &resp));
+    TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+    TEST_ASSERT_NOT_NULL(resp.message);
+    TEST_ASSERT_EQUAL_UINT32(0, resp.message->len);
+    grpc_client_response_free(&resp);
+
+    grpc_client_stream *st =
+        grpc_client_stream_open(client, "/n.Svc/Stream", nullptr, 0, 3000, &err);
+    TEST_ASSERT_NOT_NULL(st);
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(st, nullptr, 0));
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_close_send(st));
+    int received = 0;
+    grpc_message *msg = nullptr;
+    while (grpc_client_stream_recv(st, &msg) == GRPC_OK && msg != nullptr) {
+      TEST_ASSERT_EQUAL_UINT32(0, msg->len);
+      grpc_message_free(msg);
+      received++;
+    }
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_finish(st, &resp));
+    TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+    TEST_ASSERT_EQUAL_INT(2, received);
+    grpc_client_response_free(&resp);
+
+    /* a metadata count whose header array size would wrap: refused, nothing written */
+    const grpc_metadata md = {.key = "x-k", .value = "v"};
+    TEST_ASSERT_NULL(
+        grpc_client_stream_open(client, "/n.Svc/Reply", &md, SIZE_MAX - 4, 3000, &err));
+    TEST_ASSERT_EQUAL_INT(GRPC_ERR_NOMEM, err);
+    grpc_client_free(client);
+  }
+}
+
 void test_http3_unsupported_without_build(void) {
   if (grpc_http3_available()) {
     TEST_IGNORE_MESSAGE("built with HTTP/3; covered by the http3 test");
@@ -647,6 +715,7 @@ int main(void) {
   RUN_TEST(test_client_streaming_bidi_retries_and_lb);
   RUN_TEST(test_hostile_protobuf_lengths);
   RUN_TEST(test_http3_unsupported_without_build);
+  RUN_TEST(test_null_empty_bodies);
 #ifndef _WIN32
   RUN_TEST(test_unix_domain_socket);
 #endif

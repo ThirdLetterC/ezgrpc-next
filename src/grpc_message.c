@@ -26,7 +26,11 @@ static_assert((MESSAGE_ALIGN & (MESSAGE_ALIGN - 1)) == 0, "MESSAGE_ALIGN must be
 grpc_message *message_create(u8 cflag, const void *data, size_t len) {
   if (len > UINT32_MAX)
     return nullptr;
-  size_t size = sizeof(grpc_message) + len;
+  /* header + payload, rounded up to the alignment: can exceed a 32-bit size_t */
+  size_t size;
+  if (grpc_size_add(sizeof(grpc_message), len, &size) ||
+      grpc_size_add(size, MESSAGE_ALIGN - 1, &size))
+    return nullptr;
   grpc_message *message = grpc_aligned_alloc(MESSAGE_ALIGN, grpc_align_up(size, MESSAGE_ALIGN));
   if (message == nullptr)
     return nullptr;

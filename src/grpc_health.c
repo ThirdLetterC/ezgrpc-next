@@ -163,7 +163,7 @@ GRPC_API grpc_err grpc_health_set_status(grpc_server *server, const char *servic
     }
   }
   service_health_entry *entries =
-      grpc_realloc(health->entries, (health->nb_entries + 1) * sizeof(*entries));
+      grpc_realloc_array(health->entries, (health->nb_entries + 1), sizeof(*entries));
   char *name = grpc_strndup(service, MAX_SERVICE_NAME_LEN - 1);
   if (entries != nullptr)
     health->entries = entries;

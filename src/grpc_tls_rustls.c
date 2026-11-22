@@ -40,7 +40,8 @@ static char version[128];
 /* Copies rustls_version() into `version` as a NUL-terminated string (truncated to fit). */
 static void version_init(void) {
   struct rustls_str v = rustls_version();
-  snprintf(version, sizeof(version), "%.*s", (int)v.len, v.data);
+  int n = v.len < sizeof(version) ? (int)v.len : (int)sizeof(version) - 1;
+  snprintf(version, sizeof(version), "%.*s", n, v.data);
 }
 
 /* Returns the run-time library version string, built once (thread-safely) on first use. */
@@ -185,7 +186,7 @@ out:
   if (key.data != nullptr)
     memset(key.data, 0, key.cap);
   buf_free(&key);
-  return (grpc_tls_ctx *)config;
+  return grpc_unconst(config); /* opaque to callers; only rustls_config() reads it back */
 }
 
 /* Releases the config. Connections hold their own reference, so live sessions keep it alive. */
@@ -195,7 +196,7 @@ void tls_backend_ctx_free(grpc_tls_ctx *ctx) {
 
 /* Returns the rustls_server_config itself (const in rustls, cast away for the generic API). */
 void *tls_backend_ctx_native(grpc_tls_ctx *ctx) {
-  return (void *)rustls_config(ctx);
+  return grpc_unconst(rustls_config(ctx));
 }
 
 /* Creates a session with a new server connection from the config. Returns nullptr on failure. */

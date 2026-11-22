@@ -69,12 +69,12 @@ if(MSVC)
   target_include_directories(ulog BEFORE PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated/ulog")
 endif()
 target_link_libraries(ulog PRIVATE grpc_build_options)
-target_compile_options(ulog PRIVATE ${GRPC_WARNING_FLAGS})
+target_compile_options(ulog PRIVATE ${GRPC_WARNING_FLAGS} ${GRPC_HARDENING_COMPILE_FLAGS})
 if(NOT MSVC)
   target_compile_options(ulog PRIVATE -fvisibility=hidden)
 endif()
 target_compile_definitions(ulog PRIVATE
-  _GNU_SOURCE _FORTIFY_SOURCE=2
+  _GNU_SOURCE
   ULOG_BUILD_EXTRA_OUTPUTS=1 ULOG_BUILD_TOPICS_MODE=2 ULOG_BUILD_COLOR=0
   ULOG_BUILD_SOURCE_LOCATION=0 ULOG_BUILD_TIME=0 ULOG_BUILD_WARN_NOT_ENABLED=0)
 if(NOT GRPC_HAS_C23_CONSTEXPR)

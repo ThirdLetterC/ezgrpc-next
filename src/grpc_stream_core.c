@@ -111,8 +111,6 @@ static bool header_starts_with(const u8 *value, size_t value_len, const char *ty
 
 /* Brace initializer for a grpc_nv from two string literals, so sizeof() gives their lengths at
  * compile time (usable in static arrays). */
-#define GRPC_NV(name, value) \
-  {(uint8_t *)(name), (uint8_t *)(value), sizeof(name) - 1, sizeof(value) - 1, 0}
 
 int stream_core_on_header(grpc_session *session, grpc_stream *stream, const uint8_t *name,
                           size_t namelen, const uint8_t *value, size_t valuelen, void *name_ref,
@@ -127,8 +125,8 @@ int stream_core_on_header(grpc_session *session, grpc_stream *stream, const uint
   stream->ops->hdr_incref(value_ref);
   stream->header_refs[stream->nb_headers][0] = name_ref;
   stream->header_refs[stream->nb_headers][1] = value_ref;
-  stream->headers[stream->nb_headers].name = (char *)name;
-  stream->headers[stream->nb_headers].value = (char *)value;
+  stream->headers[stream->nb_headers].name = (const char *)name;
+  stream->headers[stream->nb_headers].value = (const char *)value;
   stream->headers[stream->nb_headers].namelen = namelen;
   stream->headers[stream->nb_headers].valuelen = valuelen;
   stream->nb_headers++;
@@ -194,13 +192,13 @@ int stream_core_on_header(grpc_session *session, grpc_stream *stream, const uint
  * ignored. */
 static void submit_trailers_only(grpc_session *session, grpc_stream *stream, grpc_status status,
                                  const char *message) {
-  char grpc_status[16];
-  int len = snprintf(grpc_status, sizeof(grpc_status), "%d", (int)status);
+  char status_str[16];
+  int len = snprintf(status_str, sizeof(status_str), "%d", (int)status);
   grpc_nv nva[] = {
       GRPC_NV(":status", "200"),
       GRPC_NV("content-type", "application/grpc"),
-      {(uint8_t *)"grpc-status", (uint8_t *)grpc_status, 11, (size_t)len, 0},
-      {(uint8_t *)"grpc-message", (uint8_t *)message, 12, strlen(message), 0},
+      grpc_nv_make("grpc-status", 11, status_str, (size_t)len),
+      grpc_nv_make("grpc-message", 12, message, strlen(message)),
   };
   (void)session->ops->submit_headers(session, stream, nva, 4, true);
 }
@@ -213,7 +211,7 @@ void stream_core_on_headers_end(grpc_session *session, grpc_stream *stream, bool
 
   /* gRPC-Web CORS preflight */
   if (stream->is_method_options) {
-    static const grpc_nv cors_nva[] = {
+    const grpc_nv cors_nva[] = {
         GRPC_NV(":status", "204"),
         GRPC_NV("access-control-allow-origin", "*"),
         GRPC_NV("access-control-allow-methods", "POST, OPTIONS"),
@@ -500,5 +498,3 @@ int stream_core_flush_pending_trailers(grpc_session *session, grpc_stream *strea
   stream->nb_pending_trailers = 0;
   return rv;
 }
-
-#undef GRPC_NV

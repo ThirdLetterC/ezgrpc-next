@@ -20,7 +20,7 @@ static void push_event(grpc_server *server, grpc_event_type type, grpc_call *cal
                        grpc_message *message) {
   if (server->nb_events == server->cap_events) {
     size_t cap = server->cap_events ? server->cap_events * 2 : 64;
-    grpc_event *events = grpc_realloc(server->events, cap * sizeof(*events));
+    grpc_event *events = grpc_realloc_array(server->events, cap, sizeof(*events));
     if (events == nullptr) {
       LOG_ERROR(server, "out of memory, dropping an event\n");
       grpc_message_free(message);
@@ -41,7 +41,7 @@ static void push_event(grpc_server *server, grpc_event_type type, grpc_call *cal
  * references. Called at the start of each grpc_server_poll() and on server shutdown. */
 void server_clear_events(grpc_server *server) {
   for (size_t i = 0; i < server->nb_events; i++) {
-    grpc_message_free((grpc_message *)server->events[i].message);
+    grpc_message_free(grpc_unconst(server->events[i].message));
     grpc_call_unref(server->events[i].call);
   }
   server->nb_events = 0;
