@@ -312,19 +312,6 @@ static grpc_err receive_messages(grpc_session *session, grpc_stream *stream, grp
   return GRPC_OK;
 }
 
-/* True if every byte is in the standard base64 alphabet or '='. Padding may appear mid-body:
- * grpc-web-text clients may send separately encoded, padded chunks. */
-static bool is_base64_text(const uint8_t *p, size_t len) {
-  for (size_t i = 0; i < len; i++) {
-    uint8_t c = p[i];
-    bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-              c == '+' || c == '/' || c == '=';
-    if (!ok)
-      return false;
-  }
-  return true;
-}
-
 void stream_core_on_data_end(grpc_session *session, grpc_stream *stream, bool end_stream) {
   if (stream->call == nullptr || stream->is_discarding)
     return;
@@ -334,21 +321,19 @@ void stream_core_on_data_end(grpc_session *session, grpc_stream *stream, bool en
     /* base64 can only be decoded as a whole: wait for the end of the body */
     if (!end_stream)
       return;
-    /* grpc_metadata_decode_bin() skips characters outside the alphabet, so reject them here */
-    if (!is_base64_text(stream->recv_data + stream->recv_start, stream->recv_len)) {
-      stream->recv_len = 0;
-      call_abort(call, GRPC_STATUS_INVALID_ARGUMENT, "invalid grpc-web-text base64");
-      return;
-    }
     size_t dec_len = 0;
     uint8_t *dec = nullptr;
     if (stream->recv_len > 0) {
-      dec = grpc_metadata_decode_bin((const char *)(stream->recv_data + stream->recv_start),
-                                     stream->recv_len, &dec_len);
-      if (dec == nullptr) { /* the alphabet was checked, so only out of memory */
+      /* the body may be several separately padded chunks */
+      grpc_err derr = base64_decode((const char *)(stream->recv_data + stream->recv_start),
+                                    stream->recv_len, true, &dec, &dec_len);
+      if (derr != GRPC_OK) {
         stream->is_discarding = true;
         stream->recv_len = 0;
-        call_abort(call, GRPC_STATUS_RESOURCE_EXHAUSTED, "server out of memory");
+        if (derr == GRPC_ERR_INVALID)
+          call_abort(call, GRPC_STATUS_INVALID_ARGUMENT, "invalid grpc-web-text base64");
+        else
+          call_abort(call, GRPC_STATUS_RESOURCE_EXHAUSTED, "server out of memory");
         return;
       }
     }

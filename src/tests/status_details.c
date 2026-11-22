@@ -165,6 +165,12 @@ void test_status_details_unknown_fields_and_errors(void) {
   TEST_ASSERT_NOT_NULL(b64_trunc);
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_status_details_decode_all(b64_trunc, &all));
   grpc_free(b64_trunc);
+  /* text that is not Base64 at all is malformed input, not an allocation failure */
+  int32_t bad_code = -1;
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_status_details_decode("CAU=!", &bad_code, nullptr,
+                                                                     nullptr, nullptr, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_status_details_decode_all("CA U=", &all));
+  TEST_ASSERT_EQUAL_UINT64(0, all.nb_details);
   grpc_status_details_free(nullptr);
 }
 

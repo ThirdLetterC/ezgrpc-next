@@ -29,11 +29,13 @@ typedef struct grpc_metadata {
 } grpc_metadata;
 
 /**
- * Decodes the Base64 value of a ``-bin`` key (standard alphabet, padding
- * optional). Characters outside the alphabet are skipped, not rejected.
- * Stores the decoded length in ``*out_len`` if it is non-null. Returns a
- * buffer to free with grpc_free(), or nullptr if ``base64`` is nullptr or
- * allocation fails.
+ * Decodes the Base64 value of a ``-bin`` key: the standard alphabet, padded
+ * or unpadded (both are valid in gRPC). Any other character, including
+ * whitespace, misplaced or excess padding, or a final group of a single
+ * character makes the value malformed. Stores the decoded length in
+ * ``*out_len`` if it is non-null. Returns a buffer to free with grpc_free(),
+ * or nullptr if ``base64`` is nullptr, the value is malformed or allocation
+ * fails.
  */
 GRPC_API GRPC_NODISCARD uint8_t *grpc_metadata_decode_bin(const char *base64, size_t len,
                                                           size_t *out_len);

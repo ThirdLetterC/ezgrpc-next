@@ -66,54 +66,79 @@ static inline int b64_char_val(char c) {
   return -1;
 }
 
-/* Decodes Base64 text into a grpc_malloc buffer and stores the decoded length in *out_len when
- * out_len is non-null. Trailing '=', space and newline characters are stripped, and any other
- * non-alphabet byte is skipped rather than rejected, so malformed input decodes to whatever
- * valid characters it contains; leftover bits of an incomplete final group are dropped. Empty
- * input yields a 1-byte allocation with *out_len set to 0. Returns nullptr only if base64_str is
- * null or allocation fails. */
-GRPC_API uint8_t *grpc_metadata_decode_bin(const char *base64_str, size_t in_len, size_t *out_len) {
-  if (base64_str == nullptr) {
-    return nullptr;
-  }
+grpc_err base64_decode(const char *in, size_t len, bool concatenated, uint8_t **out,
+                       size_t *out_len) {
+  *out = nullptr;
+  *out_len = 0;
+  /* every 4 characters carry 3 bytes; a final group of 2 or 3 characters carries 1 or 2 */
+  uint8_t *dec = grpc_malloc(len / 4 * 3 + 3);
+  if (dec == nullptr)
+    return GRPC_ERR_NOMEM;
+  size_t j = 0;
+  uint32_t quad = 0;  /* 6-bit values of the current group */
+  size_t nq = 0;      /* characters of the current group seen, padding included */
+  size_t npad = 0;    /* '=' in the current group */
+  bool ended = false; /* a padded group ended the value (one-value mode) */
 
-  // Count valid base64 characters (strip trailing '=')
-  while (in_len > 0 && (base64_str[in_len - 1] == '=' || base64_str[in_len - 1] == ' ' ||
-                        base64_str[in_len - 1] == '\n')) {
-    in_len--;
-  }
-
-  if (in_len == 0) {
-    uint8_t *empty = grpc_malloc(1);
-    if (out_len)
-      *out_len = 0;
-    return empty;
-  }
-
-  size_t max_out = (in_len * 3) / 4 + 4;
-  uint8_t *out = grpc_malloc(max_out);
-  if (out == nullptr) {
-    return nullptr;
-  }
-
-  size_t i = 0, j = 0;
-  uint32_t buf = 0;
-  int bits = 0;
-
-  while (i < in_len) {
-    int val = b64_char_val(base64_str[i++]);
-    if (val < 0)
-      continue;
-    buf = (buf << 6) | (uint32_t)val;
-    bits += 6;
-    if (bits >= 8) {
-      bits -= 8;
-      out[j++] = (uint8_t)((buf >> bits) & 0xFF);
+  for (size_t i = 0; i < len; i++) {
+    char c = in[i];
+    if (ended)
+      goto invalid; /* nothing may follow the padding of a single value */
+    if (c == '=') {
+      if (nq < 2) /* "=..." or "x=..": no complete byte before the padding */
+        goto invalid;
+      npad++;
+      nq++;
+    } else {
+      int v = b64_char_val(c);
+      if (v < 0 || npad > 0) /* outside the alphabet, or data after padding in a group */
+        goto invalid;
+      quad = (quad << 6) | (uint32_t)v;
+      nq++;
+    }
+    if (nq == 4) {
+      size_t data_chars = 4 - npad;
+      quad <<= 6 * npad;
+      dec[j++] = (uint8_t)(quad >> 16);
+      if (data_chars >= 3)
+        dec[j++] = (uint8_t)(quad >> 8);
+      if (data_chars == 4)
+        dec[j++] = (uint8_t)quad;
+      if (npad > 0 && !concatenated)
+        ended = true;
+      quad = 0;
+      nq = 0;
+      npad = 0;
     }
   }
-
-  if (out_len != nullptr) {
-    *out_len = j;
+  if (nq > 0) {
+    /* an unpadded final group: 2 or 3 characters, never 1, and no partial padding */
+    if (npad > 0 || nq == 1)
+      goto invalid;
+    quad <<= 6 * (4 - nq);
+    dec[j++] = (uint8_t)(quad >> 16);
+    if (nq == 3)
+      dec[j++] = (uint8_t)(quad >> 8);
   }
+  *out = dec;
+  *out_len = j;
+  return GRPC_OK;
+
+invalid:
+  grpc_free(dec);
+  return GRPC_ERR_INVALID;
+}
+
+/* Strict Base64 decode of one -bin value (see base64_decode()). Empty input yields a 1-byte
+ * allocation with *out_len set to 0. */
+GRPC_API uint8_t *grpc_metadata_decode_bin(const char *base64_str, size_t in_len, size_t *out_len) {
+  if (base64_str == nullptr)
+    return nullptr;
+  uint8_t *out = nullptr;
+  size_t n = 0;
+  if (base64_decode(base64_str, in_len, false, &out, &n) != GRPC_OK)
+    return nullptr;
+  if (out_len != nullptr)
+    *out_len = n;
   return out;
 }

@@ -139,8 +139,9 @@ int grpc_tls_feed(grpc_session *session, const void *buf, size_t len) {
   return tls_backend_feed(session->tls, buf, len);
 }
 
-/* Appends the ciphertext the backend has ready to send to `out`. Returns 0 on success, nonzero on
- * error or when the session has no TLS state. */
+/* Appends the ciphertext the backend has ready to send to `out`. Returns TLS_DRAIN_OK,
+ * TLS_DRAIN_NOMEM (nothing lost, retry later) or TLS_DRAIN_ERROR, also when the session has no
+ * TLS state. */
 int grpc_tls_drain(grpc_session *session, grpc_buf *out) {
   if (session == nullptr || session->tls == nullptr) {
     return 1;

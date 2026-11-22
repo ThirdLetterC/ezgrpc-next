@@ -136,6 +136,18 @@ void ezflog(FILE *fp, const char *fmt, ...) {
 /* stop pulling frames out of nghttp2 once this many bytes wait for the kernel */
 static const size_t GRPC_OBUF_HIGH_WATER = 256 * 1024;
 
+/* Room reserved in the output buffer before taking a chunk from nghttp2_session_mem_send(),
+ * which returns at most one frame buffer (a 9-byte header plus up to 16 KiB of payload, since
+ * no data_source_read_length callback raises the DATA size). nghttp2 counts the bytes as sent
+ * once it hands them out, so they must never fail to fit. */
+static const size_t GRPC_SERIALIZE_HEADROOM = 32 * 1024;
+
+/* Delay before retrying a flush that an allocation failure blocked. */
+static const uint64_t GRPC_FLUSH_RETRY_MS = 10;
+
+/* session_serialize() results */
+enum { SERIALIZE_OK = 0, SERIALIZE_FATAL = 1, SERIALIZE_BLOCKED = 2 };
+
 /* Returns the session's handle as a stream, whichever of the pipe or TCP members is in use. */
 static inline uv_stream_t *session_stream(grpc_session *session) {
   return session->is_unix ? (uv_stream_t *)&session->handle.pipe
@@ -190,6 +202,7 @@ void session_slot_release(grpc_session *session) {
   session->peer_cert_subject[0] = '\0';
   session->is_closing = false;
   session->is_active = false;
+  session->is_flush_blocked = false;
   session->ops = nullptr;
 
   atomic_fetch_sub(&server->stat_active_connections, 1);
@@ -253,26 +266,29 @@ void session_close(grpc_session *session) {
   uv_close(session_handle(session), on_session_close);
 }
 
-/* nghttp2_mem hook: allocates through grpc_malloc(), so that all of nghttp2's memory comes from
- * the library allocator. */
-static void *nghttp2_mem_malloc(size_t size, [[maybe_unused]] void *user_data) {
+void *grpc_mem_hook_malloc(size_t size, [[maybe_unused]] void *user_data) {
   return grpc_malloc(size);
 }
 
-/* nghttp2_mem hook: frees through grpc_free(). */
-static void nghttp2_mem_free(void *ptr, [[maybe_unused]] void *user_data) {
+void grpc_mem_hook_free(void *ptr, [[maybe_unused]] void *user_data) {
   grpc_free(ptr);
 }
 
-/* nghttp2_mem hook: allocates zeroed memory through grpc_calloc(). */
-static void *nghttp2_mem_calloc(size_t nmemb, size_t size, [[maybe_unused]] void *user_data) {
+void *grpc_mem_hook_calloc(size_t nmemb, size_t size, [[maybe_unused]] void *user_data) {
   return grpc_calloc(nmemb, size);
 }
 
-/* nghttp2_mem hook: resizes through grpc_realloc(). */
-static void *nghttp2_mem_realloc(void *ptr, size_t size, [[maybe_unused]] void *user_data) {
+void *grpc_mem_hook_realloc(void *ptr, size_t size, [[maybe_unused]] void *user_data) {
   return grpc_realloc(ptr, size);
 }
+
+const nghttp2_mem grpc_nghttp2_mem = {
+    .mem_user_data = nullptr,
+    .malloc = grpc_mem_hook_malloc,
+    .free = grpc_mem_hook_free,
+    .calloc = grpc_mem_hook_calloc,
+    .realloc = grpc_mem_hook_realloc,
+};
 
 /* Sets up TLS (when the server has it) and an nghttp2 server session for an accepted
  * connection, using the grpc allocator, and submits the server's SETTINGS (initial window =
@@ -287,13 +303,8 @@ static int session_create(grpc_session *ezsession) {
     return 1;
   }
 
-  nghttp2_mem mem = {
-      .mem_user_data = nullptr,
-      .malloc = nghttp2_mem_malloc,
-      .free = nghttp2_mem_free,
-      .calloc = nghttp2_mem_calloc,
-      .realloc = nghttp2_mem_realloc,
-  };
+  /* nghttp2 copies the memory table */
+  nghttp2_mem mem = grpc_nghttp2_mem;
   int res = nghttp2_session_server_new3(&ezsession->ngsession, server->ngcallbacks, ezsession,
                                         nullptr, &mem);
   if (res < 0) {
@@ -565,24 +576,32 @@ void server_flush_sessions(grpc_server *server) {
 /* Moves frames queued in nghttp2 into obuf until about GRPC_OBUF_HIGH_WATER bytes are pending.
  * With TLS, the frames are batched in the shared server->tls_obuf, encrypted with a single
  * grpc_tls_write() and the ciphertext drained into obuf; nothing is pulled from nghttp2 before
- * the handshake is done, though handshake output still gets drained. Returns 0 on success, 1 on
- * an nghttp2, allocation or TLS error. */
+ * the handshake is done, though handshake output still gets drained. Returns SERIALIZE_OK,
+ * SERIALIZE_BLOCKED when a buffer could not grow before anything was lost (what was serialized
+ * so far is in obuf; retry later), or SERIALIZE_FATAL on an nghttp2 or TLS error, including
+ * their own allocation failures, after which the connection must close. */
 static int session_serialize(grpc_session *ezsession) {
   /* TLS application data cannot be written before the handshake completes */
   bool can_send = !ezsession->is_tls || ezsession->tls_handshake_done;
   grpc_buf *out = ezsession->is_tls ? &ezsession->server->tls_obuf : &ezsession->obuf;
+  int result = SERIALIZE_OK;
 
   while (can_send && ezsession->obuf.len + out->len < GRPC_OBUF_HIGH_WATER) {
+    /* reserve first: a chunk taken from nghttp2 cannot be given back */
+    if (buf_reserve(out, GRPC_SERIALIZE_HEADROOM)) {
+      result = SERIALIZE_BLOCKED;
+      break;
+    }
     const u8 *data;
     ssize_t n = nghttp2_session_mem_send(ezsession->ngsession, &data);
     if (n < 0) {
       LOG_ERROR(ezsession->server, "nghttp2: %s. killing...\n", nghttp2_strerror((int)n));
-      return 1;
+      return SERIALIZE_FATAL;
     }
     if (n == 0)
       break;
-    if (buf_append(out, data, (size_t)n))
-      return 1;
+    if (buf_append(out, data, (size_t)n)) /* larger than the headroom: cannot happen */
+      return SERIALIZE_FATAL;
   }
 
   if (ezsession->is_tls) {
@@ -591,12 +610,38 @@ static int session_serialize(grpc_session *ezsession) {
       ssize_t n = grpc_tls_write(ezsession, out->data, out->len);
       out->len = 0;
       if (n <= 0)
-        return 1;
+        return SERIALIZE_FATAL;
     }
-    if (grpc_tls_drain(ezsession, &ezsession->obuf))
-      return 1;
+    int drained = grpc_tls_drain(ezsession, &ezsession->obuf);
+    if (drained == TLS_DRAIN_NOMEM)
+      return SERIALIZE_BLOCKED;
+    if (drained != TLS_DRAIN_OK)
+      return SERIALIZE_FATAL;
   }
-  return 0;
+  return result;
+}
+
+/* flush_retry_timer callback: re-queues the sessions whose output was blocked by an allocation
+ * failure and flushes them; a session still blocked re-arms the timer. */
+static void on_flush_retry(uv_timer_t *handle) {
+  grpc_server *server = handle->data;
+  for (size_t i = 0; i < server->nb_sessions; i++) {
+    grpc_session *s = &server->sessions[i];
+    if (s->is_flush_blocked) {
+      s->is_flush_blocked = false;
+      if (s->is_active && !s->is_closing)
+        session_schedule_flush(s);
+    }
+  }
+  server_flush_sessions(server);
+}
+
+/* Marks the session's output as blocked by an allocation failure and arms the retry timer. */
+static void session_flush_blocked(grpc_session *ezsession) {
+  grpc_server *server = ezsession->server;
+  ezsession->is_flush_blocked = true;
+  if (server->flush_retry_timer_active && !uv_is_active((uv_handle_t *)&server->flush_retry_timer))
+    (void)uv_timer_start(&server->flush_retry_timer, on_flush_retry, GRPC_FLUSH_RETRY_MS, 0);
 }
 
 /* libuv write callback for the uv_write() of wbuf started by session_flush(); also runs with
@@ -620,8 +665,10 @@ static void on_session_write(uv_write_t *req, int status) {
  * while the socket accepts everything; on a partial write it swaps obuf and wbuf and lets
  * uv_write() send the remainder from wbuf (counted as sent right away) while obuf collects new
  * output, then returns. Does nothing while a write is in flight: on_session_write() resumes it.
- * Closes the session on errors, and once nghttp2 wants neither to read nor to write (e.g. after
- * a GOAWAY exchange). */
+ * When an output buffer cannot grow, the session keeps its pending frames and the flush is
+ * retried after GRPC_FLUSH_RETRY_MS. Closes the session on other errors (including nghttp2 or
+ * the TLS library running out of memory, which they treat as fatal), and once nghttp2 wants
+ * neither to read nor to write (e.g. after a GOAWAY exchange). */
 void session_flush(grpc_session *ezsession) {
   if (ezsession->ops != nullptr && ezsession->ops->flush != nullptr) {
     ezsession->ops->flush(ezsession);
@@ -632,8 +679,15 @@ void session_flush(grpc_session *ezsession) {
     return;
 
   for (;;) {
-    if (session_serialize(ezsession)) {
+    int serialized = session_serialize(ezsession);
+    if (serialized == SERIALIZE_FATAL) {
       session_close(ezsession);
+      return;
+    }
+    if (serialized == SERIALIZE_BLOCKED && ezsession->obuf.len == 0) {
+      /* out of memory with nothing to write: try again shortly instead of dropping the
+       * connection (an RPC that needs memory to proceed fails on its own) */
+      session_flush_blocked(ezsession);
       return;
     }
     if (ezsession->obuf.len == 0)

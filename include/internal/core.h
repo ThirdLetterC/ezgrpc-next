@@ -366,6 +366,8 @@ struct grpc_session {
    * closed slot may still be queued. */
   bool is_flush_queued : 1;
   grpc_session *flush_next;
+  /* Output stopped because a buffer could not grow; server->flush_retry_timer flushes it again. */
+  bool is_flush_blocked : 1;
 };
 
 /* ---- the server ------------------------------------------------------------ */
@@ -417,6 +419,8 @@ struct grpc_server {
   uv_timer_t deadline_timer;
   /* Periodic timer for HTTP/2 keepalive, idle, and connection age checks. */
   uv_timer_t maintenance_timer;
+  /* Retries the flush of sessions whose output was blocked by an allocation failure. */
+  uv_timer_t flush_retry_timer;
   /* Wakes the loop for grpc_server_post() and grpc_server_stop(). */
   uv_async_t async;
 
@@ -427,6 +431,7 @@ struct grpc_server {
   bool timer_active : 1;
   bool deadline_timer_active : 1;
   bool maintenance_timer_active : 1;
+  bool flush_retry_timer_active : 1;
   bool async_active : 1;
   bool is_tls : 1;
 
@@ -556,3 +561,12 @@ void tls_free(grpc_server *server);
  * if it is non-null. nullptr when out of memory or `len` exceeds UINT32_MAX. Free with
  * grpc_message_free(). */
 grpc_message *message_create(u8 cflag, const void *data, size_t len);
+
+/* Strict standard-alphabet Base64 decode (grpc_metadata.c). Accepts padded and unpadded input;
+ * rejects any other character, misplaced or excess padding and a final group of one character.
+ * With concatenated, padding may end any 4-character group and decoding continues after it
+ * (gRPC-Web-Text bodies are separately encoded chunks); otherwise padding ends the value. On
+ * success *out is a grpc_malloc buffer (at least 1 byte) holding *out_len bytes. Returns
+ * GRPC_OK, GRPC_ERR_INVALID or GRPC_ERR_NOMEM; on error *out is nullptr. */
+grpc_err base64_decode(const char *in, size_t len, bool concatenated, uint8_t **out,
+                       size_t *out_len);

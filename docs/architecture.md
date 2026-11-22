@@ -69,6 +69,8 @@ grpc_set_allocator(&custom); /* pass nullptr to restore the build default */
 
 All buffers returned to the application (decoded metadata, compressed outputs, status details, etc.) are allocated through the active allocator and must be freed with `grpc_free()`.
 
+The protocol libraries allocate through it as well: nghttp2 (server and client sessions), and ngtcp2 and nghttp3 for HTTP/3. The TLS library, libuv and the compression codecs keep their own allocators.
+
 ---
 
 ## Logging

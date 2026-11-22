@@ -271,7 +271,7 @@ int tls_backend_drain(grpc_tls_session *tls, grpc_buf *out) {
   size_t pending;
   while ((pending = BIO_ctrl_pending(wbio)) > 0) {
     if (buf_reserve(out, pending)) {
-      return 1;
+      return TLS_DRAIN_NOMEM; /* nothing read yet: the ciphertext stays in the BIO */
     }
     int n = BIO_read(wbio, out->data + out->len, pending > INT_MAX ? INT_MAX : (int)pending);
     if (n <= 0) {

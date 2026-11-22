@@ -32,6 +32,22 @@
 #include "internal_http3.h"
 #include "internal_quic_tls.h"
 
+/* ngtcp2 and nghttp3 keep a pointer to their memory table, so these live for the program. */
+static const ngtcp2_mem quic_mem = {
+    .user_data = nullptr,
+    .malloc = grpc_mem_hook_malloc,
+    .free = grpc_mem_hook_free,
+    .calloc = grpc_mem_hook_calloc,
+    .realloc = grpc_mem_hook_realloc,
+};
+static const nghttp3_mem h3_mem = {
+    .user_data = nullptr,
+    .malloc = grpc_mem_hook_malloc,
+    .free = grpc_mem_hook_free,
+    .calloc = grpc_mem_hook_calloc,
+    .realloc = grpc_mem_hook_realloc,
+};
+
 /* The grpc_nv used by the call layer must be usable as an nghttp3_nv array as is. */
 static_assert(sizeof(grpc_nv) == sizeof(nghttp3_nv) &&
                   offsetof(grpc_nv, name) == offsetof(nghttp3_nv, name) &&
@@ -500,7 +516,7 @@ static int h3_setup(grpc_quic_conn *qc) {
   nghttp3_settings_default(&settings);
   settings.qpack_max_dtable_capacity = 4096;
   settings.qpack_blocked_streams = 100;
-  if (nghttp3_conn_server_new(&qc->h3, &callbacks, &settings, nullptr, qc) != 0)
+  if (nghttp3_conn_server_new(&qc->h3, &callbacks, &settings, &h3_mem, qc) != 0)
     return -1;
 
   const ngtcp2_transport_params *params = ngtcp2_conn_get_local_transport_params(qc->conn);
@@ -924,7 +940,7 @@ static grpc_quic_conn *qc_new(grpc_h3_server *h3s, uv_udp_t *udp, const struct s
     goto fail;
 
   if (ngtcp2_conn_server_new(&qc->conn, &hd->scid, &scid, &path, hd->version, &callbacks, &settings,
-                             &params, nullptr, qc) != 0)
+                             &params, &quic_mem, qc) != 0)
     goto fail;
   qc->conn_ref = (ngtcp2_crypto_conn_ref){.get_conn = get_conn, .user_data = qc};
   qc->tls = quic_tls_session_new(h3s->tls_ctx, &qc->conn_ref, true, nullptr);

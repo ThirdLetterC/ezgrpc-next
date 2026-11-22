@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdint.h>
 #include "grpc.h"
+#include "core.h"
 #include "test.h"
 
 void setUp(void) {}
@@ -83,31 +84,17 @@ void test_metadata_encode_is_padded(void) {
 
 /* padding is optional on decode (gRPC peers may omit it) */
 void test_metadata_decode_unpadded(void) {
+  check_decode("", "", 0);
   check_decode("Zg", "f", 1);
   check_decode("Zm8", "fo", 2);
   check_decode("Zm9v", "foo", 3);
   check_decode("Zm9vYg", "foob", 4);
   check_decode("Zm9vYmE", "fooba", 5);
-  check_decode("Zg=", "f", 1);
   check_decode("Zg==", "f", 1);
+  check_decode("Zm8=", "fo", 2);
+  check_decode("Zm9vYg==", "foob", 4);
   check_decode("+/8", "\xfb\xff", 2);
-  /* trailing padding, spaces and newlines are stripped */
-  check_decode("Zm8= \n", "fo", 2);
-  /* a lone final character carries only 6 bits: dropped */
-  check_decode("Zm9vY", "foo", 3);
-  check_decode("Z", "", 0);
-}
-
-/* characters outside the standard alphabet are skipped, not rejected */
-void test_metadata_decode_skips_invalid(void) {
-  check_decode("Zm 9v", "foo", 3);
-  check_decode("Z!m@9#v", "foo", 3);
-  check_decode("Zm9v\r\n\tYmFy", "foobar", 6);
-  /* the URL-safe alphabet is not standard Base64: '-' and '_' are skipped too */
-  check_decode("-_Zm9v", "foo", 3);
-  /* nothing valid at all: an empty, non-null result */
-  check_decode("!!!!", "", 0);
-  check_decode("====", "", 0);
+  check_decode("+/8=", "\xfb\xff", 2);
   /* an explicit length stops before the NUL */
   size_t dec_len = 0;
   uint8_t *decoded = grpc_metadata_decode_bin("Zm9vYmFy", 4, &dec_len);
@@ -120,6 +107,55 @@ void test_metadata_decode_skips_invalid(void) {
   TEST_ASSERT_NOT_NULL(decoded);
   TEST_ASSERT_EQUAL_MEMORY("foo", decoded, 3);
   grpc_free(decoded);
+}
+
+/* anything that is not a padded or unpadded standard Base64 value is rejected */
+void test_metadata_decode_rejects_malformed(void) {
+  const char *bad[] = {
+      "Zm 9v",    /* whitespace */
+      "Zm8= \n",  /* trailing whitespace */
+      "Zm9v\r\n", /* line break */
+      "Z!m@9#v",  /* punctuation */
+      "-_Zm9v",   /* URL-safe alphabet */
+      "Zm9vY",    /* a lone final character (6 bits, no whole byte) */
+      "Z",        /* the same */
+      "Zg=",      /* partial padding */
+      "Z===",     /* too much padding */
+      "====",     /* padding only */
+      "=Zm9",     /* padding first */
+      "Zm9v=",    /* padding after a complete group */
+      "Zg==Zg==", /* data after the padding of a single value */
+      "Zm=v",     /* data inside the padding */
+  };
+  for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+    size_t dec_len = 12345;
+    uint8_t *decoded = grpc_metadata_decode_bin(bad[i], strlen(bad[i]), &dec_len);
+    TEST_ASSERT_NULL_MESSAGE(decoded, bad[i]);
+    TEST_ASSERT_EQUAL_UINT64_MESSAGE(12345, dec_len, bad[i]); /* untouched on failure */
+  }
+}
+
+/* the internal decoder behind grpc-web-text bodies: separately padded chunks may follow each
+ * other, and it tells malformed input apart from allocation failure */
+void test_metadata_base64_decode_internal(void) {
+  uint8_t *out = nullptr;
+  size_t out_len = 0;
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, base64_decode("Zg==Zm8=Zm9v", 12, true, &out, &out_len));
+  TEST_ASSERT_EQUAL_UINT64(6, out_len);
+  TEST_ASSERT_EQUAL_MEMORY("ffofoo", out, 6);
+  grpc_free(out);
+  /* the final chunk may be unpadded */
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, base64_decode("Zg==Zm8", 7, true, &out, &out_len));
+  TEST_ASSERT_EQUAL_UINT64(3, out_len);
+  TEST_ASSERT_EQUAL_MEMORY("ffo", out, 3);
+  grpc_free(out);
+  /* one value: the padding must end it */
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, base64_decode("Zg==Zm8=", 8, false, &out, &out_len));
+  TEST_ASSERT_NULL(out);
+  /* concatenated mode is no more lenient about the characters themselves */
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, base64_decode("Zg== Zm8=", 9, true, &out, &out_len));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, base64_decode("Zg=Zm8=", 7, true, &out, &out_len));
+  TEST_ASSERT_NULL(out);
 }
 
 void test_metadata_null_handling(void) {
@@ -137,7 +173,8 @@ int main(void) {
   RUN_TEST(test_metadata_binary_random_bytes);
   RUN_TEST(test_metadata_encode_is_padded);
   RUN_TEST(test_metadata_decode_unpadded);
-  RUN_TEST(test_metadata_decode_skips_invalid);
+  RUN_TEST(test_metadata_decode_rejects_malformed);
+  RUN_TEST(test_metadata_base64_decode_internal);
   RUN_TEST(test_metadata_null_handling);
   return UNITY_END();
 }

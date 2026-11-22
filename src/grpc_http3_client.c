@@ -25,6 +25,22 @@
 #include "internal_helpers.h"
 #include "internal_quic_tls.h"
 
+/* ngtcp2 and nghttp3 keep a pointer to their memory table, so these live for the program. */
+static const ngtcp2_mem quic_mem = {
+    .user_data = nullptr,
+    .malloc = grpc_mem_hook_malloc,
+    .free = grpc_mem_hook_free,
+    .calloc = grpc_mem_hook_calloc,
+    .realloc = grpc_mem_hook_realloc,
+};
+static const nghttp3_mem h3_mem = {
+    .user_data = nullptr,
+    .malloc = grpc_mem_hook_malloc,
+    .free = grpc_mem_hook_free,
+    .calloc = grpc_mem_hook_calloc,
+    .realloc = grpc_mem_hook_realloc,
+};
+
 enum { H3C_CID_LEN = 18 };
 enum { H3C_CHUNK = 16384 };
 enum { H3C_MAX_UDP_PAYLOAD = 1452 };
@@ -337,7 +353,7 @@ static int h3c_setup(h3c_conn *hc) {
   nghttp3_settings_default(&settings);
   settings.qpack_max_dtable_capacity = 4096;
   settings.qpack_blocked_streams = 100;
-  if (nghttp3_conn_client_new(&hc->h3, &callbacks, &settings, nullptr, hc) != 0)
+  if (nghttp3_conn_client_new(&hc->h3, &callbacks, &settings, &h3_mem, hc) != 0)
     return -1;
   int64_t ctrl_id, qenc_id, qdec_id;
   if (ngtcp2_conn_open_uni_stream(hc->conn, &ctrl_id, nullptr) != 0 ||
@@ -686,7 +702,7 @@ grpc_err h3c_connect(client_subchannel *s) {
   params.initial_max_streams_uni = 3;
   params.max_idle_timeout = 30 * NGTCP2_SECONDS;
   if (ngtcp2_conn_client_new(&hc->conn, &dcid, &scid, &path, NGTCP2_PROTO_VER_V1, &callbacks,
-                             &settings, &params, nullptr, hc) != 0)
+                             &settings, &params, &quic_mem, hc) != 0)
     return GRPC_ERR_IO;
 
   const char *sni = c->config.tls.server_name != nullptr ? c->config.tls.server_name : s->host;

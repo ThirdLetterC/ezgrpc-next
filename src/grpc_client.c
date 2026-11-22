@@ -541,10 +541,9 @@ static void on_sub_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
       if (n > 0) {
         ssize_t rv = nghttp2_session_mem_recv(s->ngsession, s->rbuf, (size_t)n);
         if (rv < 0) {
-          if (s->active_stream != nullptr) {
-            s->active_stream->err = GRPC_ERR_PROTOCOL;
-            s->active_stream->stream_done = true;
-          }
+          /* the session is unusable after a fatal nghttp2 error: close it, the next RPC
+           * reconnects */
+          sub_fail(s, rv == NGHTTP2_ERR_NOMEM ? GRPC_ERR_NOMEM : GRPC_ERR_PROTOCOL);
           return;
         }
       } else {
@@ -566,10 +565,8 @@ static void on_sub_read(uv_stream_t *stream, ssize_t nread, const uv_buf_t *buf)
 
   ssize_t rv = nghttp2_session_mem_recv(s->ngsession, (const uint8_t *)buf->base, (size_t)nread);
   if (rv < 0) {
-    if (s->active_stream != nullptr) {
-      s->active_stream->err = GRPC_ERR_PROTOCOL;
-      s->active_stream->stream_done = true;
-    }
+    /* the session is unusable after a fatal nghttp2 error: close it, the next RPC reconnects */
+    sub_fail(s, rv == NGHTTP2_ERR_NOMEM ? GRPC_ERR_NOMEM : GRPC_ERR_PROTOCOL);
     return;
   }
   sub_flush(s);
@@ -778,7 +775,8 @@ static grpc_err sub_connect(client_subchannel *s) {
   nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, client_on_data_chunk);
   nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, client_on_frame_recv);
   nghttp2_session_callbacks_set_on_stream_close_callback(cbs, client_on_stream_close);
-  int rv = nghttp2_session_client_new(&s->ngsession, cbs, s);
+  nghttp2_mem mem = grpc_nghttp2_mem; /* copied by nghttp2 */
+  int rv = nghttp2_session_client_new3(&s->ngsession, cbs, s, nullptr, &mem);
   nghttp2_session_callbacks_del(cbs);
   if (rv != 0) {
     sub_disconnect(s);
@@ -1278,8 +1276,8 @@ GRPC_API grpc_err grpc_client_stream_send(grpc_client_stream *st, const void *da
     return GRPC_ERR_INVALID;
   if (st->send_closed)
     return GRPC_ERR_STATE;
-  if (st->sub->closed || st->stream_done)
-    return GRPC_ERR_CLOSED;
+  if (st->sub->closed || st->stream_done) /* report why the stream ended when it failed */
+    return st->err != GRPC_OK ? st->err : GRPC_ERR_CLOSED;
 
   grpc_err err = frame_message_into(st->sub->parent, &st->send_buf, data, len);
   if (err != GRPC_OK)

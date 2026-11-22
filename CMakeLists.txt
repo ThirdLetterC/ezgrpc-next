@@ -533,6 +533,12 @@ if(GRPC_BUILD_TESTS OR (GRPC_BUILD_EXAMPLES AND GRPC_BUILD_INTEGRATION_TESTS))
     else()
       set_tests_properties(${test} PROPERTIES LABELS unit TIMEOUT 30)
     endif()
+    if("thread" IN_LIST _grpc_sanitizers)
+      # ThreadSanitizer does not intercept io_uring_setup(), which libuv (1.45+) calls for every
+      # loop: a descriptor number reused that way looks like a race with the thread that closed
+      # it. Plain epoll keeps the reports meaningful.
+      set_tests_properties(${test} PROPERTIES ENVIRONMENT "UV_USE_IO_URING=0")
+    endif()
   endforeach()
   add_custom_target(grpc_check
     COMMAND "${CMAKE_CTEST_COMMAND}" -C "$<CONFIG>" --output-on-failure

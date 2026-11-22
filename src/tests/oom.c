@@ -822,6 +822,76 @@ void test_oom_live_call_and_client(void) {
   TEST_ASSERT_EQUAL_INT(GRPC_OK, atomic_load(&g_srv_rc));
 }
 
+/* ---- a connection's lifecycle on the server thread ---------------------------------------- */
+
+static atomic_int g_srv_tid = 0;
+
+/* Echo handler that also records the server thread's oom id. A failed reply leaves the call
+ * open, so it is finished with RESOURCE_EXHAUSTED (as an application would). */
+static void tid_echo_handler(grpc_call *call, const grpc_message *req, [[maybe_unused]] void *ud) {
+  atomic_store(&g_srv_tid, oom_thread_id());
+  if (grpc_call_reply_data(call, req->data, req->len) != GRPC_OK)
+    (void)grpc_call_finish(call, GRPC_STATUS_RESOURCE_EXHAUSTED, "out of memory");
+}
+
+void test_oom_server_connection(void) {
+  grpc_server *srv = fx_server_new();
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(srv, "/oom.Svc/Echo", tid_echo_handler, nullptr));
+  fx_server_start();
+  uint16_t port = grpc_server_port(srv);
+  grpc_client *probe = fx_client_new(port);
+  assert_echo_works(probe); /* learns the server thread's id */
+  grpc_client_free(probe);
+  g_fx.client = nullptr;
+  int srv_tid = atomic_load(&g_srv_tid);
+  TEST_ASSERT_NOT_EQUAL_INT(0, srv_tid);
+
+  /* Step n fails only the n-th allocation the (otherwise idle) server thread makes for a new
+   * connection and one unary call: accepting, the session, its SETTINGS and output buffers, the
+   * stream, the request and the reply. Each RPC either succeeds (a blocked flush is retried) or
+   * fails promptly; none hangs until its deadline, and the server keeps serving. */
+  int recovered = 0;
+  for (int n = 0;; n++) {
+    OOM_ASSERT_STEP(n);
+    oom_enable_once_on(srv_tid, n);
+    grpc_err err = GRPC_OK;
+    grpc_client *c = grpc_client_new(
+        &(grpc_client_config){.host = "127.0.0.1", .port = port, .timeout_ms = 2000}, &err);
+    g_fx.client = c;
+    grpc_err rc = err;
+    grpc_client_response r = {0};
+    if (c != nullptr)
+      rc = grpc_client_unary(c, "/oom.Svc/Echo", "ping", 4, nullptr, 0, 2000, &r);
+    bool injected = oom_disable();
+    bool ok = rc == GRPC_OK && response_is(&r, "ping", 4);
+    grpc_status status = r.status;
+    grpc_client_response_free(&r);
+    grpc_client_free(c);
+    g_fx.client = nullptr;
+    if (!injected) {
+      TEST_ASSERT_TRUE_MESSAGE(ok, "unary without OOM failed");
+      oom_report("server connection + unary (server)", n);
+      break;
+    }
+    if (ok)
+      recovered++;
+    else if (rc == GRPC_OK)
+      TEST_ASSERT_NOT_EQUAL_INT(GRPC_STATUS_OK, status);
+    else
+      TEST_ASSERT_NOT_EQUAL_INT_MESSAGE(GRPC_ERR_TIMEOUT, rc, "RPC hung after a server OOM");
+    grpc_client *after = fx_client_new(port);
+    assert_echo_works(after);
+    grpc_client_free(after);
+    g_fx.client = nullptr;
+  }
+  if (getenv("OOM_VERBOSE") != nullptr)
+    printf("[oom] server connection: %d steps recovered without failing the RPC\n", recovered);
+
+  fx_server_stop();
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, atomic_load(&g_srv_rc));
+}
+
 /* ---- request parsing on the server thread ------------------------------------------------ */
 
 /* Streaming handler for /oom.Svc/Recv. The first message is answered with "armed" and then arms
@@ -1244,6 +1314,7 @@ int main(void) {
   RUN_TEST(test_oom_client);
   RUN_TEST(test_oom_live_call_and_client);
   RUN_TEST(test_oom_request_parsing);
+  RUN_TEST(test_oom_server_connection);
 #ifndef _WIN32
   RUN_TEST(test_oom_grpc_web_and_client_deterministic);
 #endif

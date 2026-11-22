@@ -11,6 +11,17 @@
 #include <string.h>
 #include "core.h"
 
+/* Allocator hooks in the shape shared by nghttp2_mem, ngtcp2_mem and nghttp3_mem (the user data
+ * pointer comes last and is ignored): they route the protocol libraries' memory through
+ * grpc_malloc() and friends, so grpc_set_allocator() and the GRPC_ALLOCATOR build option cover
+ * it too. */
+void *grpc_mem_hook_malloc(size_t size, void *user_data);
+void grpc_mem_hook_free(void *ptr, void *user_data);
+void *grpc_mem_hook_calloc(size_t nmemb, size_t size, void *user_data);
+void *grpc_mem_hook_realloc(void *ptr, size_t size, void *user_data);
+/* The nghttp2 memory table built from these hooks, for the server and client sessions. */
+extern const nghttp2_mem grpc_nghttp2_mem;
+
 /* Start closing a session: detach and free its streams (their calls end with UNAVAILABLE), free
  * the nghttp2/TLS state and uv_close() the handle. No-op if already closing or inactive. */
 void session_close(grpc_session *session);

@@ -28,7 +28,14 @@ typedef struct grpc_tls_ctx grpc_tls_ctx;
 int grpc_tls_session_init(grpc_session *session);
 /* Hand ciphertext received from the socket to the backend. */
 int grpc_tls_feed(grpc_session *session, const void *buf, size_t len);
-/* Append the ciphertext ready to send to `out`. */
+/* Results of grpc_tls_drain() / tls_backend_drain(). */
+enum {
+  TLS_DRAIN_OK = 0,
+  TLS_DRAIN_ERROR = 1,
+  /* `out` could not grow; the ciphertext stays queued in the backend, so a later drain works */
+  TLS_DRAIN_NOMEM = 2,
+};
+/* Append the ciphertext ready to send to `out`. Returns a TLS_DRAIN_* value. */
 int grpc_tls_drain(grpc_session *session, grpc_buf *out);
 /* Advance the server handshake with the ciphertext fed so far. */
 int grpc_tls_handshake(grpc_session *session);
@@ -112,13 +119,13 @@ static inline int tls_io_push(grpc_tls_io *io, const void *data, size_t len) {
   return buf_append(&io->out, data, len);
 }
 
-/* Move all queued output ciphertext to the end of `dst`. 0 on success (also when empty), 1 if
- * out of memory (the output stays queued). */
+/* Move all queued output ciphertext to the end of `dst`. TLS_DRAIN_OK on success (also when
+ * empty), TLS_DRAIN_NOMEM if `dst` cannot grow (the output stays queued). */
 static inline int tls_io_drain(grpc_tls_io *io, grpc_buf *dst) {
   if (io->out.len == 0)
-    return 0;
+    return TLS_DRAIN_OK;
   if (buf_append(dst, io->out.data, io->out.len))
-    return 1;
+    return TLS_DRAIN_NOMEM;
   io->out.len = 0;
   return 0;
 }

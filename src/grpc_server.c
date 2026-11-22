@@ -679,6 +679,10 @@ GRPC_API grpc_server *grpc_server_new_ex(const grpc_config *config, grpc_err *ou
     goto err;
   server->deadline_timer.data = server;
   server->deadline_timer_active = true;
+  if (uv_timer_init(&server->loop, &server->flush_retry_timer) != 0)
+    goto err;
+  server->flush_retry_timer.data = server;
+  server->flush_retry_timer_active = true;
   if (uv_async_init(&server->loop, &server->async, on_async) != 0)
     goto err;
   server->async.data = server;
@@ -808,6 +812,8 @@ GRPC_API void grpc_server_free(grpc_server *server) {
     uv_close((uv_handle_t *)&server->deadline_timer, nullptr);
   if (server->maintenance_timer_active)
     uv_close((uv_handle_t *)&server->maintenance_timer, nullptr);
+  if (server->flush_retry_timer_active)
+    uv_close((uv_handle_t *)&server->flush_retry_timer, nullptr);
   if (server->async_active)
     uv_close((uv_handle_t *)&server->async, nullptr);
   if (server->ipv4_sockfd != GRPC_INVALID_SOCKET)
