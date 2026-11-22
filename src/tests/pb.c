@@ -18,7 +18,7 @@ static grpc_allocator saved_alloc;
 #if defined(_MSC_VER) && !defined(__clang__)
 #define PB_THREAD_LOCAL __declspec(thread)
 #else
-#define PB_THREAD_LOCAL thread_local
+#define PB_THREAD_LOCAL _Thread_local /* thread_local is a keyword only from GCC 13 in C23 */
 #endif
 static PB_THREAD_LOCAL bool fail_here;
 
