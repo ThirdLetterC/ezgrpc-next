@@ -164,9 +164,14 @@ void test_message_all_codecs_and_errors(void) {
   /* Decompressing an uncompressed message duplicates it */
   grpc_message *dup = grpc_message_decompress(orig, GRPC_COMPRESS_GZIP);
   TEST_ASSERT_NOT_NULL(dup);
+  TEST_ASSERT_TRUE(dup != orig);
+  TEST_ASSERT_EQUAL_UINT8(0, dup->cflag);
   TEST_ASSERT_EQUAL_UINT32(orig->len, dup->len);
+  TEST_ASSERT_EQUAL_MEMORY(orig->data, dup->data, orig->len);
   grpc_message_free(dup);
 
+#if defined(GRPC_ENABLE_ZLIB) || defined(GRPC_ENABLE_ZSTD) || defined(GRPC_ENABLE_SNAPPY)
+  /* only built with at least one codec: an empty initializer would be a zero-length array */
   const grpc_compression_algorithm algs[] = {
 #if defined(GRPC_ENABLE_ZLIB)
       GRPC_COMPRESS_GZIP,
@@ -189,6 +194,46 @@ void test_message_all_codecs_and_errors(void) {
     grpc_message_free(c);
     grpc_message_free(d);
   }
+#endif
+  /* codecs left out of the build are reported as unsupported */
+  uint8_t *out = nullptr;
+  size_t out_len = 0;
+#if !defined(GRPC_ENABLE_ZLIB)
+  TEST_ASSERT_NULL(grpc_message_compress(orig, GRPC_COMPRESS_GZIP, GRPC_COMPRESSION_LEVEL_DEFAULT));
+  TEST_ASSERT_NULL(
+      grpc_message_compress(orig, GRPC_COMPRESS_DEFLATE, GRPC_COMPRESSION_LEVEL_DEFAULT));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_UNSUPPORTED,
+                        grpc_compress(GRPC_COMPRESS_GZIP, GRPC_COMPRESSION_LEVEL_DEFAULT,
+                                      (const uint8_t *)"a", 1, &out, &out_len));
+  TEST_ASSERT_NULL(out);
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_ERR_UNSUPPORTED,
+      grpc_decompress(GRPC_COMPRESS_DEFLATE, (const uint8_t *)"a", 1, &out, &out_len));
+  TEST_ASSERT_NULL(out);
+#endif
+#if !defined(GRPC_ENABLE_ZSTD)
+  TEST_ASSERT_NULL(grpc_message_compress(orig, GRPC_COMPRESS_ZSTD, GRPC_COMPRESSION_LEVEL_DEFAULT));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_UNSUPPORTED,
+                        grpc_compress(GRPC_COMPRESS_ZSTD, GRPC_COMPRESSION_LEVEL_DEFAULT,
+                                      (const uint8_t *)"a", 1, &out, &out_len));
+  TEST_ASSERT_NULL(out);
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_ERR_UNSUPPORTED,
+      grpc_decompress(GRPC_COMPRESS_ZSTD, (const uint8_t *)"a", 1, &out, &out_len));
+  TEST_ASSERT_NULL(out);
+#endif
+#if !defined(GRPC_ENABLE_SNAPPY)
+  TEST_ASSERT_NULL(
+      grpc_message_compress(orig, GRPC_COMPRESS_SNAPPY, GRPC_COMPRESSION_LEVEL_DEFAULT));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_UNSUPPORTED,
+                        grpc_compress(GRPC_COMPRESS_SNAPPY, GRPC_COMPRESSION_LEVEL_DEFAULT,
+                                      (const uint8_t *)"a", 1, &out, &out_len));
+  TEST_ASSERT_NULL(out);
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_ERR_UNSUPPORTED,
+      grpc_decompress(GRPC_COMPRESS_SNAPPY, (const uint8_t *)"a", 1, &out, &out_len));
+  TEST_ASSERT_NULL(out);
+#endif
 #if defined(GRPC_ENABLE_ZSTD)
   grpc_message *cz = grpc_message_compress(orig, GRPC_COMPRESS_ZSTD, 3);
   TEST_ASSERT_NOT_NULL(cz);
@@ -202,8 +247,6 @@ void test_message_all_codecs_and_errors(void) {
   TEST_ASSERT_NULL(grpc_message_compress(nullptr, GRPC_COMPRESS_GZIP, -1));
   TEST_ASSERT_NULL(grpc_message_decompress(nullptr, GRPC_COMPRESS_GZIP));
 
-  uint8_t *out = nullptr;
-  size_t out_len = 0;
 #if defined(GRPC_ENABLE_ZLIB)
   TEST_ASSERT_NULL(grpc_message_compress(orig, GRPC_COMPRESS_GZIP, 99));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_compress(GRPC_COMPRESS_GZIP, 99,
@@ -237,7 +280,7 @@ int main(void) {
 #if defined(GRPC_ENABLE_ZLIB) || defined(GRPC_ENABLE_ZSTD) || defined(GRPC_ENABLE_SNAPPY)
   RUN_TEST(test_configurable_codecs_roundtrip);
   RUN_TEST(test_decompression_limits);
-  RUN_TEST(test_message_all_codecs_and_errors);
 #endif
+  RUN_TEST(test_message_all_codecs_and_errors);
   return UNITY_END();
 }

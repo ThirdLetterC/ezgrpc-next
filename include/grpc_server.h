@@ -300,6 +300,7 @@ GRPC_API grpc_err grpc_server_post(grpc_server *server, void (*fn)(void *arg), v
 GRPC_API void *grpc_server_tls_native(grpc_server *server);
 
 /**
- * The license text of grpc, a static string.
+ * The library's license (BSD 2-Clause style), identical to the LICENSE file, as a static string.
+ * The copyright holders, "The ezGRPC-next Authors", are listed in the AUTHORS file.
  */
 GRPC_API const char *grpc_license(void);

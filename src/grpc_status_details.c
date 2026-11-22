@@ -168,7 +168,8 @@ GRPC_API grpc_err grpc_status_details_decode(const char *base64_str, int32_t *ou
   size_t raw_len = 0;
   uint8_t *raw = grpc_metadata_decode_bin(base64_str, strlen(base64_str), &raw_len);
   if (raw == nullptr) {
-    return GRPC_ERR_INVALID;
+    /* only fails for a nullptr input (excluded above) or when out of memory */
+    return GRPC_ERR_NOMEM;
   }
 
   if (out_code)
@@ -287,8 +288,8 @@ GRPC_API grpc_err grpc_status_details_decode_all(const char *base64_str, grpc_st
 
   size_t raw_len = 0;
   uint8_t *raw = grpc_metadata_decode_bin(base64_str, strlen(base64_str), &raw_len);
-  if (raw == nullptr)
-    return GRPC_ERR_INVALID;
+  if (raw == nullptr) /* only nullptr input (excluded above) or out of memory */
+    return GRPC_ERR_NOMEM;
 
   size_t cap = 0;
   size_t seek = 0;

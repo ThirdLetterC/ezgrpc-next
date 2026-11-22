@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdatomic.h>
 #ifndef _WIN32
 #include <pthread.h>
 #endif
@@ -9,8 +10,54 @@
 #include "test_msg.pb-c.h"
 #include "unity.h"
 
+/* A forwarding allocator: every call goes to the allocator that was installed before it (so
+ * blocks are always freed by the family that allocated them), except that allocations fail on a
+ * thread that set fail_here. The live call fails only the server thread's allocations this way,
+ * while the client on the test thread keeps working. */
+static grpc_allocator saved_alloc;
+#if defined(_MSC_VER) && !defined(__clang__)
+#define PB_THREAD_LOCAL __declspec(thread)
+#else
+#define PB_THREAD_LOCAL thread_local
+#endif
+static PB_THREAD_LOCAL bool fail_here;
+
+static void *fwd_malloc(size_t sz) {
+  return fail_here ? nullptr : saved_alloc.malloc(sz);
+}
+
+static void *fwd_calloc(size_t n, size_t sz) {
+  return fail_here ? nullptr : saved_alloc.calloc(n, sz);
+}
+
+static void *fwd_realloc(void *p, size_t sz) {
+  return fail_here ? nullptr : saved_alloc.realloc(p, sz);
+}
+
+static void fwd_free(void *p) {
+  saved_alloc.free(p);
+}
+
+static void *fwd_aligned(size_t a, size_t sz) {
+  return fail_here ? nullptr : saved_alloc.aligned_alloc(a, sz);
+}
+
+static void install_failing_allocator(void) {
+  saved_alloc = *grpc_get_allocator();
+  grpc_set_allocator(&(grpc_allocator){.malloc = fwd_malloc,
+                                       .calloc = fwd_calloc,
+                                       .realloc = fwd_realloc,
+                                       .free = fwd_free,
+                                       .aligned_alloc = fwd_aligned});
+}
+
 void setUp(void) {}
-void tearDown(void) {}
+
+/* runs even when an assertion failed between installing and restoring the allocator */
+void tearDown(void) {
+  fail_here = false;
+  grpc_set_allocator(nullptr);
+}
 
 void test_pb_allocator(void) {
   ProtobufCAllocator *allocator = grpc_pb_get_allocator();
@@ -66,15 +113,33 @@ static void *pb_server_run(void *arg) {
   return nullptr;
 }
 
+/* results of the handler, checked on the test thread */
+static atomic_int handler_calls;
+static atomic_bool handler_unpacked;
+static atomic_int handler_send_oom = GRPC_OK;
+static atomic_int handler_reply_oom = GRPC_OK;
+static atomic_int handler_reply = GRPC_ERR_STATE;
+
 static void pb_echo_handler(grpc_call *call, const grpc_message *req_msg,
                             [[maybe_unused]] void *userdata) {
+  atomic_fetch_add(&handler_calls, 1);
   Test__Echo *req = GRPC_PB_UNPACK(Test__Echo, &test__echo__descriptor, req_msg);
-  TEST_ASSERT_NOT_NULL(req);
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_call_reply_pb(call, &req->base));
+  atomic_store(&handler_unpacked, req != nullptr);
+  if (req == nullptr) {
+    (void)grpc_call_finish(call, GRPC_STATUS_INTERNAL, "unpack failed");
+    return;
+  }
+  /* a real call whose packing fails: neither function may send or finish */
+  fail_here = true;
+  atomic_store(&handler_send_oom, grpc_call_send_pb(call, &req->base));
+  atomic_store(&handler_reply_oom, grpc_call_reply_pb(call, &req->base));
+  fail_here = false;
+  atomic_store(&handler_reply, grpc_call_reply_pb(call, &req->base));
   GRPC_PB_FREE_UNPACKED(req);
 }
 
 void test_pb_live_call(void) {
+  install_failing_allocator();
   grpc_server *server = grpc_server_new(
       &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
   TEST_ASSERT_NOT_NULL(server);
@@ -105,6 +170,11 @@ void test_pb_live_call(void) {
   TEST_ASSERT_NOT_NULL(reply);
   TEST_ASSERT_EQUAL_STRING("pb-live", reply->text);
   TEST_ASSERT_EQUAL_INT32(7, reply->number);
+  TEST_ASSERT_EQUAL_INT(1, atomic_load(&handler_calls));
+  TEST_ASSERT_TRUE(atomic_load(&handler_unpacked));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_NOMEM, atomic_load(&handler_send_oom));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_NOMEM, atomic_load(&handler_reply_oom));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, atomic_load(&handler_reply));
 
   GRPC_PB_FREE_UNPACKED(reply);
   grpc_client_response_free(&resp);
@@ -116,44 +186,28 @@ void test_pb_live_call(void) {
 }
 #endif
 
-static void *pb_fail_malloc([[maybe_unused]] size_t sz) {
-  return nullptr;
-}
-
-static void *pb_fail_calloc([[maybe_unused]] size_t n, [[maybe_unused]] size_t sz) {
-  return nullptr;
-}
-
-static void *pb_fail_realloc([[maybe_unused]] void *p, [[maybe_unused]] size_t sz) {
-  return nullptr;
-}
-
-/* a real no-op: the failing allocator hands out nothing, and anything freed while it is
- * installed came from the default allocator (_aligned_malloc on MSVC), not libc malloc */
-static void pb_noop_free([[maybe_unused]] void *p) {}
-
-static void *pb_fail_aligned([[maybe_unused]] size_t a, [[maybe_unused]] size_t sz) {
-  return nullptr;
-}
-
 void test_pb_oom_and_errors(void) {
   Test__Echo req = TEST__ECHO__INIT;
   req.text = (char *)"oom";
   req.number = 1;
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_reply_pb(nullptr, &req.base));
 
-  grpc_allocator fail_alloc = {
-      .malloc = pb_fail_malloc,
-      .calloc = pb_fail_calloc,
-      .realloc = pb_fail_realloc,
-      .free = pb_noop_free,
-      .aligned_alloc = pb_fail_aligned,
-  };
-  grpc_set_allocator(&fail_alloc);
-  TEST_ASSERT_NULL(grpc_pb_pack(&req.base));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_NOMEM, grpc_call_send_pb((grpc_call *)&req, &req.base));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_NOMEM, grpc_call_reply_pb((grpc_call *)&req, &req.base));
-  grpc_set_allocator(nullptr);
+  install_failing_allocator();
+  fail_here = true;
+  grpc_message *packed = grpc_pb_pack(&req.base);
+  fail_here = false;
+  TEST_ASSERT_NULL(packed);
+  /* argument checks come before packing; send/reply on a real call that fails to pack are
+   * covered by test_pb_live_call */
+  fail_here = true;
+  grpc_err send_err = grpc_call_send_pb(nullptr, &req.base);
+  fail_here = false;
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, send_err);
+
+  /* the same message packs once allocations succeed again */
+  packed = grpc_pb_pack(&req.base);
+  TEST_ASSERT_NOT_NULL(packed);
+  grpc_message_free(packed);
 }
 
 int main(void) {

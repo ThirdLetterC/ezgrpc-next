@@ -244,6 +244,46 @@ static uint8_t *build_list_services_response(const char services[][MAX_SYMBOL_LE
   return buf;
 }
 
+/* True when a registered key answers a query: the query equals the key, or names something
+ * inside it ("pkg.Service" answers "pkg.Service.Method"). An empty query matches nothing. */
+static bool key_matches(const char *key, const char *query) {
+  size_t klen = strlen(key);
+  if (query[0] == '\0' || klen == 0 || strncmp(key, query, klen) != 0)
+    return false;
+  return query[klen] == '\0' || query[klen] == '.';
+}
+
+/* Builds a ServerReflectionResponse with original_request (field 2) echoing the request and
+ * error_response (field 7) {error_code, error_message}. Returns a grpc_malloc buffer and its
+ * length, or nullptr when out of memory. */
+static uint8_t *build_error_response(uint32_t code, const char *msg, const uint8_t *req_data,
+                                     size_t req_len, size_t *out_len) {
+  size_t elen = strlen(msg);
+  size_t err_inner = 1 + varint_size(code) + 1 + varint_size(elen) + elen;
+  size_t orig_req_size = req_len > 0 ? 1 + varint_size(req_len) + req_len : 0;
+  size_t total = orig_req_size + 1 + varint_size(err_inner) + err_inner;
+  uint8_t *out = grpc_malloc(total);
+  if (out == nullptr)
+    return nullptr;
+  size_t off = 0;
+  if (req_len > 0) {
+    out[off++] = (2 << 3) | 2; /* original_request */
+    off += write_varint(out + off, req_len);
+    memcpy(out + off, req_data, req_len);
+    off += req_len;
+  }
+  out[off++] = (7 << 3) | 2; /* error_response */
+  off += write_varint(out + off, err_inner);
+  out[off++] = (1 << 3) | 0; /* error_code */
+  off += write_varint(out + off, code);
+  out[off++] = (2 << 3) | 2; /* error_message */
+  off += write_varint(out + off, elen);
+  memcpy(out + off, msg, elen);
+  off += elen;
+  *out_len = off;
+  return out;
+}
+
 /* on_message handler: answers one ServerReflectionRequest. Scans the request for
  * list_services (field 7) and file_by_filename / file_containing_symbol (fields 3 and 4); a
  * request of at most two bytes with no file query is treated as list_services. A file query is
@@ -261,12 +301,15 @@ static void reflection_on_message(grpc_call *call, const grpc_message *in_msg, v
   bool is_list_services = false;
   char queried_symbol[MAX_SYMBOL_LEN] = {};
   bool is_file_query = false;
+  /* file_containing_extension (5) / all_extension_numbers_of_type (6): valid, not supported */
+  bool is_unsupported = false;
 
   size_t seek = 0;
   while (seek < req_len) {
-    uint8_t tag = req_data[seek++];
-    uint8_t field_num = tag >> 3;
-    uint8_t wire_type = tag & 0x07;
+    /* the tag is a varint: field numbers from 16 up take more than one byte */
+    uint64_t tag = read_varint(req_data, req_len, &seek);
+    uint64_t field_num = tag >> 3;
+    unsigned wire_type = (unsigned)(tag & 0x07);
 
     if (field_num == 7 && wire_type == 2) {
       // list_services
@@ -283,8 +326,18 @@ static void reflection_on_message(grpc_call *call, const grpc_message *in_msg, v
       }
       seek = skip_bytes(seek, slen, req_len);
       is_file_query = true;
+    } else if (field_num == 5 || field_num == 6) {
+      is_unsupported = true;
+      if (wire_type == 2)
+        seek = skip_bytes(seek, read_varint(req_data, req_len, &seek), req_len);
+      else
+        break;
     } else if (wire_type == 0) {
       read_varint(req_data, req_len, &seek);
+    } else if (wire_type == 1) { /* fixed64 */
+      seek = skip_bytes(seek, 8, req_len);
+    } else if (wire_type == 5) { /* fixed32 */
+      seek = skip_bytes(seek, 4, req_len);
     } else if (wire_type == 2) {
       uint64_t skip = read_varint(req_data, req_len, &seek);
       seek = skip_bytes(seek, skip, req_len);
@@ -304,8 +357,7 @@ static void reflection_on_message(grpc_call *call, const grpc_message *in_msg, v
   } else if (is_file_query) {
     const descriptor_entry *found = nullptr;
     for (size_t i = 0; state != nullptr && i < state->nb_entries; i++) {
-      if (strstr(state->entries[i].symbol, queried_symbol) ||
-          strstr(queried_symbol, state->entries[i].symbol)) {
+      if (key_matches(state->entries[i].symbol, queried_symbol)) {
         found = &state->entries[i];
         break;
       }
@@ -336,35 +388,15 @@ static void reflection_on_message(grpc_call *call, const grpc_message *in_msg, v
         resp_len = off;
       }
     } else {
-      // ErrorResponse: error_code = 5 (NOT_FOUND), error_message = "Not found"
-      const char *err_msg = "Symbol or file not found";
-      size_t elen = strlen(err_msg);
-      size_t err_inner = 1 + varint_size(5) + 1 + varint_size(elen) + elen;
-      size_t orig_req_size = req_len > 0 ? 1 + varint_size(req_len) + req_len : 0;
-      size_t total = orig_req_size + 1 + varint_size(err_inner) + err_inner;
-
-      resp_bytes = grpc_malloc(total);
-      if (resp_bytes != nullptr) {
-        size_t off = 0;
-        if (req_len > 0) {
-          resp_bytes[off++] = 0x12;
-          off += write_varint(resp_bytes + off, req_len);
-          memcpy(resp_bytes + off, req_data, req_len);
-          off += req_len;
-        }
-        resp_bytes[off++] = (7 << 3) | 2; // 0x3A (error_response)
-        off += write_varint(resp_bytes + off, err_inner);
-
-        resp_bytes[off++] = (1 << 3) | 0;         // 0x08 (error_code)
-        off += write_varint(resp_bytes + off, 5); // NOT_FOUND
-
-        resp_bytes[off++] = (2 << 3) | 2; // 0x12 (error_message)
-        off += write_varint(resp_bytes + off, elen);
-        memcpy(resp_bytes + off, err_msg, elen);
-        off += elen;
-        resp_len = off;
-      }
+      resp_bytes = build_error_response(5 /* NOT_FOUND */, "Symbol or file not found", req_data,
+                                        req_len, &resp_len);
     }
+  } else {
+    /* a request without a supported message_request still gets an answer */
+    resp_bytes = build_error_response(12 /* UNIMPLEMENTED */,
+                                      is_unsupported ? "Extension queries are not supported"
+                                                     : "Unsupported reflection request",
+                                      req_data, req_len, &resp_len);
   }
 
   if (resp_bytes != nullptr) {
@@ -392,5 +424,10 @@ GRPC_API grpc_err grpc_reflection_enable(grpc_server *server) {
   grpc_err err = grpc_server_handle_stream(server, GRPC_REFLECTION_V1ALPHA_PATH, &handler, server);
   if (err != GRPC_OK)
     return err;
-  return grpc_server_handle_stream(server, GRPC_REFLECTION_V1_PATH, &handler, server);
+  err = grpc_server_handle_stream(server, GRPC_REFLECTION_V1_PATH, &handler, server);
+  if (err != GRPC_OK) {
+    /* all or nothing, as for health and channelz: a retry must not find v1alpha half-registered */
+    (void)grpc_server_unregister(server, GRPC_REFLECTION_V1ALPHA_PATH);
+  }
+  return err;
 }

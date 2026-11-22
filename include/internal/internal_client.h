@@ -66,6 +66,8 @@ struct client_subchannel {
   bool connected;
   bool closed;
   int connect_status;
+  /* why the connection was marked closed by a local failure (see sub_fail()), or GRPC_OK */
+  grpc_err fail_err;
   /* set by the connect/handshake deadline timer (config.timeout_ms) */
   bool connect_deadline_hit;
   bool handle_close_done;

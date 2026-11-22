@@ -1046,27 +1046,33 @@ GRPC_API void grpc_server_flush(grpc_server *server) {
     server_flush_sessions(server);
 }
 
-/* Returns the library's license text (a static string). */
+/* Returns the library's license text (a static string): exactly the LICENSE file, which
+ * src/tests/api.c checks. "The ezGRPC-next Authors" are listed in AUTHORS, including the authors of
+ * EZgRPC2, the project this one was forked from. */
 GRPC_API const char *grpc_license(void) {
   static const char *license =
-      "ezGRPC-next - A gRPC server without the extra fancy features.\n"
-      "https://github.com/mnyoshie/ezgrpc2\n"
+      "ezGRPC-next - A lightweight, modular gRPC server in C.\n"
+      "https://github.com/ThirdLetterC/ezgrpc-next\n"
       "\n"
-      "Copyright (c) 2023-2025 M. N. Yoshie & Al-buharie Amjari\n"
+      "Copyright (c) 2023-2026 The ezGRPC-next Authors\n"
       "\n"
       "Redistribution and use in source and binary forms, with or without\n"
       "modification, are permitted provided that the following conditions\n"
       "are met:\n"
       "\n"
       "  1. Redistributions of source code must retain the above copyright notice,\n"
-      "  this list of conditions and the following disclaimer.\n"
+      "     this list of conditions and the following disclaimer.\n"
       "\n"
       "  2. Neither the name of the copyright holder nor the names of its\n"
-      "  contributors may be used to endorse or promote products derived from\n"
-      "  this software without specific prior written permission.\n"
+      "     contributors may be used to endorse or promote products derived from\n"
+      "     this software without specific prior written permission.\n"
       "\n"
       "THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS\n"
-      "\"AS IS\" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT\n"
+      /* U+201C / U+201D as UTF-8 bytes, so the text does not depend on the compiler's charset */
+      "\xE2\x80\x9C"
+      "AS IS"
+      "\xE2\x80\x9D"
+      " AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT\n"
       "LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR\n"
       "A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT\n"
       "HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,\n"

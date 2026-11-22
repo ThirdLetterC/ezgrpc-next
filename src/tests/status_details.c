@@ -131,6 +131,11 @@ void test_status_details_unknown_fields_and_errors(void) {
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_status_details_decode(b64, &code, &msg, &url, &val, &vlen));
   TEST_ASSERT_EQUAL_INT32(5, code);
   TEST_ASSERT_EQUAL_STRING("ok", msg);
+  /* the unknown fields inside the Any are skipped; its url and value survive */
+  TEST_ASSERT_EQUAL_STRING("u", url);
+  TEST_ASSERT_EQUAL_UINT64(1, vlen);
+  TEST_ASSERT_NOT_NULL(val);
+  TEST_ASSERT_EQUAL_HEX8(0x42, val[0]);
   grpc_free(msg);
   grpc_free(url);
   grpc_free(val);
@@ -138,7 +143,11 @@ void test_status_details_unknown_fields_and_errors(void) {
   grpc_status_details all = {0};
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_status_details_decode_all(b64, &all));
   TEST_ASSERT_EQUAL_INT32(5, all.code);
+  TEST_ASSERT_EQUAL_STRING("ok", all.message);
   TEST_ASSERT_EQUAL_UINT64(1, all.nb_details);
+  TEST_ASSERT_EQUAL_STRING("u", all.details[0].type_url);
+  TEST_ASSERT_EQUAL_UINT64(1, all.details[0].value_len);
+  TEST_ASSERT_EQUAL_HEX8(0x42, all.details[0].value[0]);
   grpc_status_details_free(&all);
   grpc_free(b64);
 
@@ -148,10 +157,12 @@ void test_status_details_unknown_fields_and_errors(void) {
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_status_details_decode_all(nullptr, &all));
   const uint8_t trunc_msg[] = {0x12, 0x50, 'a'};
   char *b64_trunc = grpc_metadata_encode_bin(trunc_msg, sizeof(trunc_msg), &b64_len);
+  TEST_ASSERT_NOT_NULL(b64_trunc);
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_status_details_decode_all(b64_trunc, &all));
   grpc_free(b64_trunc);
   const uint8_t trunc_any[] = {0x1A, 0x50, 'a'};
   b64_trunc = grpc_metadata_encode_bin(trunc_any, sizeof(trunc_any), &b64_len);
+  TEST_ASSERT_NOT_NULL(b64_trunc);
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_status_details_decode_all(b64_trunc, &all));
   grpc_free(b64_trunc);
   grpc_status_details_free(nullptr);
@@ -207,6 +218,7 @@ void test_status_details_hostile_lengths(void) {
   const uint8_t repeated[] = {0x12, 0x01, 'a', 0x12, 0x01, 'b'};
   size_t b64_len = 0;
   char *b64 = grpc_metadata_encode_bin(repeated, sizeof(repeated), &b64_len);
+  TEST_ASSERT_NOT_NULL(b64);
   char *msg = nullptr;
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_status_details_decode(b64, nullptr, &msg, nullptr, nullptr, nullptr));

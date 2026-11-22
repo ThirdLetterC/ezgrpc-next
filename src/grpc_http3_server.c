@@ -1082,6 +1082,11 @@ static void on_udp_read(uv_udp_t *udp, ssize_t nread, const uv_buf_t *buf,
 
 /* ---- transport ops ---- */
 
+/* Maps an nghttp3 result to the transport-op convention: 0, or a grpc_err. */
+static int h3_err(int rv) {
+  return rv == 0 ? 0 : rv == NGHTTP3_ERR_NOMEM ? GRPC_ERR_NOMEM : GRPC_ERR_PROTOCOL;
+}
+
 /* submit_headers op. nghttp3 sends headers and body together, so headers that do not end the
  * stream are parked until start_data() or submit_trailers() supplies the body. */
 static int h3_submit_headers(grpc_session *session, grpc_stream *stream, const grpc_nv *nva,
@@ -1089,32 +1094,30 @@ static int h3_submit_headers(grpc_session *session, grpc_stream *stream, const g
   grpc_quic_conn *qc = session->quic;
   h3_stream *hs = stream->transport;
   if (qc->h3 == nullptr || hs == nullptr || hs->response_submitted)
-    return -1;
+    return GRPC_ERR_PROTOCOL;
   if (end_stream) {
     hs->response_submitted = true;
     hs->body_done = true;
-    return nghttp3_conn_submit_response(qc->h3, stream->stream_id, (const nghttp3_nv *)nva, nvlen,
-                                        nullptr) == 0
-               ? 0
-               : -1;
+    return h3_err(nghttp3_conn_submit_response(qc->h3, stream->stream_id, (const nghttp3_nv *)nva,
+                                               nvlen, nullptr));
   }
   grpc_free(hs->headers);
   hs->headers = nv_copy(nva, nvlen);
   hs->nb_headers = nvlen;
-  return hs->headers != nullptr ? 0 : -1;
+  return hs->headers != nullptr ? 0 : GRPC_ERR_NOMEM;
 }
 
 /* Submits the parked response headers with the body data reader. */
 static int h3_submit_parked_response(grpc_quic_conn *qc, grpc_stream *stream, h3_stream *hs) {
   if (hs->headers == nullptr)
-    return -1;
+    return GRPC_ERR_PROTOCOL;
   int rv = nghttp3_conn_submit_response(qc->h3, stream->stream_id, (const nghttp3_nv *)hs->headers,
                                         hs->nb_headers, &h3_data_reader);
   grpc_free(hs->headers);
   hs->headers = nullptr;
   hs->nb_headers = 0;
   if (rv != 0)
-    return -1;
+    return h3_err(rv);
   hs->response_submitted = true;
   return 0;
 }
@@ -1125,10 +1128,10 @@ static int h3_start_data(grpc_session *session, grpc_stream *stream) {
   grpc_quic_conn *qc = session->quic;
   h3_stream *hs = stream->transport;
   if (qc->h3 == nullptr || hs == nullptr || hs->body_done)
-    return -1;
+    return GRPC_ERR_PROTOCOL;
   if (!hs->response_submitted)
     return h3_submit_parked_response(qc, stream, hs);
-  return nghttp3_conn_resume_stream(qc->h3, stream->stream_id) == 0 ? 0 : -1;
+  return h3_err(nghttp3_conn_resume_stream(qc->h3, stream->stream_id));
 }
 
 /* submit_trailers op: ends the body (the reader then returns EOF without END_STREAM) and queues
@@ -1138,19 +1141,18 @@ static int h3_submit_trailers(grpc_session *session, grpc_stream *stream, const 
   grpc_quic_conn *qc = session->quic;
   h3_stream *hs = stream->transport;
   if (qc->h3 == nullptr || hs == nullptr)
-    return -1;
+    return GRPC_ERR_PROTOCOL;
   if (!hs->response_submitted) {
     hs->body_done = true;
-    if (h3_submit_parked_response(qc, stream, hs) != 0)
-      return -1;
+    int rv = h3_submit_parked_response(qc, stream, hs);
+    if (rv != 0)
+      return rv;
   } else if (!hs->body_done) {
     hs->body_done = true;
     (void)nghttp3_conn_resume_stream(qc->h3, stream->stream_id);
   }
-  return nghttp3_conn_submit_trailers(qc->h3, stream->stream_id, (const nghttp3_nv *)nva, nvlen) ==
-                 0
-             ? 0
-             : -1;
+  return h3_err(
+      nghttp3_conn_submit_trailers(qc->h3, stream->stream_id, (const nghttp3_nv *)nva, nvlen));
 }
 
 /* reset_stream op: RESET_STREAM and STOP_SENDING with H3_GENERAL_PROTOCOL_ERROR or

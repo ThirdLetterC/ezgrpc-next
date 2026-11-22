@@ -9,20 +9,30 @@ void tearDown(void) {}
 
 void test_reflection(void) {
   grpc_server *server = grpc_server_new(
-      &(grpc_config){.port = 19994, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
   TEST_ASSERT_NOT_NULL(server);
 
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_reflection_enable(server));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_EXISTS, grpc_reflection_enable(server));
 
-  const uint8_t descriptor[] = {0x0a, 0x0e, 'h', 'e', 'l', 'l', 'o', 'w', 'o',
+  /* FileDescriptorProto{name: "helloworld.proto"}: field 1, length 16 */
+  const uint8_t descriptor[] = {0x0a, 0x10, 'h', 'e', 'l', 'l', 'o', 'w', 'o',
                                 'r',  'l',  'd', '.', 'p', 'r', 'o', 't', 'o'};
+  static_assert(sizeof(descriptor) == 2 + 16);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_reflection_add_file_descriptor(
                                      server, "helloworld.proto", descriptor, sizeof(descriptor)));
+  /* each invalid argument on its own, the others valid */
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_reflection_add_file_descriptor(
+                                              nullptr, "x", descriptor, sizeof(descriptor)));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_reflection_add_file_descriptor(
+                                              server, nullptr, descriptor, sizeof(descriptor)));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_reflection_add_file_descriptor(server, nullptr, descriptor, 1));
+                        grpc_reflection_add_file_descriptor(server, "x", nullptr, 1));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
-                        grpc_reflection_add_file_descriptor(server, "x", nullptr, 0));
+                        grpc_reflection_add_file_descriptor(server, "x", descriptor, 0));
+  /* duplicates are accepted (the first one wins on lookup) */
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_reflection_add_file_descriptor(
+                                     server, "helloworld.proto", descriptor, sizeof(descriptor)));
 
   grpc_server_free(server);
 }

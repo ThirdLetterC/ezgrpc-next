@@ -66,33 +66,32 @@ static ssize_t h2_data_read(nghttp2_session *ngsession, i32 stream_id, u8 *buf, 
   return (ssize_t)n;
 }
 
+/* Maps an nghttp2 submit result to the transport-op convention: 0, or a grpc_err. */
+static int h2_err(int rv) {
+  return rv >= 0 ? 0 : rv == NGHTTP2_ERR_NOMEM ? GRPC_ERR_NOMEM : GRPC_ERR_PROTOCOL;
+}
+
 /* submit_headers op: one HEADERS frame, with END_STREAM when end_stream. */
 static int h2_submit_headers(grpc_session *session, grpc_stream *stream, const grpc_nv *nva,
                              size_t nvlen, bool end_stream) {
-  return nghttp2_submit_headers(
-             session->ngsession, end_stream ? NGHTTP2_FLAG_END_STREAM : NGHTTP2_FLAG_NONE,
-             (i32)stream->stream_id, nullptr, (const nghttp2_nv *)nva, nvlen, nullptr) < 0
-             ? -1
-             : 0;
+  return h2_err(nghttp2_submit_headers(
+      session->ngsession, end_stream ? NGHTTP2_FLAG_END_STREAM : NGHTTP2_FLAG_NONE,
+      (i32)stream->stream_id, nullptr, (const nghttp2_nv *)nva, nvlen, nullptr));
 }
 
 /* start_data op: submits a data provider over h2_data_read(). It ends with the stream only for
  * gRPC-Web; otherwise h2_data_read() keeps the stream open for the trailers. */
 static int h2_start_data(grpc_session *session, grpc_stream *stream) {
   nghttp2_data_provider provider = {.source.ptr = stream, .read_callback = h2_data_read};
-  return nghttp2_submit_data(session->ngsession, NGHTTP2_FLAG_END_STREAM, (i32)stream->stream_id,
-                             &provider) != 0
-             ? -1
-             : 0;
+  return h2_err(nghttp2_submit_data(session->ngsession, NGHTTP2_FLAG_END_STREAM,
+                                    (i32)stream->stream_id, &provider));
 }
 
 /* submit_trailers op: a trailing HEADERS frame ending the stream. */
 static int h2_submit_trailers(grpc_session *session, grpc_stream *stream, const grpc_nv *nva,
                               size_t nvlen) {
-  return nghttp2_submit_trailer(session->ngsession, (i32)stream->stream_id, (const nghttp2_nv *)nva,
-                                nvlen) != 0
-             ? -1
-             : 0;
+  return h2_err(nghttp2_submit_trailer(session->ngsession, (i32)stream->stream_id,
+                                       (const nghttp2_nv *)nva, nvlen));
 }
 
 /* reset_stream op: RST_STREAM with PROTOCOL_ERROR or INTERNAL_ERROR. */

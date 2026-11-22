@@ -120,7 +120,8 @@ typedef enum grpc_reset_reason {
 } grpc_reset_reason;
 
 /* What the call layer and grpc_stream_core.c need from a transport. Every function runs on the
- * loop thread; the int-returning ones return 0 on success and nonzero on failure. Frames are only
+ * loop thread; the int-returning ones return 0 on success or a grpc_err on failure
+ * (GRPC_ERR_NOMEM when the HTTP library ran out of memory, GRPC_ERR_PROTOCOL otherwise). Frames are only
  * queued; the session flush sends them. */
 typedef struct grpc_transport_ops grpc_transport_ops;
 struct grpc_transport_ops {

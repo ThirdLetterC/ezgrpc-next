@@ -472,7 +472,7 @@ static grpc_err submit_response_headers(grpc_call *call, bool end_stream, const 
   int res = call->session->ops->submit_headers(call->session, call->stream, nva, total, end_stream);
   grpc_free(nva);
   if (res != 0)
-    return GRPC_ERR_PROTOCOL;
+    return (grpc_err)res;
   call->headers_sent = true;
   nv_list_free(&call->headers);
   return GRPC_OK;
@@ -572,8 +572,9 @@ static grpc_err call_finish_internal(grpc_call *call, grpc_status status, const 
             grpc_message_free(tmsg);
             err = GRPC_ERR_NOMEM;
           } else if (!stream->is_data_active) {
-            if (call->session->ops->start_data(call->session, stream) != 0)
-              err = GRPC_ERR_PROTOCOL;
+            int rv = call->session->ops->start_data(call->session, stream);
+            if (rv != 0)
+              err = (grpc_err)rv;
             else
               stream->is_data_active = true;
           }
@@ -591,8 +592,10 @@ static grpc_err call_finish_internal(grpc_call *call, grpc_status status, const 
     stream->nb_pending_trailers = n;
     if (stream->pending_trailers == nullptr)
       err = GRPC_ERR_NOMEM;
-  } else if (call->session->ops->submit_trailers(call->session, stream, nva, n) != 0) {
-    err = GRPC_ERR_PROTOCOL;
+  } else {
+    int rv = call->session->ops->submit_trailers(call->session, stream, nva, n);
+    if (rv != 0)
+      err = (grpc_err)rv;
   }
   grpc_free(nva);
   grpc_free(encoded);
@@ -760,8 +763,9 @@ GRPC_API grpc_err grpc_call_send(grpc_call *call, grpc_message *message) {
 
   /* an active data provider picks up the new message by itself */
   if (!stream->is_data_active) {
-    if (call->session->ops->start_data(call->session, stream) != 0)
-      return GRPC_ERR_PROTOCOL;
+    int rv = call->session->ops->start_data(call->session, stream);
+    if (rv != 0)
+      return (grpc_err)rv;
     stream->is_data_active = true;
   }
   session_schedule_flush(call->session);

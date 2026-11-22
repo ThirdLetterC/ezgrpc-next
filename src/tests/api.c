@@ -20,8 +20,6 @@
 void setUp(void) {}
 void tearDown(void) {}
 
-#define PORT 19990
-
 static void handler([[maybe_unused]] grpc_call *call, [[maybe_unused]] const grpc_message *request,
                     [[maybe_unused]] void *userdata) {}
 
@@ -46,27 +44,34 @@ void test_config_validation(void) {
   grpc_server_free(ephemeral);
   TEST_ASSERT_EQUAL_UINT16(0, grpc_server_port(nullptr));
 
-  /* invalid addresses and limits */
+  /* invalid addresses and limits (rejected before anything is bound) */
   TEST_ASSERT_NULL(grpc_server_new_ex(
-      &(grpc_config){.port = PORT, .ipv4_addr = "not an address", .log_level = GRPC_LOG_OFF},
-      &err));
+      &(grpc_config){.port = 0, .ipv4_addr = "not an address", .log_level = GRPC_LOG_OFF}, &err));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
   TEST_ASSERT_NULL(grpc_server_new_ex(
-      &(grpc_config){.port = PORT, .max_frame_size = 100, .log_level = GRPC_LOG_OFF}, &err));
+      &(grpc_config){.port = 0, .max_frame_size = 100, .log_level = GRPC_LOG_OFF}, &err));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
   /* TLS needs both files or both PEMs */
   TEST_ASSERT_NULL(grpc_server_new_ex(
-      &(grpc_config){.port = PORT, .tls.cert_file = "cert.pem", .log_level = GRPC_LOG_OFF}, &err));
+      &(grpc_config){.port = 0, .tls.cert_file = "cert.pem", .log_level = GRPC_LOG_OFF}, &err));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
   TEST_ASSERT_NULL(grpc_server_new_ex(
-      &(grpc_config){.port = PORT, .tls.cert_pem = "pem", .log_level = GRPC_LOG_OFF}, &err));
+      &(grpc_config){.port = 0, .tls.cert_pem = "pem", .log_level = GRPC_LOG_OFF}, &err));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
 
+  /* a configured port is reported as is; take one the OS just handed out rather than a fixed
+   * number that concurrent runs could share */
+  grpc_server *probe = grpc_server_new(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
+  TEST_ASSERT_NOT_NULL(probe);
+  uint16_t fixed_port = grpc_server_port(probe);
+  TEST_ASSERT_TRUE(fixed_port > 0);
+  grpc_server_free(probe);
   /* only the given address family */
   grpc_server *server = grpc_server_new(
-      &(grpc_config){.port = PORT, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
+      &(grpc_config){.port = fixed_port, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
   TEST_ASSERT_NOT_NULL(server);
-  TEST_ASSERT_EQUAL_UINT16(PORT, grpc_server_port(server));
+  TEST_ASSERT_EQUAL_UINT16(fixed_port, grpc_server_port(server));
   grpc_server_free(server);
 
   grpc_server_free(nullptr);
@@ -74,7 +79,7 @@ void test_config_validation(void) {
 
 void test_routes(void) {
   grpc_server *server = grpc_server_new(
-      &(grpc_config){.port = PORT, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
   TEST_ASSERT_NOT_NULL(server);
 
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/a.B/C", handler, nullptr));
@@ -108,7 +113,7 @@ void test_routes(void) {
 
 void test_poll_idle(void) {
   grpc_server *server = grpc_server_new(
-      &(grpc_config){.port = PORT, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
   TEST_ASSERT_NOT_NULL(server);
   TEST_ASSERT_EQUAL_INT(0, grpc_server_poll(server, 0));
   TEST_ASSERT_EQUAL_INT(0, grpc_server_poll(server, 10));
@@ -138,13 +143,13 @@ static void *post_and_stop(void *arg) {
 
 void test_post_and_stop_from_another_thread(void) {
   grpc_server *server = grpc_server_new(
-      &(grpc_config){.port = PORT, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
   TEST_ASSERT_NOT_NULL(server);
 
   int counter = 0;
   thread_arg arg = {server, &counter};
   pthread_t thread;
-  pthread_create(&thread, nullptr, post_and_stop, &arg);
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&thread, nullptr, post_and_stop, &arg));
   /* returns once the other thread stops it */
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_run(server));
   pthread_join(thread, nullptr);
@@ -161,19 +166,51 @@ static size_t read_log(FILE *file, char *buffer, size_t size) {
   return n;
 }
 
+#ifdef _WIN32
+#include <io.h>
+#define dup    _dup
+#define dup2   _dup2
+#define close  _close
+#define fileno _fileno
+#else
+#include <unistd.h>
+#endif
+
+/* Runs ezdump(data, len) with stdout redirected to a temporary file and reads what it printed
+ * into buffer. Returns false if the redirection could not be set up. */
+static bool capture_stdout_dump(void *data, size_t len, char *buffer, size_t size) {
+  extern void ezdump(void *vdata, size_t len);
+  FILE *capture = tmpfile();
+  if (capture == nullptr)
+    return false;
+  fflush(stdout);
+  int saved = dup(fileno(stdout));
+  if (saved < 0 || dup2(fileno(capture), fileno(stdout)) < 0) {
+    if (saved >= 0)
+      close(saved);
+    fclose(capture);
+    return false;
+  }
+  ezdump(data, len);
+  fflush(stdout);
+  dup2(saved, fileno(stdout));
+  close(saved);
+  read_log(capture, buffer, size);
+  fclose(capture);
+  return true;
+}
+
 void test_log_level_control(void) {
   FILE *first_log = tmpfile();
   FILE *second_log = tmpfile();
   TEST_ASSERT_NOT_NULL(first_log);
   TEST_ASSERT_NOT_NULL(second_log);
 
-  grpc_server *first = grpc_server_new(&(grpc_config){.port = PORT,
-                                                      .ipv4_addr = "127.0.0.1",
-                                                      .log_level = GRPC_LOG_WARNING,
-                                                      .log_file = first_log});
+  grpc_server *first = grpc_server_new(&(grpc_config){
+      .port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_WARNING, .log_file = first_log});
   TEST_ASSERT_NOT_NULL(first);
   grpc_server *second = grpc_server_new(&(grpc_config){
-      .port = PORT, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_ERROR, .log_file = second_log});
+      .port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_ERROR, .log_file = second_log});
   TEST_ASSERT_NOT_NULL(second);
 
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_set_log_level(nullptr, GRPC_LOG_INFO));
@@ -207,8 +244,12 @@ void test_log_level_control(void) {
 }
 
 void test_strings(void) {
-  for (int e = GRPC_OK; e >= GRPC_ERR_TIMEOUT; e--)
-    TEST_ASSERT_NOT_NULL(grpc_strerror((grpc_err)e));
+  /* every defined code has its own message, not the fallback */
+  for (int e = GRPC_OK; e >= GRPC_ERR_TIMEOUT; e--) {
+    const char *str = grpc_strerror((grpc_err)e);
+    TEST_ASSERT_NOT_NULL(str);
+    TEST_ASSERT_TRUE_MESSAGE(strcmp(str, "unknown error") != 0, "grpc_err without a message");
+  }
   TEST_ASSERT_EQUAL_STRING("success", grpc_strerror(GRPC_OK));
   TEST_ASSERT_EQUAL_STRING("already exists", grpc_strerror(GRPC_ERR_EXISTS));
   TEST_ASSERT_EQUAL_STRING("output limit exceeded", grpc_strerror(GRPC_ERR_LIMIT));
@@ -216,25 +257,56 @@ void test_strings(void) {
   TEST_ASSERT_EQUAL_STRING("operation timed out", grpc_strerror(GRPC_ERR_TIMEOUT));
   TEST_ASSERT_EQUAL_STRING("unknown error", grpc_strerror((grpc_err)-1000));
 
-  for (int s = GRPC_STATUS_OK; s <= GRPC_STATUS_UNAUTHENTICATED; s++)
-    TEST_ASSERT_NOT_NULL(grpc_status_str((grpc_status)s));
+  for (int s = GRPC_STATUS_OK; s <= GRPC_STATUS_UNAUTHENTICATED; s++) {
+    const char *str = grpc_status_str((grpc_status)s);
+    TEST_ASSERT_NOT_NULL(str);
+    TEST_ASSERT_TRUE_MESSAGE(strcmp(str, "(null)") != 0, "grpc_status without a name");
+  }
   TEST_ASSERT_EQUAL_STRING("invalid argument", grpc_status_str(GRPC_STATUS_INVALID_ARGUMENT));
   TEST_ASSERT_EQUAL_STRING("aborted", grpc_status_str(GRPC_STATUS_ABORTED));
   TEST_ASSERT_EQUAL_STRING("(null)", grpc_status_str((grpc_status)999));
-  TEST_ASSERT_NOT_NULL(grpc_license());
+  /* grpc_license() must match the LICENSE file byte for byte */
+  FILE *lf = fopen(GRPC_LICENSE_FILE, "rb");
+  TEST_ASSERT_NOT_NULL_MESSAGE(lf, GRPC_LICENSE_FILE);
+  static char license_file[4096];
+  size_t license_len = fread(license_file, 1, sizeof(license_file) - 1, lf);
+  fclose(lf);
+  license_file[license_len] = '\0';
+  /* a Windows checkout may have CRLF line endings */
+  size_t w = 0;
+  for (size_t r = 0; r < license_len; r++)
+    if (license_file[r] != '\r')
+      license_file[w++] = license_file[r];
+  license_file[w] = '\0';
+  TEST_ASSERT_EQUAL_STRING(license_file, grpc_license());
 
   /* Internal debug formatting helpers */
-  extern void ezdump(void *vdata, size_t len);
   uint8_t sample[20];
   for (size_t i = 0; i < sizeof(sample); i++)
     sample[i] = (uint8_t)(i + 0x1e);
   FILE *f = tmpfile();
-  if (f != nullptr) {
-    ezflog(f, "helper test %d\n", 1);
-    fclose(f);
-  }
-  ezdump(sample, sizeof(sample));
-  ezdump(sample, 0);
+  TEST_ASSERT_NOT_NULL(f);
+  ezflog(f, "helper test %d\n", 1);
+  char logged[256];
+  read_log(f, logged, sizeof(logged));
+  fclose(f);
+  /* "[<timestamp>] helper test 1\n" */
+  TEST_ASSERT_EQUAL_CHAR('[', logged[0]);
+  char *close_bracket = strstr(logged, "] ");
+  TEST_ASSERT_NOT_NULL(close_bracket);
+  TEST_ASSERT_TRUE(close_bracket > logged + 1);
+  TEST_ASSERT_EQUAL_STRING("helper test 1\n", close_bracket + 2);
+
+  /* ezdump writes to stdout: point stdout at a temporary file while it runs (no assertion in
+   * between, since Unity prints to stdout too) */
+  char dumped[512];
+  TEST_ASSERT_TRUE(capture_stdout_dump(sample, sizeof(sample), dumped, sizeof(dumped)));
+  TEST_ASSERT_EQUAL_STRING(
+      "1e 1f 20 21 22 23 24 25  26 27 28 29 2a 2b 2c 2d | .. !\"#$%&'()*+,- |\n"
+      "2e 2f 30 31                                      | ./01             |\n",
+      dumped);
+  TEST_ASSERT_TRUE(capture_stdout_dump(sample, 0, dumped, sizeof(dumped)));
+  TEST_ASSERT_EQUAL_STRING("", dumped);
 
   grpc_header ha = {.name = (char *)"content-type", .namelen = 12};
   grpc_header hb = {.name = (char *)"CONTENT-TYPE", .namelen = 12};
@@ -243,10 +315,17 @@ void test_strings(void) {
   TEST_ASSERT_NOT_EQUAL(0, list_cmp_ezheader_name(&ha, &hc));
 
   /* Bind failure on non-local address + GRPC_LOG_TRACE + channelz error paths */
+  /* 192.0.2.1 (TEST-NET-1) is normally not a local address, but the bind succeeds where
+   * net.ipv4.ip_nonlocal_bind=1 (or the address is configured): then there is nothing to check */
   grpc_err err = GRPC_OK;
-  TEST_ASSERT_NULL(grpc_server_new_ex(
-      &(grpc_config){.port = 19991, .ipv4_addr = "192.0.2.1", .log_level = GRPC_LOG_OFF}, &err));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_IO, err);
+  grpc_server *nonlocal = grpc_server_new_ex(
+      &(grpc_config){.port = 0, .ipv4_addr = "192.0.2.1", .log_level = GRPC_LOG_OFF}, &err);
+  if (nonlocal == nullptr) {
+    TEST_ASSERT_EQUAL_INT(GRPC_ERR_IO, err);
+  } else {
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, err);
+    grpc_server_free(nonlocal);
+  }
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_channelz_enable(nullptr));
   grpc_server *cz = grpc_server_new(
       &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_TRACE});

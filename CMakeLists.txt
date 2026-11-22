@@ -344,10 +344,18 @@ if(GRPC_BUILD_TESTS)
     set(GRPC_TEST_TARGETS ${GRPC_TEST_TARGETS} test_${name} PARENT_SCOPE)
   endfunction()
 
-  foreach(name IN ITEMS api list mem metadata timeout compression health interceptor status_details
-                        reflection version client integration oom)
+  set(grpc_unit_tests api list mem metadata timeout compression health interceptor status_details
+                      reflection version client)
+  # integration and oom exercise gzip throughout (as do the Python greeter tests below)
+  if(GRPC_ZLIB_ENABLED)
+    list(APPEND grpc_unit_tests integration oom)
+  else()
+    message(STATUS "ezGRPC-next: zlib is disabled; skipping the integration, oom and Python greeter tests")
+  endif()
+  foreach(name IN LISTS grpc_unit_tests)
     grpc_add_unit_test(${name} "src/tests/${name}.c")
   endforeach()
+  target_compile_definitions(test_api PRIVATE "GRPC_LICENSE_FILE=\"${CMAKE_CURRENT_SOURCE_DIR}/LICENSE\"")
 
   if(GRPC_BUILD_SHARED)
     grpc_add_unit_test(version_shared src/tests/version.c LIBRARY grpc_shared)
@@ -451,7 +459,7 @@ if(GRPC_BUILD_EXAMPLES)
       add_dependencies(example_grpc_server example_tls_certificates)
     endif()
 
-    if(GRPC_BUILD_INTEGRATION_TESTS)
+    if(GRPC_BUILD_INTEGRATION_TESTS AND GRPC_ZLIB_ENABLED)
       add_dependencies(example_grpc_server example_python_proto)
       set(greeter_client "${CMAKE_CURRENT_SOURCE_DIR}/examples/python_client_c_server/client.py")
       grpc_add_integration_test(grpc_cleartext SERVER example_grpc_server CLIENT "${greeter_client}"

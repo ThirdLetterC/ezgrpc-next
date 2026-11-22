@@ -152,6 +152,18 @@ static void on_sub_write(uv_write_t *req, int status) {
   sub_flush(s);
 }
 
+/* Marks the connection unusable after nghttp2 output was lost (nghttp2 already considers bytes it
+ * handed out as sent, so the session and the server are now out of sync), records why in
+ * s->fail_err for sub_connect(), and fails the active RPC. The next RPC reconnects. */
+static void sub_fail(client_subchannel *s, grpc_err err) {
+  s->closed = true;
+  s->fail_err = err;
+  if (s->active_stream != nullptr && !s->active_stream->stream_done) {
+    s->active_stream->err = err;
+    s->active_stream->stream_done = true;
+  }
+}
+
 /* Pulls all pending frames out of nghttp2 (through SSL when TLS is on) into obuf and writes
  * them: first with uv_try_write, then the remainder with an async uv_write after swapping obuf
  * into wbuf, so obuf can keep accumulating while the write is in flight. Only one uv_write is
@@ -173,19 +185,13 @@ static void sub_flush(client_subchannel *s) {
         const u8 *data;
         ssize_t n = nghttp2_session_mem_send(s->ngsession, &data);
         if (n < 0) {
-          if (s->active_stream != nullptr) {
-            s->active_stream->err = GRPC_ERR_PROTOCOL;
-            s->active_stream->stream_done = true;
-          }
+          sub_fail(s, n == NGHTTP2_ERR_NOMEM ? GRPC_ERR_NOMEM : GRPC_ERR_PROTOCOL);
           return;
         }
         if (n == 0)
           break;
         if (buf_append(&s->tls_obuf, data, (size_t)n)) {
-          if (s->active_stream != nullptr) {
-            s->active_stream->err = GRPC_ERR_NOMEM;
-            s->active_stream->stream_done = true;
-          }
+          sub_fail(s, GRPC_ERR_NOMEM);
           return;
         }
       }
@@ -220,19 +226,13 @@ static void sub_flush(client_subchannel *s) {
       const u8 *data;
       ssize_t n = nghttp2_session_mem_send(s->ngsession, &data);
       if (n < 0) {
-        if (s->active_stream != nullptr) {
-          s->active_stream->err = GRPC_ERR_PROTOCOL;
-          s->active_stream->stream_done = true;
-        }
+        sub_fail(s, n == NGHTTP2_ERR_NOMEM ? GRPC_ERR_NOMEM : GRPC_ERR_PROTOCOL);
         return;
       }
       if (n == 0)
         break;
       if (buf_append(&s->obuf, data, (size_t)n)) {
-        if (s->active_stream != nullptr) {
-          s->active_stream->err = GRPC_ERR_NOMEM;
-          s->active_stream->stream_done = true;
-        }
+        sub_fail(s, GRPC_ERR_NOMEM);
         return;
       }
     }
@@ -657,6 +657,7 @@ static grpc_err sub_connect(client_subchannel *s) {
     return GRPC_OK;
   sub_disconnect(s);
   s->closed = false;
+  s->fail_err = GRPC_OK;
 
   if (uv_loop_init(&s->loop) != 0)
     return GRPC_ERR_IO;
@@ -781,16 +782,17 @@ static grpc_err sub_connect(client_subchannel *s) {
   nghttp2_session_callbacks_del(cbs);
   if (rv != 0) {
     sub_disconnect(s);
-    return GRPC_ERR_PROTOCOL;
+    return rv == NGHTTP2_ERR_NOMEM ? GRPC_ERR_NOMEM : GRPC_ERR_PROTOCOL;
   }
 
   nghttp2_settings_entry iv[] = {
       {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100},
       {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, s->parent->config.max_message_size},
   };
-  if (nghttp2_submit_settings(s->ngsession, NGHTTP2_FLAG_NONE, iv, 2) != 0) {
+  rv = nghttp2_submit_settings(s->ngsession, NGHTTP2_FLAG_NONE, iv, 2);
+  if (rv != 0) {
     sub_disconnect(s);
-    return GRPC_ERR_PROTOCOL;
+    return rv == NGHTTP2_ERR_NOMEM ? GRPC_ERR_NOMEM : GRPC_ERR_PROTOCOL;
   }
   if (uv_read_start(sub_stream(s), on_sub_alloc, on_sub_read) != 0)
     goto fail_io;
@@ -808,6 +810,12 @@ static grpc_err sub_connect(client_subchannel *s) {
 #endif
   uv_timer_stop(&s->timer);
   sub_flush(s);
+  if (s->closed) {
+    /* the connection preface or SETTINGS could not be queued */
+    grpc_err err = s->fail_err != GRPC_OK ? s->fail_err : GRPC_ERR_IO;
+    sub_disconnect(s);
+    return err;
+  }
   return GRPC_OK;
 
 fail_io:
@@ -817,46 +825,48 @@ fail_io:
 
 /* Parses a target string: "unix:path" or "unix://path" sets *out_unix, otherwise "host:port" or
  * "[ipv6]:port" sets *out_host and *out_port (1-65535; characters after the digits are ignored).
- * Outputs are grpc_malloc strings owned by the caller. Returns false on malformed input or
- * allocation failure, with nothing left allocated. */
-static bool parse_target(const char *target, char **out_host, uint16_t *out_port, char **out_unix) {
+ * Outputs are grpc_malloc strings owned by the caller. Returns GRPC_OK, GRPC_ERR_INVALID for
+ * malformed input or GRPC_ERR_NOMEM, with nothing left allocated on failure. */
+static grpc_err parse_target(const char *target, char **out_host, uint16_t *out_port,
+                             char **out_unix) {
   *out_host = nullptr;
   *out_port = 0;
   *out_unix = nullptr;
   if (target == nullptr || target[0] == '\0')
-    return false;
+    return GRPC_ERR_INVALID;
   if (strncmp(target, "unix:", 5) == 0) {
     const char *p = target + 5;
     if (strncmp(p, "//", 2) == 0)
       p += 2;
     if (p[0] == '\0')
-      return false;
+      return GRPC_ERR_INVALID;
     *out_unix = grpc_strdup(p);
-    return *out_unix != nullptr;
+    return *out_unix != nullptr ? GRPC_OK : GRPC_ERR_NOMEM;
   }
   const char *colon = nullptr;
+  const char *host_start = target;
+  size_t host_len = 0;
   if (target[0] == '[') {
     const char *rb = strchr(target, ']');
     if (rb == nullptr || rb[1] != ':')
-      return false;
-    *out_host = grpc_strndup(target + 1, (size_t)(rb - target - 1));
+      return GRPC_ERR_INVALID;
+    host_start = target + 1;
+    host_len = (size_t)(rb - target - 1);
     colon = rb + 1;
   } else {
     colon = strrchr(target, ':');
     if (colon == nullptr || colon == target)
-      return false;
-    *out_host = grpc_strndup(target, (size_t)(colon - target));
+      return GRPC_ERR_INVALID;
+    host_len = (size_t)(colon - target);
   }
-  if (*out_host == nullptr)
-    return false;
   long p = strtol(colon + 1, nullptr, 10);
-  if (p <= 0 || p > 65535) {
-    grpc_free(*out_host);
-    *out_host = nullptr;
-    return false;
-  }
+  if (p <= 0 || p > 65535)
+    return GRPC_ERR_INVALID;
+  *out_host = grpc_strndup(host_start, host_len);
+  if (*out_host == nullptr)
+    return GRPC_ERR_NOMEM;
   *out_port = (uint16_t)p;
-  return true;
+  return GRPC_OK;
 }
 
 /* Fills in a zeroed subchannel's target (copying host or unix_path) and the :authority value
@@ -957,10 +967,9 @@ GRPC_API grpc_client *grpc_client_new(const grpc_client_config *config, grpc_err
     for (size_t i = 0; i < config->nb_targets; i++) {
       char *host = nullptr, *upath = nullptr;
       uint16_t port = 0;
-      if (!parse_target(config->targets[i], &host, &port, &upath)) {
-        err = GRPC_ERR_INVALID;
+      err = parse_target(config->targets[i], &host, &port, &upath);
+      if (err != GRPC_OK)
         goto fail;
-      }
       err = init_subchannel(&c->subs[i], c, host, port, upath);
       grpc_free(host);
       grpc_free(upath);
@@ -969,12 +978,17 @@ GRPC_API grpc_client *grpc_client_new(const grpc_client_config *config, grpc_err
     }
     /* Eagerly connect at least one target to fail fast if all are unreachable. */
     bool any_ok = false;
+    grpc_err last_err = GRPC_ERR_IO;
     for (size_t i = 0; i < c->nb_subs; i++) {
-      if (sub_connect(&c->subs[i]) == GRPC_OK)
+      grpc_err cerr = sub_connect(&c->subs[i]);
+      if (cerr == GRPC_OK)
         any_ok = true;
+      else
+        last_err = cerr;
     }
     if (!any_ok) {
-      err = GRPC_ERR_IO;
+      /* report why the (last) target failed, e.g. GRPC_ERR_NOMEM, not always GRPC_ERR_IO */
+      err = last_err;
       goto fail;
     }
   } else {
@@ -1213,7 +1227,7 @@ static grpc_client_stream *stream_open_on_sub(client_subchannel *s, const char *
   if (sid < 0) {
     stream_free_internal(st);
     if (out_err != nullptr)
-      *out_err = GRPC_ERR_PROTOCOL;
+      *out_err = sid == NGHTTP2_ERR_NOMEM ? GRPC_ERR_NOMEM : GRPC_ERR_PROTOCOL;
     return nullptr;
   }
   st->stream_id = sid;

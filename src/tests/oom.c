@@ -5,6 +5,7 @@
 #ifndef _WIN32
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <nghttp2/nghttp2.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -17,18 +18,47 @@
 
 /* Deterministic countdown allocator for OOM fault-injection testing. It is installed once in
  * main(), before any server thread exists, and stays installed: grpc_set_allocator() is not
- * thread-safe, so tests switch failures on and off only through the atomic countdown
- * (-1 = never fail, 0 = fail every allocation, n = fail after n more successes). */
+ * thread-safe, so tests switch failures on and off only through atomics:
+ *
+ *   g_fail_after   -1 = never fail, 0 = fail every allocation, n = fail after n more successes
+ *   g_target_tid   the only thread (oom_thread_id()) whose allocations count down and fail;
+ *                  allocations of every other thread always succeed and do not consume the
+ *                  countdown, so injection is deterministic even while another thread (the
+ *                  server loop, or the client blocked in a call) allocates concurrently
+ *   g_injected     number of allocations failed since the last oom_enable_on()
+ *
+ * Every fault-injection loop runs with n = 0, 1, 2, ... until an iteration completes without an
+ * injected failure, so each allocation point of the operation is failed exactly once with all
+ * earlier ones succeeding. The final n is the number of allocation points covered. */
+enum { OOM_MAX_STEPS = 2000 };
+
 static atomic_int g_fail_after = -1;
+static atomic_int g_target_tid = 0;
+static atomic_int g_injected = 0;
+static atomic_int g_next_tid = 1;
+static _Thread_local int t_oom_tid;
+
+/* Small per-thread id (never 0), assigned on first use. */
+static int oom_thread_id(void) {
+  if (t_oom_tid == 0)
+    t_oom_tid = atomic_fetch_add(&g_next_tid, 1);
+  return t_oom_tid;
+}
 
 static bool should_fail(void) {
   int cur = atomic_load(&g_fail_after);
+  if (cur < 0)
+    return false;
+  if (atomic_load(&g_target_tid) != oom_thread_id())
+    return false;
   for (;;) {
     if (cur < 0)
       return false;
-    if (cur == 0)
+    if (cur == 0) {
+      atomic_fetch_add(&g_injected, 1);
       return true;
-    /* claim one successful allocation; retry if another thread took it first */
+    }
+    /* claim one successful allocation; retry if the countdown changed meanwhile */
     if (atomic_compare_exchange_weak(&g_fail_after, &cur, cur - 1))
       return false;
   }
@@ -69,19 +99,158 @@ static void oom_install(void) {
   });
 }
 
-static void oom_enable(int fail_after) {
+/* Arms the countdown for thread `tid` only. */
+static void oom_enable_on(int tid, int fail_after) {
+  atomic_store(&g_injected, 0);
+  atomic_store(&g_target_tid, tid);
   atomic_store(&g_fail_after, fail_after);
 }
 
-static void oom_disable(void) {
+static void oom_enable_self(int fail_after) {
+  oom_enable_on(oom_thread_id(), fail_after);
+}
+
+/* Disarms the countdown. Returns true if an allocation was failed since it was armed. */
+static bool oom_disable(void) {
   atomic_store(&g_fail_after, -1);
+  atomic_store(&g_target_tid, 0);
+  return atomic_exchange(&g_injected, 0) != 0;
+}
+
+/* With OOM_VERBOSE set, prints how many allocation points a loop covered. */
+static void oom_report(const char *loop, int points) {
+  if (getenv("OOM_VERBOSE") != nullptr) {
+    printf("[oom] %-34s %4d allocation points\n", loop, points);
+    fflush(stdout);
+  }
+}
+
+#define OOM_ASSERT_STEP(n) \
+  TEST_ASSERT_LESS_THAN_INT_MESSAGE(OOM_MAX_STEPS, (n), "fault-injection loop did not converge")
+
+#define ASSERT_ERR_ONE_OF2(rc, a, b)                                          \
+  do {                                                                        \
+    grpc_err rc_ = (rc);                                                      \
+    if (rc_ != (a) && rc_ != (b)) {                                           \
+      char m_[80];                                                            \
+      snprintf(m_, sizeof(m_), "unexpected grpc_err %d (%s)", (int)rc_, #rc); \
+      TEST_FAIL_MESSAGE(m_);                                                  \
+    }                                                                         \
+  } while (0)
+#define ASSERT_OK_OR_NOMEM(rc) ASSERT_ERR_ONE_OF2(rc, GRPC_OK, GRPC_ERR_NOMEM)
+
+/* Server threads must never run Unity assertions (they longjmp on the test thread's stack).
+ * Handlers record the first failed expectation here and the test thread checks it. */
+static atomic_int g_srv_bad_line = 0;
+#define SRV_EXPECT(cond)                                                       \
+  do {                                                                         \
+    if (!(cond)) {                                                             \
+      int zero_ = 0;                                                           \
+      (void)atomic_compare_exchange_strong(&g_srv_bad_line, &zero_, __LINE__); \
+    }                                                                          \
+  } while (0)
+
+static void assert_server_expectations(void) {
+  int line = atomic_load(&g_srv_bad_line);
+  if (line != 0) {
+    char msg[96];
+    snprintf(msg, sizeof(msg), "server-side expectation failed at oom.c:%d", line);
+    TEST_FAIL_MESSAGE(msg);
+  }
+}
+
+/* ---- fixtures: torn down in tearDown() even when an assertion fails --------------------- */
+
+static struct {
+  grpc_server *srv;
+  pthread_t srv_th;
+  bool srv_running;
+  grpc_client *client;
+#ifndef _WIN32
+  int raw_lfd;
+  pthread_t raw_th;
+  bool raw_running;
+  int web_fd;
+  nghttp2_session *web_sess;
+#endif
+} g_fx;
+static atomic_int g_srv_rc = GRPC_OK;
+#ifndef _WIN32
+static atomic_int g_oom_raw_stop = 0;
+#endif
+
+static void *oom_srv_run(void *arg) {
+  atomic_store(&g_srv_rc, grpc_server_run((grpc_server *)arg));
+  return nullptr;
+}
+
+static grpc_server *fx_server_new(void) {
+  g_fx.srv = grpc_server_new(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
+  TEST_ASSERT_NOT_NULL(g_fx.srv);
+  return g_fx.srv;
+}
+
+static void fx_server_start(void) {
+  atomic_store(&g_srv_rc, GRPC_OK);
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&g_fx.srv_th, nullptr, oom_srv_run, g_fx.srv));
+  g_fx.srv_running = true;
+}
+
+static void fx_server_stop(void) {
+  if (g_fx.srv_running) {
+    grpc_server_stop(g_fx.srv);
+    pthread_join(g_fx.srv_th, nullptr);
+    g_fx.srv_running = false;
+  }
+  grpc_server_free(g_fx.srv);
+  g_fx.srv = nullptr;
+}
+
+static grpc_client *fx_client_new(uint16_t port) {
+  grpc_err err = GRPC_OK;
+  g_fx.client = grpc_client_new(
+      &(grpc_client_config){.host = "127.0.0.1", .port = port, .timeout_ms = 2000}, &err);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, err);
+  TEST_ASSERT_NOT_NULL(g_fx.client);
+  return g_fx.client;
+}
+
+static void fx_teardown(void) {
+  grpc_client_free(g_fx.client);
+  g_fx.client = nullptr;
+  fx_server_stop();
+#ifndef _WIN32
+  if (g_fx.web_sess != nullptr)
+    nghttp2_session_del(g_fx.web_sess);
+  g_fx.web_sess = nullptr;
+  if (g_fx.web_fd >= 0)
+    close(g_fx.web_fd);
+  g_fx.web_fd = -1;
+  if (g_fx.raw_running) {
+    atomic_store(&g_oom_raw_stop, 1);
+    pthread_join(g_fx.raw_th, nullptr);
+    g_fx.raw_running = false;
+  }
+  if (g_fx.raw_lfd >= 0)
+    close(g_fx.raw_lfd);
+  g_fx.raw_lfd = -1;
+#endif
 }
 
 void setUp(void) {
-  oom_disable();
+  (void)oom_disable();
+  atomic_store(&g_srv_bad_line, 0);
+  memset(&g_fx, 0, sizeof(g_fx));
+#ifndef _WIN32
+  g_fx.raw_lfd = -1;
+  g_fx.web_fd = -1;
+#endif
 }
+
 void tearDown(void) {
-  oom_disable();
+  (void)oom_disable();
+  fx_teardown();
 }
 
 static void dummy_handler([[maybe_unused]] grpc_call *call,
@@ -89,30 +258,77 @@ static void dummy_handler([[maybe_unused]] grpc_call *call,
 
 static void dummy_post([[maybe_unused]] void *arg) {}
 
+static bool response_is(const grpc_client_response *r, const void *data, size_t len) {
+  return r->status == GRPC_STATUS_OK && r->message != nullptr && r->message->len == len &&
+         memcmp(r->message->data, data, len) == 0;
+}
+
+/* ---- library primitives ----------------------------------------------------------------- */
+
 void test_oom_primitives(void) {
   /* Messages, strdup, metadata base64, list */
-  for (int n = 0; n < 4; n++) {
-    oom_enable(n);
+  for (int n = 0;; n++) {
+    OOM_ASSERT_STEP(n);
+    oom_enable_self(n);
     grpc_message *m = grpc_message_new("hello", 5);
-    grpc_message_free(m);
-    m = grpc_message_alloc(16);
-    grpc_message_free(m);
+    grpc_message *a = grpc_message_alloc(16);
     char *s = grpc_strdup("abc");
-    grpc_free(s);
-    s = grpc_strndup("abcdef", 3);
-    grpc_free(s);
-    size_t out_len = 0;
-    char *b64 = grpc_metadata_encode_bin((const uint8_t *)"hello", 5, &out_len);
-    grpc_free(b64);
-    uint8_t *raw = grpc_metadata_decode_bin("aGVsbG8=", 8, &out_len);
-    grpc_free(raw);
+    char *sn = grpc_strndup("abcdef", 3);
+    size_t b64_len = 0;
+    char *b64 = grpc_metadata_encode_bin((const uint8_t *)"hello", 5, &b64_len);
+    size_t raw_len = 0;
+    uint8_t *raw = grpc_metadata_decode_bin("aGVsbG8=", 8, &raw_len);
     grpc_list *l = grpc_list_new();
+    int pushed_back = -1, pushed_front = -1;
     if (l != nullptr) {
-      (void)grpc_list_push_back(l, (void *)"a");
-      (void)grpc_list_push_front(l, (void *)"b");
-      grpc_list_free(l);
+      pushed_back = grpc_list_push_back(l, (void *)"a");
+      pushed_front = grpc_list_push_front(l, (void *)"b");
     }
-    oom_disable();
+    bool injected = oom_disable();
+
+    /* every result is either complete and correct, or the documented nullptr / nonzero */
+    if (m != nullptr) {
+      TEST_ASSERT_EQUAL_UINT32(5, m->len);
+      TEST_ASSERT_EQUAL_MEMORY("hello", m->data, 5);
+    }
+    if (a != nullptr)
+      TEST_ASSERT_EQUAL_UINT32(16, a->len);
+    if (s != nullptr)
+      TEST_ASSERT_EQUAL_STRING("abc", s);
+    if (sn != nullptr)
+      TEST_ASSERT_EQUAL_STRING("abc", sn);
+    if (b64 != nullptr) {
+      TEST_ASSERT_EQUAL_size_t(8, b64_len);
+      TEST_ASSERT_EQUAL_STRING("aGVsbG8=", b64);
+    }
+    if (raw != nullptr) {
+      TEST_ASSERT_EQUAL_size_t(5, raw_len);
+      TEST_ASSERT_EQUAL_MEMORY("hello", raw, 5);
+    }
+    if (l != nullptr) {
+      size_t expect = (pushed_back == 0 ? 1u : 0u) + (pushed_front == 0 ? 1u : 0u);
+      TEST_ASSERT_EQUAL_size_t(expect, grpc_list_count(l));
+      /* the list stays usable after a failed push */
+      TEST_ASSERT_EQUAL_INT(0, grpc_list_push_back(l, (void *)"c"));
+      TEST_ASSERT_EQUAL_size_t(expect + 1, grpc_list_count(l));
+    }
+    if (!injected) {
+      TEST_ASSERT_TRUE(m != nullptr && a != nullptr && s != nullptr && sn != nullptr &&
+                       b64 != nullptr && raw != nullptr && l != nullptr);
+      TEST_ASSERT_EQUAL_INT(0, pushed_back);
+      TEST_ASSERT_EQUAL_INT(0, pushed_front);
+    }
+    grpc_message_free(m);
+    grpc_message_free(a);
+    grpc_free(s);
+    grpc_free(sn);
+    grpc_free(b64);
+    grpc_free(raw);
+    grpc_list_free(l);
+    if (!injected) {
+      oom_report("primitives", n);
+      break;
+    }
   }
 }
 
@@ -123,8 +339,9 @@ void test_oom_compression_and_status_details(void) {
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_compress_gzip(data, sizeof(data), &gz, &gz_len));
 
   const uint8_t raw_det[] = {0x01, 0x02};
+  const char *type_url = "type.googleapis.com/google.rpc.ErrorInfo";
   grpc_status_detail_entry det = {
-      .type_url = "type.googleapis.com/google.rpc.ErrorInfo",
+      .type_url = type_url,
       .value = raw_det,
       .value_len = sizeof(raw_det),
   };
@@ -132,92 +349,275 @@ void test_oom_compression_and_status_details(void) {
   char *b64 = grpc_status_details_encode(3, "bad", &det, 1, &b64_len);
   TEST_ASSERT_NOT_NULL(b64);
 
-  for (int n = 0; n < 10; n++) {
-    oom_enable(n);
-    uint8_t *out = nullptr;
-    size_t out_len = 0;
-    grpc_err rc = grpc_compress_gzip(data, sizeof(data), &out, &out_len);
-    (void)rc;
-    grpc_free(out);
-    rc = grpc_decompress_gzip(gz, gz_len, &out, &out_len);
-    (void)rc;
-    grpc_free(out);
+  for (int n = 0;; n++) {
+    OOM_ASSERT_STEP(n);
+    oom_enable_self(n);
+    uint8_t *cz = nullptr, *dz = nullptr;
+    size_t cz_len = 0, dz_len = 0;
+    grpc_err rc_c = grpc_compress_gzip(data, sizeof(data), &cz, &cz_len);
+    grpc_err rc_d = grpc_decompress_gzip(gz, gz_len, &dz, &dz_len);
 #if defined(GRPC_ENABLE_ZSTD)
-    rc = grpc_compress(GRPC_COMPRESS_ZSTD, -1, data, sizeof(data), &out, &out_len);
-    (void)rc;
-    grpc_free(out);
+    uint8_t *zs = nullptr;
+    size_t zs_len = 0;
+    grpc_err rc_zs = grpc_compress(GRPC_COMPRESS_ZSTD, -1, data, sizeof(data), &zs, &zs_len);
 #endif
 #if defined(GRPC_ENABLE_SNAPPY)
-    rc = grpc_compress(GRPC_COMPRESS_SNAPPY, -1, data, sizeof(data), &out, &out_len);
-    (void)rc;
-    grpc_free(out);
+    uint8_t *sn = nullptr;
+    size_t sn_len = 0;
+    grpc_err rc_sn = grpc_compress(GRPC_COMPRESS_SNAPPY, -1, data, sizeof(data), &sn, &sn_len);
 #endif
-    char *enc = grpc_status_details_encode(3, "bad", &det, 1, &out_len);
-    grpc_free(enc);
+    size_t enc_len = 0;
+    char *enc = grpc_status_details_encode(3, "bad", &det, 1, &enc_len);
     grpc_status_details all = {0};
-    if (grpc_status_details_decode_all(b64, &all) == GRPC_OK)
-      grpc_status_details_free(&all);
-    oom_disable();
+    grpc_err rc_all = grpc_status_details_decode_all(b64, &all);
+    bool injected = oom_disable();
+
+    ASSERT_OK_OR_NOMEM(rc_c);
+    if (rc_c == GRPC_OK) {
+      /* the compressed output must round-trip */
+      uint8_t *back = nullptr;
+      size_t back_len = 0;
+      TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_decompress_gzip(cz, cz_len, &back, &back_len));
+      TEST_ASSERT_EQUAL_size_t(sizeof(data), back_len);
+      TEST_ASSERT_EQUAL_MEMORY(data, back, sizeof(data));
+      grpc_free(back);
+    }
+    ASSERT_OK_OR_NOMEM(rc_d);
+    if (rc_d == GRPC_OK) {
+      TEST_ASSERT_EQUAL_size_t(sizeof(data), dz_len);
+      TEST_ASSERT_EQUAL_MEMORY(data, dz, sizeof(data));
+    }
+#if defined(GRPC_ENABLE_ZSTD)
+    ASSERT_OK_OR_NOMEM(rc_zs);
+    TEST_ASSERT_TRUE(injected || rc_zs == GRPC_OK);
+    grpc_free(zs);
+#endif
+#if defined(GRPC_ENABLE_SNAPPY)
+    ASSERT_OK_OR_NOMEM(rc_sn);
+    TEST_ASSERT_TRUE(injected || rc_sn == GRPC_OK);
+    grpc_free(sn);
+#endif
+    if (enc != nullptr) {
+      TEST_ASSERT_EQUAL_size_t(b64_len, enc_len);
+      TEST_ASSERT_EQUAL_STRING(b64, enc);
+    }
+    ASSERT_ERR_ONE_OF2(rc_all, GRPC_OK, GRPC_ERR_NOMEM);
+    if (rc_all == GRPC_OK) {
+      TEST_ASSERT_EQUAL_INT32(3, all.code);
+      TEST_ASSERT_EQUAL_STRING("bad", all.message);
+      TEST_ASSERT_EQUAL_size_t(1, all.nb_details);
+      TEST_ASSERT_EQUAL_STRING(type_url, all.details[0].type_url);
+      TEST_ASSERT_EQUAL_size_t(sizeof(raw_det), all.details[0].value_len);
+      TEST_ASSERT_EQUAL_MEMORY(raw_det, all.details[0].value, sizeof(raw_det));
+    } else {
+      /* on error the struct is freed and zeroed */
+      TEST_ASSERT_NULL(all.message);
+      TEST_ASSERT_NULL(all.details);
+      TEST_ASSERT_EQUAL_size_t(0, all.nb_details);
+    }
+    if (!injected) {
+      TEST_ASSERT_EQUAL_INT(GRPC_OK, rc_c);
+      TEST_ASSERT_EQUAL_INT(GRPC_OK, rc_d);
+      TEST_ASSERT_NOT_NULL(enc);
+      TEST_ASSERT_EQUAL_INT(GRPC_OK, rc_all);
+    }
+    grpc_free(cz);
+    grpc_free(dz);
+    grpc_free(enc);
+    grpc_status_details_free(&all);
+    if (!injected) {
+      oom_report("compression + status details", n);
+      break;
+    }
   }
 
   grpc_free(b64);
   grpc_free(gz);
 }
 
+/* ---- server construction and registration ---------------------------------------------- */
+
 void test_oom_server_and_services(void) {
   /* Fail at every allocation step during server creation */
-  for (int n = 0; n < 12; n++) {
-    oom_enable(n);
+  for (int n = 0;; n++) {
+    OOM_ASSERT_STEP(n);
+    oom_enable_self(n);
     grpc_err err = GRPC_OK;
     grpc_server *s = grpc_server_new_ex(
         &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF}, &err);
+    bool injected = oom_disable();
+    if (s == nullptr)
+      TEST_ASSERT_EQUAL_INT(GRPC_ERR_NOMEM, err);
+    else
+      TEST_ASSERT_EQUAL_INT(GRPC_OK, err);
+    TEST_ASSERT_TRUE(injected || s != nullptr);
+    if (s != nullptr) /* a server created despite a failed allocation must still work */
+      TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(s, "/oom.Svc/New", dummy_handler, nullptr));
     grpc_server_free(s);
-    oom_disable();
+    if (!injected) {
+      oom_report("grpc_server_new_ex", n);
+      break;
+    }
   }
 
-  /* Create a real server, then fault-inject routes, interceptors, health, reflection, post */
-  grpc_server *s = grpc_server_new(
-      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
-  TEST_ASSERT_NOT_NULL(s);
+  /* Fault-inject routes, fallback, interceptors, post, health, reflection and channelz on a
+   * fresh server per step, then check each API either succeeded or rolled back: repeating it
+   * with allocations working must give GRPC_ERR_EXISTS (registered) or GRPC_OK (rolled back). */
+  const uint8_t fdp[] = {0x0A, 0x01, 'a'};
+  const grpc_stream_handler fallback = {.on_message = (void *)dummy_handler};
+  const grpc_interceptor interceptor = {.name = "x", .path_prefix = "/oom/"};
+  for (int n = 0;; n++) {
+    OOM_ASSERT_STEP(n);
+    grpc_server *s = fx_server_new();
+    oom_enable_self(n);
+    grpc_err rc_handle = grpc_server_handle(s, "/oom.Svc/M", dummy_handler, nullptr);
+    grpc_err rc_fallback = grpc_server_set_fallback(s, &fallback, nullptr);
+    grpc_err rc_icpt = grpc_server_add_interceptor(s, &interceptor);
+    grpc_err rc_post = grpc_server_post(s, dummy_post, nullptr);
+    grpc_err rc_health = grpc_health_enable(s);
+    grpc_err rc_status = grpc_health_set_status(s, "oom.Svc", GRPC_HEALTH_SERVING);
+    grpc_err rc_refl = grpc_reflection_enable(s);
+    grpc_err rc_fd = grpc_reflection_add_file_descriptor(s, "oom.proto", fdp, sizeof(fdp));
+    grpc_err rc_cz = grpc_channelz_enable(s);
+    bool injected = oom_disable();
 
-  for (int n = 0; n < 5; n++) {
-    oom_enable(n);
-    char path[32];
-    snprintf(path, sizeof(path), "/oom.Svc/M%d", n);
-    (void)grpc_server_handle(s, path, dummy_handler, nullptr);
-    (void)grpc_server_set_fallback(s, &(grpc_stream_handler){.on_message = (void *)dummy_handler},
-                                   nullptr);
-    (void)grpc_server_add_interceptor(s, &(grpc_interceptor){.name = "x", .path_prefix = "/oom/"});
-    (void)grpc_server_post(s, dummy_post, nullptr);
-    (void)grpc_health_enable(s);
-    (void)grpc_health_set_status(s, "oom.Svc", GRPC_HEALTH_SERVING);
-    (void)grpc_reflection_enable(s);
-    const uint8_t fdp[] = {0x0A, 0x01, 'a'};
-    (void)grpc_reflection_add_file_descriptor(s, "oom.proto", fdp, sizeof(fdp));
-    (void)grpc_channelz_enable(s);
-    oom_disable();
+    ASSERT_OK_OR_NOMEM(rc_handle);
+    ASSERT_OK_OR_NOMEM(rc_fallback);
+    ASSERT_OK_OR_NOMEM(rc_icpt);
+    ASSERT_OK_OR_NOMEM(rc_post);
+    ASSERT_OK_OR_NOMEM(rc_health);
+    ASSERT_OK_OR_NOMEM(rc_status);
+    ASSERT_OK_OR_NOMEM(rc_refl);
+    ASSERT_OK_OR_NOMEM(rc_fd);
+    ASSERT_OK_OR_NOMEM(rc_cz);
+    if (!injected) {
+      grpc_err all[] = {rc_handle, rc_fallback, rc_icpt, rc_post, rc_health,
+                        rc_status, rc_refl,     rc_fd,   rc_cz};
+      for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
+        TEST_ASSERT_EQUAL_INT_MESSAGE(GRPC_OK, all[i], "operation failed without OOM");
+    }
+
+    /* the server is still usable, and failed registrations left nothing behind */
+    grpc_err again_ok_or_exists[][2] = {
+        {rc_handle, grpc_server_handle(s, "/oom.Svc/M", dummy_handler, nullptr)},
+        {rc_health, grpc_health_enable(s)},
+        {rc_cz, grpc_channelz_enable(s)},
+    };
+    for (size_t i = 0; i < sizeof(again_ok_or_exists) / sizeof(again_ok_or_exists[0]); i++) {
+      grpc_err first = again_ok_or_exists[i][0], again = again_ok_or_exists[i][1];
+      TEST_ASSERT_EQUAL_INT(first == GRPC_OK ? GRPC_ERR_EXISTS : GRPC_OK, again);
+    }
+    /* grpc_reflection_enable() is all or nothing: after a failure a retry registers cleanly */
+    grpc_err refl_again = grpc_reflection_enable(s);
+    TEST_ASSERT_EQUAL_INT(rc_refl == GRPC_OK ? GRPC_ERR_EXISTS : GRPC_OK, refl_again);
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_set_fallback(s, &fallback, nullptr));
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_add_interceptor(s, &interceptor));
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_post(s, dummy_post, nullptr));
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_health_set_status(s, "oom.Svc", GRPC_HEALTH_SERVING));
+    TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                          grpc_reflection_add_file_descriptor(s, "oom2.proto", fdp, sizeof(fdp)));
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(s, "/oom.Svc/After", dummy_handler, nullptr));
+    fx_server_stop();
+    if (!injected) {
+      oom_report("server registration + services", n);
+      break;
+    }
   }
+}
 
-  grpc_server_free(s);
+/* ---- live server and client ------------------------------------------------------------ */
+
+static void oom_echo_handler(grpc_call *call, const grpc_message *req, [[maybe_unused]] void *ud) {
+  grpc_metadata md[] = {{.key = "x-r", .value = "1"}};
+  SRV_EXPECT(grpc_call_send_metadata(call, md, 1) == GRPC_OK);
+  SRV_EXPECT(grpc_call_reply_data(call, req->data, req->len) == GRPC_OK);
+}
+
+static void assert_echo_works(grpc_client *c) {
+  grpc_client_response r = {0};
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(c, "/oom.Svc/Echo", "ping", 4, nullptr, 0, 2000, &r));
+  bool ok = response_is(&r, "ping", 4);
+  grpc_client_response_free(&r);
+  TEST_ASSERT_TRUE_MESSAGE(ok, "client or server unusable after OOM");
 }
 
 void test_oom_client(void) {
-  for (int n = 0; n < 6; n++) {
-    oom_enable(n);
-    grpc_err err = GRPC_OK;
-    const char *targets[] = {"127.0.0.1:1"};
-    grpc_client *c =
-        grpc_client_new(&(grpc_client_config){.targets = targets, .nb_targets = 1}, &err);
-    grpc_client_free(c);
-    oom_disable();
+  grpc_server *srv = fx_server_new();
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_server_handle(srv, "/oom.Svc/Echo", oom_echo_handler, nullptr));
+  fx_server_start();
+  uint16_t port = grpc_server_port(srv);
+  char target[32];
+  snprintf(target, sizeof(target), "127.0.0.1:%u", port);
+  const char *targets[] = {target};
+
+  /* single target and target list against the live server: every injected failure yields
+   * nullptr and an error; without OOM the client connects and works. Only the test thread's
+   * allocations fail, the server thread is unaffected. */
+  for (int mode = 0; mode < 2; mode++) {
+    const grpc_client_config cfg =
+        mode == 0 ? (grpc_client_config){.host = "127.0.0.1", .port = port, .timeout_ms = 2000}
+                  : (grpc_client_config){.targets = targets, .nb_targets = 1, .timeout_ms = 2000};
+    for (int n = 0;; n++) {
+      OOM_ASSERT_STEP(n);
+      oom_enable_self(n);
+      grpc_err err = GRPC_OK;
+      grpc_client *c = grpc_client_new(&cfg, &err);
+      bool injected = oom_disable();
+      if (c == nullptr) {
+        TEST_ASSERT_TRUE(injected);
+        if (err != GRPC_ERR_NOMEM) {
+          char m[64];
+          snprintf(m, sizeof(m), "grpc_client_new: unexpected grpc_err %d", (int)err);
+          TEST_FAIL_MESSAGE(m);
+        }
+      } else {
+        TEST_ASSERT_EQUAL_INT(GRPC_OK, err);
+        g_fx.client = c;
+        /* an allocation failure while connecting fails grpc_client_new() (a lost connection
+         * preface included), so a client that was created is always usable */
+        assert_echo_works(c);
+        grpc_client_free(c);
+        g_fx.client = nullptr;
+      }
+      if (!injected) {
+        oom_report(mode == 0 ? "grpc_client_new (host/port)" : "grpc_client_new (targets)", n);
+        break;
+      }
+    }
   }
+
+  /* unix_path init: the path does not exist, so without OOM the result is GRPC_ERR_IO */
+  for (int n = 0;; n++) {
+    OOM_ASSERT_STEP(n);
+    oom_enable_self(n);
+    grpc_err err = GRPC_OK;
+    grpc_client *uc =
+        grpc_client_new(&(grpc_client_config){.unix_path = "oom-no-such-dir/none.sock"}, &err);
+    bool injected = oom_disable();
+    TEST_ASSERT_NULL(uc);
+    if (injected)
+      ASSERT_ERR_ONE_OF2(err, GRPC_ERR_NOMEM, GRPC_ERR_IO);
+    else
+      TEST_ASSERT_EQUAL_INT(GRPC_ERR_IO, err);
+    if (!injected) {
+      oom_report("grpc_client_new (unix_path)", n);
+      break;
+    }
+  }
+  assert_server_expectations();
+  fx_server_stop();
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, atomic_load(&g_srv_rc));
 }
 
-static void *oom_srv_run(void *arg) {
-  (void)grpc_server_run((grpc_server *)arg);
-  return nullptr;
-}
+/* Results of the live-call handlers, reported to the test thread. */
+static atomic_int g_call_points = -1;
+static atomic_int g_step = 0;
+static atomic_int g_step_injected = -1; /* -1 = handler did not run */
 
+/* Runs on the server thread: fault-injects every grpc_call API with the countdown restricted
+ * to this thread, then echoes the request. */
 static void oom_call_handler(grpc_call *call, const grpc_message *req, [[maybe_unused]] void *ud) {
   grpc_metadata md[] = {{.key = "x-k", .value = "v"}};
   const uint8_t raw[] = {0x01};
@@ -228,118 +628,185 @@ static void oom_call_handler(grpc_call *call, const grpc_message *req, [[maybe_u
   };
   grpc_metadata bad_null[] = {{.key = nullptr, .value = "v"}};
   grpc_metadata bad_empty[] = {{.key = "", .value = "v"}};
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_send_metadata(call, bad_null, 1));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_send_metadata(call, bad_empty, 1));
-  for (int n = 0; n < 5; n++) {
-    oom_enable(n);
-    (void)grpc_call_send_metadata(call, md, 1);
-    (void)grpc_call_add_trailers(call, md, 1);
-    (void)grpc_call_send_metadata_async(call, md, 1);
-    (void)grpc_call_add_trailers_async(call, md, 1);
-    (void)grpc_call_send_data_async(call, "a", 1);
-    (void)grpc_call_finish_async(call, GRPC_STATUS_OK, "m");
-    (void)grpc_call_finish_with_details_async(call, GRPC_STATUS_INTERNAL, "e", &det, 1);
-    oom_disable();
-    grpc_message *m1 = grpc_message_new("a", 1);
-    grpc_message *m2 = grpc_message_new("a", 1);
-    oom_enable(0);
-    (void)grpc_call_send_async(call, m1);
-    (void)grpc_call_reply_async(call, m2);
-    oom_disable();
+  SRV_EXPECT(grpc_call_send_metadata(call, bad_null, 1) == GRPC_ERR_INVALID);
+  SRV_EXPECT(grpc_call_send_metadata(call, bad_empty, 1) == GRPC_ERR_INVALID);
+
+  int me = oom_thread_id();
+  for (int n = 0;; n++) {
+    if (n >= OOM_MAX_STEPS) {
+      SRV_EXPECT(n < OOM_MAX_STEPS);
+      break;
+    }
+    oom_enable_on(me, n);
+    grpc_err rc[] = {
+        grpc_call_send_metadata(call, md, 1),
+        grpc_call_add_trailers(call, md, 1),
+        grpc_call_send_metadata_async(call, md, 1),
+        grpc_call_add_trailers_async(call, md, 1),
+        grpc_call_send_data_async(call, "a", 1),
+        grpc_call_finish_async(call, GRPC_STATUS_OK, "m"),
+        grpc_call_finish_with_details_async(call, GRPC_STATUS_INTERNAL, "e", &det, 1),
+    };
+    bool injected = oom_disable();
+    for (size_t i = 0; i < sizeof(rc) / sizeof(rc[0]); i++) {
+      SRV_EXPECT(rc[i] == GRPC_OK || rc[i] == GRPC_ERR_NOMEM);
+      SRV_EXPECT(injected || rc[i] == GRPC_OK);
+    }
+    if (!injected) {
+      atomic_store(&g_call_points, n);
+      break;
+    }
   }
-  (void)grpc_call_reply_data(call, req->data, req->len);
+  /* queueing a message fails cleanly (and frees it) when nothing can be allocated */
+  grpc_message *m1 = grpc_message_new("a", 1);
+  grpc_message *m2 = grpc_message_new("a", 1);
+  SRV_EXPECT(m1 != nullptr && m2 != nullptr);
+  oom_enable_on(me, 0);
+  grpc_err rc_send = grpc_call_send_async(call, m1);
+  grpc_err rc_reply = grpc_call_reply_async(call, m2);
+  (void)oom_disable();
+  SRV_EXPECT(rc_send == GRPC_ERR_NOMEM);
+  SRV_EXPECT(rc_reply == GRPC_ERR_NOMEM);
+  /* the call is still usable: answer synchronously before the queued operations run */
+  SRV_EXPECT(grpc_call_reply_data(call, req->data, req->len) == GRPC_OK);
 }
 
-static void oom_echo_handler(grpc_call *call, const grpc_message *req, [[maybe_unused]] void *ud) {
-  grpc_metadata md[] = {{.key = "x-r", .value = "1"}};
-  (void)grpc_call_send_metadata(call, md, 1);
-  (void)grpc_call_reply_data(call, req->data, req->len);
-}
-
+/* Runs on the server thread: replies with gzip compression, failing allocation g_step of the
+ * reply; a failed reply finishes the call with RESOURCE_EXHAUSTED. */
 static void oom_gzip_handler(grpc_call *call, const grpc_message *req, [[maybe_unused]] void *ud) {
-  (void)grpc_call_set_compression(call, GRPC_COMPRESS_GZIP, GRPC_COMPRESSION_LEVEL_DEFAULT);
-  for (int n = 0; n < 4; n++) {
-    oom_enable(n);
-    grpc_err rc = grpc_call_reply_data(call, req->data, req->len);
-    oom_disable();
-    if (rc == GRPC_OK)
-      return;
-  }
-  (void)grpc_call_finish(call, GRPC_STATUS_OK, nullptr);
+  SRV_EXPECT(grpc_call_set_compression(call, GRPC_COMPRESS_GZIP, GRPC_COMPRESSION_LEVEL_DEFAULT) ==
+             GRPC_OK);
+  oom_enable_on(oom_thread_id(), atomic_load(&g_step));
+  grpc_err rc = grpc_call_reply_data(call, req->data, req->len);
+  bool injected = oom_disable();
+  SRV_EXPECT(rc == GRPC_OK || rc == GRPC_ERR_NOMEM);
+  SRV_EXPECT(injected || rc == GRPC_OK);
+  if (rc != GRPC_OK) /* a failed reply leaves the call open and finishable */
+    SRV_EXPECT(grpc_call_finish(call, GRPC_STATUS_RESOURCE_EXHAUSTED, "oom") == GRPC_OK);
+  atomic_store(&g_step_injected, injected ? 1 : 0);
 }
 
 void test_oom_live_call_and_client(void) {
-  grpc_server *srv = grpc_server_new(
-      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
-  TEST_ASSERT_NOT_NULL(srv);
+  grpc_server *srv = fx_server_new();
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_server_handle(srv, "/oom.Svc/Call", oom_call_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_server_handle(srv, "/oom.Svc/Echo", oom_echo_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_server_handle(srv, "/oom.Svc/Gzip", oom_gzip_handler, nullptr));
-  pthread_t th;
-  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, oom_srv_run, srv));
+  fx_server_start();
+  grpc_client *c = fx_client_new(grpc_server_port(srv));
 
-  grpc_err err = GRPC_OK;
-  grpc_client *c = grpc_client_new(
-      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(srv), .timeout_ms = 2000},
-      &err);
-  TEST_ASSERT_NOT_NULL(c);
-
-  /* Run handler that exercises OOM paths on live grpc_call */
+  /* 1. grpc_call APIs under OOM on the server thread; the call still answers */
+  atomic_store(&g_call_points, -1);
   grpc_client_response resp = {0};
-  (void)grpc_client_unary(c, "/oom.Svc/Call", "hi", 2, nullptr, 0, 0, &resp);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(c, "/oom.Svc/Call", "hi", 2, nullptr, 0, 0, &resp));
+  bool call_ok = response_is(&resp, "hi", 2);
   grpc_client_response_free(&resp);
-  (void)grpc_client_unary(c, "/oom.Svc/Gzip", "hello-compress-oom", 18, nullptr, 0, 0, &resp);
-  grpc_client_response_free(&resp);
+  assert_server_expectations();
+  TEST_ASSERT_TRUE_MESSAGE(call_ok, "/oom.Svc/Call did not echo");
+  TEST_ASSERT_TRUE_MESSAGE(atomic_load(&g_call_points) >= 0, "call handler did not converge");
+  oom_report("grpc_call APIs (server thread)", atomic_load(&g_call_points));
 
-  /* Fault-inject client unary response handling (headers, data, message queue) */
+  /* 2. gzip reply under OOM on the server thread, one call per allocation point */
+  const char gz_req[] = "hello-compress-oom hello-compress-oom hello-compress-oom";
+  for (int n = 0;; n++) {
+    OOM_ASSERT_STEP(n);
+    atomic_store(&g_step, n);
+    atomic_store(&g_step_injected, -1);
+    grpc_client_response r = {0};
+    grpc_err rc = grpc_client_unary(c, "/oom.Svc/Gzip", gz_req, sizeof(gz_req), nullptr, 0, 0, &r);
+    int injected = atomic_load(&g_step_injected);
+    bool echoed = response_is(&r, gz_req, sizeof(gz_req));
+    grpc_status st = r.status;
+    grpc_client_response_free(&r);
+    assert_server_expectations();
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, rc);
+    TEST_ASSERT_NOT_EQUAL_INT_MESSAGE(-1, injected, "gzip handler did not run");
+    if (!echoed)
+      TEST_ASSERT_EQUAL_INT(GRPC_STATUS_RESOURCE_EXHAUSTED, st);
+    if (!injected) {
+      TEST_ASSERT_TRUE(echoed);
+      oom_report("gzip reply (server thread)", n);
+      break;
+    }
+  }
+
+  /* 3. client unary: only the test thread's allocations fail (connection, headers, data,
+   * message queue). A failed call reports an error; the client then still works. */
   char med_req[512];
   memset(med_req, 'R', sizeof(med_req));
-  for (int n = 0; n < 28; n++) {
-    oom_enable(n);
+  for (int n = 0;; n++) {
+    OOM_ASSERT_STEP(n);
+    oom_enable_self(n);
     grpc_client_response r = {0};
-    (void)grpc_client_unary(c, "/oom.Svc/Echo", med_req, sizeof(med_req), nullptr, 0, 1000, &r);
+    grpc_err rc =
+        grpc_client_unary(c, "/oom.Svc/Echo", med_req, sizeof(med_req), nullptr, 0, 2000, &r);
+    bool injected = oom_disable();
+    bool echoed = rc == GRPC_OK && response_is(&r, med_req, sizeof(med_req));
+    grpc_status st = r.status;
     grpc_client_response_free(&r);
-    oom_disable();
+    if (!echoed) {
+      TEST_ASSERT_TRUE_MESSAGE(injected, "unary failed without OOM");
+      if (rc == GRPC_OK) /* transport OK but no response: must be reported as an RPC error */
+        TEST_ASSERT_NOT_EQUAL_INT(GRPC_STATUS_OK, st);
+      else
+        TEST_ASSERT_NOT_EQUAL_INT(GRPC_ERR_TIMEOUT, rc);
+      assert_echo_works(c);
+    }
+    if (!injected) {
+      oom_report("grpc_client_unary (client thread)", n);
+      break;
+    }
   }
 
-  /* Fault-inject client stream_open / send / unary allocations & unix_path init */
-  for (int n = 0; n < 4; n++) {
-    oom_enable(n);
-    grpc_client *uc = grpc_client_new(&(grpc_client_config){.unix_path = "/tmp/oom_u.sock"}, &err);
-    grpc_client_free(uc);
-    oom_disable();
-  }
-  for (int n = 0; n < 6; n++) {
-    oom_enable(n);
-    grpc_client_stream *st = grpc_client_stream_open(c, "/oom.Svc/Call", nullptr, 0, 1000, &err);
-    if (st != nullptr) {
-      (void)grpc_client_stream_send(st, "x", 1);
+  /* 4. client stream_open / send */
+  for (int n = 0;; n++) {
+    OOM_ASSERT_STEP(n);
+    oom_enable_self(n);
+    grpc_err err = GRPC_OK;
+    grpc_client_stream *st = grpc_client_stream_open(c, "/oom.Svc/Echo", nullptr, 0, 2000, &err);
+    grpc_err rc_send = GRPC_OK;
+    if (st != nullptr)
+      rc_send = grpc_client_stream_send(st, "x", 1);
+    bool injected = oom_disable();
+    if (st == nullptr) {
+      TEST_ASSERT_TRUE(injected);
+      TEST_ASSERT_EQUAL_INT(GRPC_ERR_NOMEM, err);
+    } else {
+      TEST_ASSERT_EQUAL_INT(GRPC_OK, err);
+      ASSERT_OK_OR_NOMEM(rc_send);
+      TEST_ASSERT_TRUE(injected || rc_send == GRPC_OK);
       grpc_client_stream_cancel(st);
     }
-    oom_disable();
+    assert_echo_works(c);
+    if (!injected) {
+      oom_report("grpc_client_stream_open/send", n);
+      break;
+    }
   }
 
+  assert_server_expectations();
   grpc_client_free(c);
-  grpc_server_stop(srv);
-  pthread_join(th, nullptr);
-  grpc_server_free(srv);
+  g_fx.client = nullptr;
+  fx_server_stop();
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, atomic_load(&g_srv_rc));
 }
 
 #ifndef _WIN32
-static atomic_int g_web_oom_step = 0;
-
+/* Runs on the server thread: adds a trailer, then replies with allocation g_step failing. */
 static void oom_web_handler(grpc_call *call, const grpc_message *req, [[maybe_unused]] void *ud) {
-  int step = atomic_fetch_add(&g_web_oom_step, 1);
   grpc_metadata tr[] = {{.key = "x-t", .value = "val"}};
-  (void)grpc_call_add_trailers(call, tr, 1);
-  oom_enable(step);
+  SRV_EXPECT(grpc_call_add_trailers(call, tr, 1) == GRPC_OK);
+  oom_enable_on(oom_thread_id(), atomic_load(&g_step));
   grpc_err rc = grpc_call_reply_data(call, req->data, req->len);
-  oom_disable();
-  if (rc != GRPC_OK)
-    (void)grpc_call_finish(call, GRPC_STATUS_OK, nullptr);
+  bool injected = oom_disable();
+  SRV_EXPECT(rc == GRPC_OK || rc == GRPC_ERR_NOMEM);
+  SRV_EXPECT(injected || rc == GRPC_OK);
+  if (rc != GRPC_OK) /* a failed reply leaves the call open and finishable */
+    SRV_EXPECT(grpc_call_finish(call, GRPC_STATUS_RESOURCE_EXHAUSTED, "oom") == GRPC_OK);
+  atomic_store(&g_step_injected, injected ? 1 : 0);
 }
 
 typedef struct oom_h2_buf {
@@ -373,6 +840,40 @@ static void oom_send_all(int fd, const uint8_t *p, size_t len) {
   }
 }
 
+static void oom_h2_flush(nghttp2_session *sess, int fd) {
+  for (;;) {
+    const uint8_t *out;
+    ssize_t wn = nghttp2_session_mem_send(sess, &out);
+    if (wn <= 0)
+      break;
+    oom_send_all(fd, out, (size_t)wn);
+  }
+}
+
+/* State of the raw nghttp2 client's current request. */
+typedef struct oom_web_req {
+  int32_t sid;
+  bool closed;
+  int http_status;
+} oom_web_req;
+
+static int oom_web_on_header([[maybe_unused]] nghttp2_session *s, const nghttp2_frame *f,
+                             const uint8_t *name, size_t namelen, const uint8_t *value,
+                             size_t valuelen, [[maybe_unused]] uint8_t flags, void *ud) {
+  oom_web_req *r = ud;
+  if (f->hd.stream_id == r->sid && namelen == 7 && memcmp(name, ":status", 7) == 0 && valuelen == 3)
+    r->http_status = (value[0] - '0') * 100 + (value[1] - '0') * 10 + (value[2] - '0');
+  return 0;
+}
+
+static int oom_web_on_close([[maybe_unused]] nghttp2_session *s, int32_t sid,
+                            [[maybe_unused]] uint32_t code, void *ud) {
+  oom_web_req *r = ud;
+  if (sid == r->sid)
+    r->closed = true;
+  return 0;
+}
+
 static uint8_t g_oom_resp_frame[520];
 static oom_h2_buf g_oom_resp_src;
 
@@ -394,8 +895,8 @@ static int oom_raw_srv_on_frame(nghttp2_session *s, const nghttp2_frame *f,
   return 0;
 }
 
-static atomic_int g_oom_raw_stop = 0;
-
+/* Minimal HTTP/2 server built on nghttp2's own (libc) allocator, so that none of its
+ * allocations go through the fault-injecting grpc allocator. Serves one connection at a time. */
 static void *oom_raw_h2_server(void *arg) {
   int lfd = *(int *)arg;
   struct timeval tv = {.tv_sec = 0, .tv_usec = 100000};
@@ -405,6 +906,8 @@ static void *oom_raw_h2_server(void *arg) {
     if (cfd < 0)
       continue;
     setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    int one = 1; /* no Nagle / delayed-ACK stalls between frames */
+    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     nghttp2_session_callbacks *cbs = nullptr;
     nghttp2_session_callbacks_new(&cbs);
     nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, oom_raw_srv_on_frame);
@@ -412,13 +915,7 @@ static void *oom_raw_h2_server(void *arg) {
     nghttp2_session_server_new(&sess, cbs, nullptr);
     nghttp2_session_callbacks_del(cbs);
     nghttp2_submit_settings(sess, NGHTTP2_FLAG_NONE, nullptr, 0);
-    for (;;) {
-      const uint8_t *out;
-      ssize_t wn = nghttp2_session_mem_send(sess, &out);
-      if (wn <= 0)
-        break;
-      oom_send_all(cfd, out, (size_t)wn);
-    }
+    oom_h2_flush(sess, cfd);
     uint8_t rbuf[4096];
     while (!atomic_load(&g_oom_raw_stop)) {
       ssize_t n = recv(cfd, rbuf, sizeof(rbuf), 0);
@@ -428,13 +925,7 @@ static void *oom_raw_h2_server(void *arg) {
         continue;
       if (nghttp2_session_mem_recv(sess, rbuf, (size_t)n) < 0)
         break;
-      for (;;) {
-        const uint8_t *out;
-        ssize_t wn = nghttp2_session_mem_send(sess, &out);
-        if (wn <= 0)
-          break;
-        oom_send_all(cfd, out, (size_t)wn);
-      }
+      oom_h2_flush(sess, cfd);
     }
     nghttp2_session_del(sess);
     close(cfd);
@@ -442,127 +933,176 @@ static void *oom_raw_h2_server(void *arg) {
   return nullptr;
 }
 
+/* Sends one gRPC-Web request on the fixture's raw nghttp2 connection and waits (up to ~5 s) for
+ * its stream to close. */
+static void oom_web_request(oom_web_req *req, const char *content_type, const uint8_t *body,
+                            size_t body_len) {
+  nghttp2_nv hdrs[] = {
+      {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)":scheme", (uint8_t *)"http", 7, 4, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)":path", (uint8_t *)"/oom.Web/Call", 5, 13, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
+      {(uint8_t *)"content-type", (uint8_t *)content_type, 12, strlen(content_type),
+       NGHTTP2_NV_FLAG_NONE},
+  };
+  oom_h2_buf src = {.data = body, .len = body_len, .off = 0};
+  nghttp2_data_provider dp = {.source.ptr = &src, .read_callback = oom_h2_read_cb};
+  *req = (oom_web_req){0};
+  req->sid = nghttp2_submit_request(g_fx.web_sess, nullptr, hdrs, 5, &dp, nullptr);
+  TEST_ASSERT_TRUE(req->sid > 0);
+  oom_h2_flush(g_fx.web_sess, g_fx.web_fd);
+  uint8_t rbuf[4096];
+  for (int tries = 0; !req->closed && tries < 50; tries++) {
+    ssize_t n = recv(g_fx.web_fd, rbuf, sizeof(rbuf), 0);
+    if (n == 0)
+      break;
+    if (n < 0)
+      continue; /* SO_RCVTIMEO tick */
+    TEST_ASSERT_TRUE(nghttp2_session_mem_recv(g_fx.web_sess, rbuf, (size_t)n) >= 0);
+    oom_h2_flush(g_fx.web_sess, g_fx.web_fd);
+  }
+  TEST_ASSERT_TRUE_MESSAGE(req->closed, "gRPC-Web response stream did not complete");
+}
+
 void test_oom_grpc_web_and_client_deterministic(void) {
-  /* 1. Server route registration OOM */
-  grpc_server *srv = grpc_server_new(
-      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
-  TEST_ASSERT_NOT_NULL(srv);
-  for (int n = 0; n < 4; n++) {
-    oom_enable(n);
-    (void)grpc_server_handle(srv, "/oom/Route", oom_web_handler, nullptr);
-    oom_disable();
+  /* 1. Server route registration OOM (before the server thread exists) */
+  grpc_server *srv = fx_server_new();
+  for (int n = 0;; n++) {
+    OOM_ASSERT_STEP(n);
+    char path[32];
+    snprintf(path, sizeof(path), "/oom/Route%d", n);
+    oom_enable_self(n);
+    grpc_err rc = grpc_server_handle(srv, path, oom_web_handler, nullptr);
+    bool injected = oom_disable();
+    ASSERT_OK_OR_NOMEM(rc);
+    TEST_ASSERT_TRUE(injected || rc == GRPC_OK);
+    TEST_ASSERT_EQUAL_INT(rc == GRPC_OK ? GRPC_ERR_EXISTS : GRPC_OK,
+                          grpc_server_handle(srv, path, oom_web_handler, nullptr));
+    if (!injected) {
+      oom_report("grpc_server_handle", n);
+      break;
+    }
   }
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_server_handle(srv, "/oom.Web/Call", oom_web_handler, nullptr));
-  pthread_t th;
-  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, oom_srv_run, srv));
+  fx_server_start();
 
-  /* 2. gRPC-Web-Text and gRPC-Web binary OOM inside grpc_call_reply_data / call_finish_internal */
+  /* 2. gRPC-Web-Text and gRPC-Web binary OOM inside grpc_call_reply_data / call finish, one
+   * request per allocation point on the server thread */
   const uint8_t wframe[] = {0x00, 0x00, 0x00, 0x00, 0x02, 'o', 'k'};
   size_t wb64_len = 0;
   char *wb64 = grpc_metadata_encode_bin(wframe, sizeof(wframe), &wb64_len);
+  TEST_ASSERT_NOT_NULL(wb64);
+  uint8_t wb64_copy[32];
+  TEST_ASSERT_TRUE(wb64_len <= sizeof(wb64_copy));
+  memcpy(wb64_copy, wb64, wb64_len);
+  grpc_free(wb64);
   const char *cts[] = {"application/grpc-web-text", "application/grpc-web"};
   for (int mode = 0; mode < 2; mode++) {
-    atomic_store(&g_web_oom_step, 0);
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd >= 0) {
-      struct sockaddr_in sin = {0};
-      sin.sin_family = AF_INET;
-      sin.sin_port = htons(grpc_server_port(srv));
-      inet_pton(AF_INET, "127.0.0.1", &sin.sin_addr);
-      if (connect(fd, (struct sockaddr *)&sin, sizeof(sin)) == 0) {
-        nghttp2_session_callbacks *cbs = nullptr;
-        nghttp2_session_callbacks_new(&cbs);
-        nghttp2_session *sess = nullptr;
-        nghttp2_session_client_new(&sess, cbs, nullptr);
-        nghttp2_session_callbacks_del(cbs);
-        nghttp2_submit_settings(sess, NGHTTP2_FLAG_NONE, nullptr, 0);
-        oom_h2_buf bufs[12];
-        nghttp2_data_provider dps[12];
-        nghttp2_nv hdrs[] = {
-            {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
-            {(uint8_t *)":scheme", (uint8_t *)"http", 7, 4, NGHTTP2_NV_FLAG_NONE},
-            {(uint8_t *)":path", (uint8_t *)"/oom.Web/Call", 5, 13, NGHTTP2_NV_FLAG_NONE},
-            {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
-            {(uint8_t *)"content-type", (uint8_t *)cts[mode], 12, strlen(cts[mode]),
-             NGHTTP2_NV_FLAG_NONE},
-        };
-        for (int i = 0; i < 12; i++) {
-          bufs[i] = (oom_h2_buf){
-              .data = mode == 0 ? (const uint8_t *)wb64 : wframe,
-              .len = mode == 0 ? wb64_len : sizeof(wframe),
-              .off = 0,
-          };
-          dps[i] = (nghttp2_data_provider){.source.ptr = &bufs[i], .read_callback = oom_h2_read_cb};
-          nghttp2_submit_request(sess, nullptr, hdrs, 5, &dps[i], nullptr);
-        }
-        for (;;) {
-          const uint8_t *out;
-          ssize_t wn = nghttp2_session_mem_send(sess, &out);
-          if (wn <= 0)
-            break;
-          oom_send_all(fd, out, (size_t)wn);
-        }
-        struct timeval tv = {.tv_sec = 0, .tv_usec = 80000};
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        uint8_t rbuf[4096];
-        for (int r = 0; r < 10; r++) {
-          ssize_t n = recv(fd, rbuf, sizeof(rbuf), 0);
-          if (n <= 0)
-            break;
-          nghttp2_session_mem_recv(sess, rbuf, (size_t)n);
-        }
-        nghttp2_session_del(sess);
-      }
-      close(fd);
-    }
-  }
-  grpc_free(wb64);
-  grpc_server_stop(srv);
-  pthread_join(th, nullptr);
-  grpc_server_free(srv);
+    g_fx.web_fd = socket(AF_INET, SOCK_STREAM, 0);
+    TEST_ASSERT_TRUE(g_fx.web_fd >= 0);
+    struct sockaddr_in sin = {0};
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(grpc_server_port(srv));
+    inet_pton(AF_INET, "127.0.0.1", &sin.sin_addr);
+    TEST_ASSERT_EQUAL_INT(0, connect(g_fx.web_fd, (struct sockaddr *)&sin, sizeof(sin)));
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 100000};
+    setsockopt(g_fx.web_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    int one = 1;
+    setsockopt(g_fx.web_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    oom_web_req req = {0};
+    nghttp2_session_callbacks *cbs = nullptr;
+    TEST_ASSERT_EQUAL_INT(0, nghttp2_session_callbacks_new(&cbs));
+    nghttp2_session_callbacks_set_on_header_callback(cbs, oom_web_on_header);
+    nghttp2_session_callbacks_set_on_stream_close_callback(cbs, oom_web_on_close);
+    int rv = nghttp2_session_client_new(&g_fx.web_sess, cbs, &req);
+    nghttp2_session_callbacks_del(cbs);
+    TEST_ASSERT_EQUAL_INT(0, rv);
+    nghttp2_submit_settings(g_fx.web_sess, NGHTTP2_FLAG_NONE, nullptr, 0);
 
-  /* 3. Deterministic client-only OOM against non-grpc_malloc raw HTTP/2 server */
+    for (int n = 0;; n++) {
+      OOM_ASSERT_STEP(n);
+      atomic_store(&g_step, n);
+      atomic_store(&g_step_injected, -1);
+      if (mode == 0)
+        oom_web_request(&req, cts[mode], wb64_copy, wb64_len);
+      else
+        oom_web_request(&req, cts[mode], wframe, sizeof(wframe));
+      assert_server_expectations();
+      TEST_ASSERT_EQUAL_INT(200, req.http_status);
+      int injected = atomic_load(&g_step_injected);
+      TEST_ASSERT_NOT_EQUAL_INT_MESSAGE(-1, injected, "gRPC-Web handler did not run");
+      if (!injected) {
+        oom_report(mode == 0 ? "gRPC-Web-Text reply (server thread)"
+                             : "gRPC-Web reply (server thread)",
+                   n);
+        break;
+      }
+    }
+    nghttp2_session_del(g_fx.web_sess);
+    g_fx.web_sess = nullptr;
+    close(g_fx.web_fd);
+    g_fx.web_fd = -1;
+  }
+  assert_server_expectations();
+  fx_server_stop();
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, atomic_load(&g_srv_rc));
+
+  /* 3. Client-only OOM against the raw nghttp2 server (libc allocator, own thread): only the
+   * test thread's allocations fail */
   g_oom_resp_frame[0] = 0;
   uint32_t rlen = htonl(sizeof(g_oom_resp_frame) - 5);
   memcpy(g_oom_resp_frame + 1, &rlen, 4);
   memset(g_oom_resp_frame + 5, 'Z', sizeof(g_oom_resp_frame) - 5);
+  uint8_t expect[sizeof(g_oom_resp_frame) - 5];
+  memset(expect, 'Z', sizeof(expect));
 
-  int lfd = socket(AF_INET, SOCK_STREAM, 0);
-  TEST_ASSERT_TRUE(lfd >= 0);
-  int opt = 1;
-  setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  g_fx.raw_lfd = socket(AF_INET, SOCK_STREAM, 0);
+  TEST_ASSERT_TRUE(g_fx.raw_lfd >= 0);
   struct sockaddr_in lsin = {0};
   lsin.sin_family = AF_INET;
   lsin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
   lsin.sin_port = 0;
-  TEST_ASSERT_EQUAL_INT(0, bind(lfd, (struct sockaddr *)&lsin, sizeof(lsin)));
-  TEST_ASSERT_EQUAL_INT(0, listen(lfd, 8));
+  TEST_ASSERT_EQUAL_INT(0, bind(g_fx.raw_lfd, (struct sockaddr *)&lsin, sizeof(lsin)));
+  TEST_ASSERT_EQUAL_INT(0, listen(g_fx.raw_lfd, 64));
   socklen_t slen = sizeof(lsin);
-  TEST_ASSERT_EQUAL_INT(0, getsockname(lfd, (struct sockaddr *)&lsin, &slen));
+  TEST_ASSERT_EQUAL_INT(0, getsockname(g_fx.raw_lfd, (struct sockaddr *)&lsin, &slen));
   uint16_t lport = ntohs(lsin.sin_port);
 
   atomic_store(&g_oom_raw_stop, 0);
-  pthread_t rth;
-  TEST_ASSERT_EQUAL_INT(0, pthread_create(&rth, nullptr, oom_raw_h2_server, &lfd));
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&g_fx.raw_th, nullptr, oom_raw_h2_server, &g_fx.raw_lfd));
+  g_fx.raw_running = true;
 
-  for (int n = 0; n < 24; n++) {
-    grpc_err err = GRPC_OK;
-    grpc_client *c = grpc_client_new(
-        &(grpc_client_config){.host = "127.0.0.1", .port = lport, .timeout_ms = 500}, &err);
-    if (c == nullptr)
-      continue;
-    grpc_client_response resp = {0};
-    oom_enable(n);
-    (void)grpc_client_unary(c, "/raw.Svc/Echo", "hi", 2, nullptr, 0, 500, &resp);
-    oom_disable();
-    grpc_client_response_free(&resp);
+  for (int n = 0;; n++) {
+    OOM_ASSERT_STEP(n);
+    grpc_client *c = fx_client_new(lport);
+    grpc_client_response r = {0};
+    oom_enable_self(n);
+    grpc_err rc = grpc_client_unary(c, "/raw.Svc/Echo", "hi", 2, nullptr, 0, 2000, &r);
+    bool injected = oom_disable();
+    bool ok = rc == GRPC_OK && response_is(&r, expect, sizeof(expect));
+    grpc_status st = r.status;
+    grpc_client_response_free(&r);
+    if (!ok) {
+      TEST_ASSERT_TRUE_MESSAGE(injected, "raw unary failed without OOM");
+      if (rc == GRPC_OK)
+        TEST_ASSERT_NOT_EQUAL_INT(GRPC_STATUS_OK, st);
+      else
+        TEST_ASSERT_NOT_EQUAL_INT(GRPC_ERR_TIMEOUT, rc);
+      /* the same client recovers */
+      TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                            grpc_client_unary(c, "/raw.Svc/Echo", "hi", 2, nullptr, 0, 2000, &r));
+      ok = response_is(&r, expect, sizeof(expect));
+      grpc_client_response_free(&r);
+      TEST_ASSERT_TRUE_MESSAGE(ok, "client unusable after OOM");
+    }
     grpc_client_free(c);
+    g_fx.client = nullptr;
+    if (!injected) {
+      oom_report("grpc_client_unary (raw server)", n);
+      break;
+    }
   }
-
-  atomic_store(&g_oom_raw_stop, 1);
-  pthread_join(rth, nullptr);
-  close(lfd);
 }
 #endif
 

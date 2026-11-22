@@ -8,7 +8,11 @@
  * examples/python_client_c_server exercises on_call, rejection and on_done */
 
 void setUp(void) {}
-void tearDown(void) {}
+
+/* a failed assertion must not leave the failing allocator installed */
+void tearDown(void) {
+  grpc_set_allocator(nullptr);
+}
 
 static int s_freed = 0;
 
@@ -27,7 +31,7 @@ static bool validator(const char *token, [[maybe_unused]] void *userdata) {
 
 void test_interceptor_registration(void) {
   grpc_server *server = grpc_server_new(
-      &(grpc_config){.port = 19998, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
   TEST_ASSERT_NOT_NULL(server);
 
   grpc_interceptor inc = {
@@ -55,7 +59,7 @@ void test_bearer_auth_interceptor(void) {
 
   /* freed with the server */
   grpc_server *server = grpc_server_new(
-      &(grpc_config){.port = 19998, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
   TEST_ASSERT_NOT_NULL(server);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_add_interceptor(server, &auth));
   grpc_server_free(server);

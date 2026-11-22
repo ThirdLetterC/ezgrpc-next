@@ -104,6 +104,13 @@ static void notify_watchers_on_loop(void *arg) {
   }
 }
 
+/* Names are kept truncated to MAX_SERVICE_NAME_LEN - 1 bytes (as are names read from Check and
+ * Watch requests), so they are compared on that prefix: a long name set by the application is
+ * found again by the same long name. */
+static bool service_name_eq(const char *stored, const char *service) {
+  return strncmp(stored, service, MAX_SERVICE_NAME_LEN - 1) == 0;
+}
+
 /* An empty or null service sets the overall status. New names are added to the list (truncated
  * to MAX_SERVICE_NAME_LEN - 1 bytes). Watchers are notified through grpc_server_post() only when
  * the status actually changed and the server's async handle is up. */
@@ -125,7 +132,7 @@ GRPC_API grpc_err grpc_health_set_status(grpc_server *server, const char *servic
     goto out;
   }
   for (size_t i = 0; i < health->nb_entries; i++) {
-    if (strcmp(health->entries[i].name, service) == 0) {
+    if (service_name_eq(health->entries[i].name, service)) {
       changed = (health->entries[i].status != status);
       health->entries[i].status = status;
       goto out;
@@ -165,7 +172,7 @@ GRPC_API grpc_health_status grpc_health_get_status(grpc_server *server, const ch
     res = health->overall;
   } else {
     for (size_t i = 0; i < health->nb_entries; i++) {
-      if (strcmp(health->entries[i].name, service) == 0) {
+      if (service_name_eq(health->entries[i].name, service)) {
         res = health->entries[i].status;
         break;
       }

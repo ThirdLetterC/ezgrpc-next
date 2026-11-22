@@ -12,6 +12,7 @@
 
 #include <time.h>
 #include <ctype.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <limits.h>
 #include "core.h"
@@ -26,7 +27,7 @@ uint64_t grpc_time_now_ms(void) {
  * (H hours, M minutes, S seconds, m milliseconds, u microseconds, n nanoseconds). Sub-millisecond
  * units round up so a nonzero timeout never becomes 0 ms. Returns the timeout in milliseconds,
  * clamped to INT64_MAX, or -1 for null/empty input, a missing or unknown unit, trailing bytes, a
- * zero value, or a value that overflows during unit conversion. The spec's 8-digit limit is not
+ * zero value, more digits than fit in 64 bits, or a value that overflows during unit conversion. The spec's 8-digit limit is not
  * enforced. */
 int64_t grpc_timeout_parse_ms(const char *timeout_str) {
   if (timeout_str == nullptr || *timeout_str == '\0') {
@@ -51,8 +52,10 @@ int64_t grpc_timeout_parse_ms(const char *timeout_str) {
 
   // Parse numeric part
   char *endptr = nullptr;
+  errno = 0;
   unsigned long long val = strtoull(timeout_str, &endptr, 10);
-  if (endptr != p || val == 0) {
+  /* ERANGE: more digits than 64 bits hold (strtoull then returns ULLONG_MAX) */
+  if (endptr != p || val == 0 || errno == ERANGE) {
     return -1;
   }
 
@@ -76,11 +79,13 @@ int64_t grpc_timeout_parse_ms(const char *timeout_str) {
   case 'm': // Millisecond
     ms = val;
     break;
-  case 'u':                        // Microsecond
-    ms = (val + 999ULL) / 1000ULL; // Ceiling to at least 1ms if non-zero
+  /* round up so a nonzero timeout never becomes 0 ms; (val + 999) / 1000 would wrap near
+   * ULLONG_MAX and turn a huge timeout into 0 */
+  case 'u': // Microsecond
+    ms = val / 1000ULL + (val % 1000ULL != 0);
     break;
-  case 'n':                              // Nanosecond
-    ms = (val + 999999ULL) / 1000000ULL; // Ceiling to at least 1ms if non-zero
+  case 'n': // Nanosecond
+    ms = val / 1000000ULL + (val % 1000000ULL != 0);
     break;
   default:
     return -1;

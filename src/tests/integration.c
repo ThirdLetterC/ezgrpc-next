@@ -5,19 +5,431 @@
 #include <string.h>
 #ifndef _WIN32
 #include <nghttp2/nghttp2.h>
+#include <poll.h>
 #include <signal.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
 #endif
 #include <uv.h>
 #include "internal/grpc_threads.h"
 #include "grpc.h"
 #include "unity.h"
 
-void setUp(void) {}
-void tearDown(void) {}
+/* ---- Synchronisation helpers ------------------------------------------------------------------ */
+
+/* Upper bound for every "wait until something observable happens" loop. */
+#define WAIT_DEADLINE_MS 3000
+
+static uint64_t now_ms(void) {
+  return uv_hrtime() / 1000000u;
+}
+
+/* Re-evaluates cond every 5 ms until it holds or WAIT_DEADLINE_MS passes. */
+#define WAIT_FOR(cond)                                    \
+  do {                                                    \
+    const uint64_t wf_end_ = now_ms() + WAIT_DEADLINE_MS; \
+    while (!(cond) && now_ms() < wf_end_)                 \
+      uv_sleep(5);                                        \
+  } while (0)
+
+#define ASSERT_EVENTUALLY(cond)                                        \
+  do {                                                                 \
+    WAIT_FOR(cond);                                                    \
+    TEST_ASSERT_TRUE_MESSAGE((cond), "timed out waiting for: " #cond); \
+  } while (0)
+
+/* Same for a poll-driven server: drives its loop on this thread while waiting. */
+#define ASSERT_POLL_EVENTUALLY(srv, cond)                              \
+  do {                                                                 \
+    const uint64_t pf_end_ = now_ms() + WAIT_DEADLINE_MS;              \
+    while (!(cond) && now_ms() < pf_end_)                              \
+      (void)grpc_server_poll((srv), 5);                                \
+    TEST_ASSERT_TRUE_MESSAGE((cond), "timed out waiting for: " #cond); \
+  } while (0)
+
+static grpc_server_stats srv_stats(const grpc_server *srv) {
+  grpc_server_stats st = {0};
+  (void)grpc_server_get_stats(srv, &st);
+  return st;
+}
+
+static const char *md_find(const grpc_metadata *md, size_t n, const char *key) {
+  for (size_t i = 0; i < n; i++) {
+    if (md[i].key != nullptr && strcmp(md[i].key, key) == 0)
+      return md[i].value;
+  }
+  return nullptr;
+}
+
+/* Checks made on the server thread. Unity assertions longjmp, so they must never run there: a
+ * failing check records its source line, and the test thread asserts it with
+ * ASSERT_HANDLER_CHECKS(). */
+static atomic_int g_handler_fail_line;
+#define HCHECK(cond)                                                                   \
+  do {                                                                                 \
+    if (!(cond)) {                                                                     \
+      int hc_zero_ = 0;                                                                \
+      (void)atomic_compare_exchange_strong(&g_handler_fail_line, &hc_zero_, __LINE__); \
+    }                                                                                  \
+  } while (0)
+#define ASSERT_HANDLER_CHECKS()                                       \
+  TEST_ASSERT_EQUAL_INT_MESSAGE(0, atomic_load(&g_handler_fail_line), \
+                                "a server-thread check failed at this line of integration.c")
+
+/* ---- Per-test fixture -------------------------------------------------------------------------
+ * Everything a test starts (server threads, clients, streams, sockets, raw HTTP/2 sessions, worker
+ * threads, buffers, temporary files) is recorded here, so tearDown() can stop, join and free what a
+ * failed assertion left behind before the next test runs. */
+
+enum { FX_SLOTS = 16 };
+
+typedef struct fx_server_slot {
+  grpc_server *srv;
+  pthread_t th;
+  bool threaded;
+} fx_server_slot;
+
+typedef struct fx_log_slot {
+  FILE *f;
+  char path[320];
+} fx_log_slot;
+
+#ifndef _WIN32
+typedef struct fx_raw_thread_slot {
+  pthread_t th;
+  int listen_fd;
+  bool used;
+} fx_raw_thread_slot;
+#endif
+
+static struct {
+  fx_server_slot servers[FX_SLOTS];
+  void *clients[FX_SLOTS];
+  void *streams[FX_SLOTS];
+  void *mem[FX_SLOTS];
+  fx_log_slot logs[4];
+#ifndef _WIN32
+  int fds[FX_SLOTS]; /* fd + 1; 0 = empty */
+  void *sessions[FX_SLOTS];
+  fx_raw_thread_slot raw_threads[2];
+  char tmpdir[256];
+  char tmpfiles[4][320];
+#endif
+} g_fx;
+
+static void fx_put(void **slots, void *p) {
+  if (p == nullptr)
+    return;
+  for (size_t i = 0; i < FX_SLOTS; i++) {
+    if (slots[i] == nullptr) {
+      slots[i] = p;
+      return;
+    }
+  }
+  TEST_FAIL_MESSAGE("fixture slots exhausted");
+}
+
+static void fx_take(void **slots, void *p) {
+  for (size_t i = 0; i < FX_SLOTS; i++) {
+    if (slots[i] == p) {
+      slots[i] = nullptr;
+      return;
+    }
+  }
+}
 
 static void *run_server_fn(void *arg) {
   (void)grpc_server_run((grpc_server *)arg);
   return nullptr;
+}
+
+static fx_server_slot *fx_server_slot_of(const grpc_server *srv) {
+  for (size_t i = 0; i < FX_SLOTS; i++) {
+    if (g_fx.servers[i].srv == srv)
+      return &g_fx.servers[i];
+  }
+  return nullptr;
+}
+
+/* Records a server so tearDown() frees it. Returns it (asserted non-null). */
+static grpc_server *fx_server(grpc_server *srv) {
+  TEST_ASSERT_NOT_NULL(srv);
+  fx_server_slot *slot = fx_server_slot_of(nullptr);
+  TEST_ASSERT_NOT_NULL_MESSAGE(slot, "fixture server slots exhausted");
+  *slot = (fx_server_slot){.srv = srv};
+  return srv;
+}
+
+/* Starts grpc_server_run() on a new thread. Configure the server before calling this. */
+static void fx_start(grpc_server *srv) {
+  fx_server_slot *slot = fx_server_slot_of(srv);
+  TEST_ASSERT_NOT_NULL(slot);
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&slot->th, nullptr, run_server_fn, srv));
+  slot->threaded = true;
+}
+
+/* Stops the server thread and joins it; the server itself stays allocated. */
+static void fx_stop_join(grpc_server *srv) {
+  fx_server_slot *slot = fx_server_slot_of(srv);
+  if (slot == nullptr || !slot->threaded)
+    return;
+  grpc_server_stop(srv);
+  pthread_join(slot->th, nullptr);
+  slot->threaded = false;
+}
+
+static void fx_server_free(grpc_server *srv) {
+  fx_stop_join(srv);
+  fx_server_slot *slot = fx_server_slot_of(srv);
+  if (slot != nullptr)
+    *slot = (fx_server_slot){0};
+  grpc_server_free(srv);
+}
+
+static grpc_client *fx_client(grpc_client *c) {
+  fx_put(g_fx.clients, c);
+  return c;
+}
+
+static void fx_client_free(grpc_client *c) {
+  fx_take(g_fx.clients, c);
+  grpc_client_free(c);
+}
+
+static grpc_client_stream *fx_stream(grpc_client_stream *st) {
+  fx_put(g_fx.streams, st);
+  return st;
+}
+
+static void fx_stream_cancel(grpc_client_stream *st) {
+  fx_take(g_fx.streams, st);
+  grpc_client_stream_cancel(st);
+}
+
+static grpc_err fx_stream_finish(grpc_client_stream *st, grpc_client_response *resp) {
+  fx_take(g_fx.streams, st);
+  return grpc_client_stream_finish(st, resp);
+}
+
+/* grpc_malloc()ed buffer released with grpc_free() */
+static void *fx_mem(void *p) {
+  TEST_ASSERT_NOT_NULL(p);
+  fx_put(g_fx.mem, p);
+  return p;
+}
+
+static void fx_free(void *p) {
+  fx_take(g_fx.mem, p);
+  grpc_free(p);
+}
+
+#ifndef _WIN32
+static const char *fx_tmpdir(void) {
+  if (g_fx.tmpdir[0] == '\0') {
+    const char *base = getenv("TMPDIR");
+    if (base == nullptr || base[0] == '\0' || strlen(base) > 64)
+      base = "/tmp";
+    snprintf(g_fx.tmpdir, sizeof(g_fx.tmpdir), "%s/ezgrpc-integ-XXXXXX", base);
+    if (mkdtemp(g_fx.tmpdir) == nullptr) {
+      g_fx.tmpdir[0] = '\0';
+      TEST_FAIL_MESSAGE("mkdtemp failed");
+    }
+  }
+  return g_fx.tmpdir;
+}
+
+/* Unique path inside this test's temporary directory, removed by tearDown(). */
+static const char *fx_tmp_path(const char *name) {
+  const char *dir = fx_tmpdir();
+  for (size_t i = 0; i < sizeof(g_fx.tmpfiles) / sizeof(g_fx.tmpfiles[0]); i++) {
+    if (g_fx.tmpfiles[i][0] == '\0') {
+      snprintf(g_fx.tmpfiles[i], sizeof(g_fx.tmpfiles[i]), "%s/%s", dir, name);
+      return g_fx.tmpfiles[i];
+    }
+  }
+  TEST_FAIL_MESSAGE("fixture tmp file slots exhausted");
+  return nullptr;
+}
+
+static int fx_fd(int fd) {
+  TEST_ASSERT_TRUE_MESSAGE(fd >= 0, strerror(errno));
+  for (size_t i = 0; i < FX_SLOTS; i++) {
+    if (g_fx.fds[i] == 0) {
+      g_fx.fds[i] = fd + 1;
+      return fd;
+    }
+  }
+  close(fd);
+  TEST_FAIL_MESSAGE("fixture fd slots exhausted");
+  return -1;
+}
+
+static void fx_close(int fd) {
+  for (size_t i = 0; i < FX_SLOTS; i++) {
+    if (g_fx.fds[i] == fd + 1)
+      g_fx.fds[i] = 0;
+  }
+  close(fd);
+}
+
+static void fx_session_del(nghttp2_session *s) {
+  fx_take(g_fx.sessions, s);
+  nghttp2_session_del(s);
+}
+
+/* Thread of a raw (non-library) server blocked in accept()/recv() on listen_fd. */
+static void fx_raw_thread(pthread_t th, int listen_fd) {
+  for (size_t i = 0; i < 2; i++) {
+    if (!g_fx.raw_threads[i].used) {
+      g_fx.raw_threads[i] = (fx_raw_thread_slot){.th = th, .listen_fd = listen_fd, .used = true};
+      return;
+    }
+  }
+  TEST_FAIL_MESSAGE("fixture raw thread slots exhausted");
+}
+
+static void fx_raw_join(pthread_t th) {
+  for (size_t i = 0; i < 2; i++) {
+    if (g_fx.raw_threads[i].used && pthread_equal(g_fx.raw_threads[i].th, th))
+      g_fx.raw_threads[i].used = false;
+  }
+  pthread_join(th, nullptr);
+}
+#endif
+
+/* A log sink for a server, so a test can check what it logged instead of flooding stderr. */
+static FILE *fx_log(void) {
+  for (size_t i = 0; i < sizeof(g_fx.logs) / sizeof(g_fx.logs[0]); i++) {
+    fx_log_slot *slot = &g_fx.logs[i];
+    if (slot->f != nullptr)
+      continue;
+#ifndef _WIN32
+    char name[32];
+    snprintf(name, sizeof(name), "server-%zu.log", i);
+    snprintf(slot->path, sizeof(slot->path), "%s", fx_tmp_path(name));
+    slot->f = fopen(slot->path, "a");
+#else
+    slot->f = tmpfile();
+#endif
+    TEST_ASSERT_NOT_NULL(slot->f);
+    setvbuf(slot->f, nullptr, _IONBF, 0);
+    return slot->f;
+  }
+  TEST_FAIL_MESSAGE("fixture log slots exhausted");
+  return nullptr;
+}
+
+/* True when the server writing to `log` has logged `needle`. Always true on Windows. */
+static bool log_contains(FILE *log, const char *needle) {
+#ifndef _WIN32
+  for (size_t i = 0; i < sizeof(g_fx.logs) / sizeof(g_fx.logs[0]); i++) {
+    if (g_fx.logs[i].f != log)
+      continue;
+    FILE *r = fopen(g_fx.logs[i].path, "rb");
+    if (r == nullptr)
+      return false;
+    static char buf[256 * 1024];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, r);
+    fclose(r);
+    buf[n] = '\0';
+    return strstr(buf, needle) != nullptr;
+  }
+  return false;
+#else
+  (void)log;
+  (void)needle;
+  return true;
+#endif
+}
+
+/* Worker threads answering calls through the *_async API. Joined (not detached) so none can still
+ * be inside grpc_call_unref() when its server is freed. */
+static pthread_mutex_t g_workers_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t g_workers[FX_SLOTS];
+static size_t g_nb_workers;
+
+/* Server thread: takes a call reference and hands it to fn on a new worker thread. */
+static void spawn_call_worker(grpc_call *call, void *(*fn)(void *)) {
+  grpc_call_ref(call);
+  pthread_mutex_lock(&g_workers_mu);
+  bool ok =
+      g_nb_workers < FX_SLOTS && pthread_create(&g_workers[g_nb_workers], nullptr, fn, call) == 0;
+  if (ok)
+    g_nb_workers++;
+  pthread_mutex_unlock(&g_workers_mu);
+  if (!ok) {
+    grpc_call_unref(call);
+    HCHECK(false);
+  }
+}
+
+static void join_call_workers(void) {
+  pthread_t ths[FX_SLOTS];
+  pthread_mutex_lock(&g_workers_mu);
+  size_t n = g_nb_workers;
+  memcpy(ths, g_workers, n * sizeof(ths[0]));
+  g_nb_workers = 0;
+  pthread_mutex_unlock(&g_workers_mu);
+  for (size_t i = 0; i < n; i++)
+    pthread_join(ths[i], nullptr);
+}
+
+static void reset_handler_state(void);
+
+void setUp(void) {
+  atomic_store(&g_handler_fail_line, 0);
+  reset_handler_state();
+}
+
+void tearDown(void) {
+  join_call_workers();
+  for (size_t i = 0; i < FX_SLOTS; i++) {
+    if (g_fx.streams[i] != nullptr)
+      grpc_client_stream_cancel(g_fx.streams[i]);
+  }
+  for (size_t i = 0; i < FX_SLOTS; i++)
+    grpc_client_free(g_fx.clients[i]);
+#ifndef _WIN32
+  for (size_t i = 0; i < FX_SLOTS; i++) {
+    if (g_fx.sessions[i] != nullptr)
+      nghttp2_session_del(g_fx.sessions[i]);
+  }
+  for (size_t i = 0; i < 2; i++) {
+    if (g_fx.raw_threads[i].used) {
+      (void)shutdown(g_fx.raw_threads[i].listen_fd, SHUT_RDWR);
+      pthread_join(g_fx.raw_threads[i].th, nullptr);
+    }
+  }
+  for (size_t i = 0; i < FX_SLOTS; i++) {
+    if (g_fx.fds[i] != 0)
+      close(g_fx.fds[i] - 1);
+  }
+#endif
+  for (size_t i = 0; i < FX_SLOTS; i++) {
+    if (g_fx.servers[i].threaded)
+      grpc_server_stop(g_fx.servers[i].srv);
+  }
+  for (size_t i = 0; i < FX_SLOTS; i++) {
+    if (g_fx.servers[i].threaded)
+      pthread_join(g_fx.servers[i].th, nullptr);
+    if (g_fx.servers[i].srv != nullptr)
+      grpc_server_free(g_fx.servers[i].srv);
+  }
+  for (size_t i = 0; i < FX_SLOTS; i++)
+    grpc_free(g_fx.mem[i]);
+  for (size_t i = 0; i < sizeof(g_fx.logs) / sizeof(g_fx.logs[0]); i++) {
+    if (g_fx.logs[i].f != nullptr)
+      fclose(g_fx.logs[i].f);
+  }
+#ifndef _WIN32
+  for (size_t i = 0; i < sizeof(g_fx.tmpfiles) / sizeof(g_fx.tmpfiles[0]); i++) {
+    if (g_fx.tmpfiles[i][0] != '\0')
+      (void)unlink(g_fx.tmpfiles[i]);
+  }
+  if (g_fx.tmpdir[0] != '\0')
+    (void)rmdir(g_fx.tmpdir);
+#endif
+  memset(&g_fx, 0, sizeof(g_fx));
 }
 
 static bool bearer_validator(const char *token, [[maybe_unused]] void *userdata) {
@@ -26,16 +438,35 @@ static bool bearer_validator(const char *token, [[maybe_unused]] void *userdata)
 
 /* ---- Handlers for comprehensive end-to-end integration tests ---------------- */
 
+/* State written by handlers on the server thread and read by the test thread. */
+static atomic_int g_bp_hit_limit;
+static atomic_int g_bp_writable_fired;
+static atomic_int g_cancel_started;
+static atomic_int g_cancel_hits;
+static atomic_int g_hold_started;
+static atomic_int g_on_done_calls;
+static atomic_int g_cancel_cb_fired;
+
+static void reset_handler_state(void) {
+  atomic_store(&g_bp_hit_limit, 0);
+  atomic_store(&g_bp_writable_fired, 0);
+  atomic_store(&g_cancel_started, 0);
+  atomic_store(&g_cancel_hits, 0);
+  atomic_store(&g_hold_started, 0);
+  atomic_store(&g_on_done_calls, 0);
+  atomic_store(&g_cancel_cb_fired, 0);
+}
+
 static void inspect_metadata_handler(grpc_call *call, const grpc_message *req,
                                      [[maybe_unused]] void *userdata) {
-  TEST_ASSERT_NOT_NULL(grpc_call_request(call));
-  TEST_ASSERT_NOT_NULL(grpc_call_peer(call));
-  TEST_ASSERT_NOT_NULL(grpc_call_server(call));
-  TEST_ASSERT_TRUE(grpc_call_metadata_count(call) >= 4);
+  HCHECK(grpc_call_request(call) != nullptr);
+  HCHECK(grpc_call_peer(call) != nullptr);
+  HCHECK(grpc_call_server(call) != nullptr);
+  HCHECK(grpc_call_metadata_count(call) >= 4);
 
   grpc_metadata first = {0};
-  TEST_ASSERT_TRUE(grpc_call_metadata_at(call, 0, &first));
-  TEST_ASSERT_FALSE(grpc_call_metadata_at(call, 9999, &first));
+  HCHECK(grpc_call_metadata_at(call, 0, &first));
+  HCHECK(!grpc_call_metadata_at(call, 9999, &first));
 
   /* Multi-value metadata iteration */
   size_t idx = 0, len = 0;
@@ -45,24 +476,24 @@ static void inspect_metadata_handler(grpc_call *call, const grpc_message *req,
 
   /* Deadline check + traceparent hex a-f check */
   int64_t rem = grpc_call_deadline(call);
-  TEST_ASSERT_TRUE(rem > 0);
+  HCHECK(rem > 0);
   grpc_trace_context tc = {0};
-  TEST_ASSERT_TRUE(grpc_call_trace_context(call, &tc));
-  TEST_ASSERT_EQUAL_UINT8(0xaf, tc.trace_flags);
+  HCHECK(grpc_call_trace_context(call, &tc));
+  HCHECK(tc.trace_flags == 0xaf);
 
   /* Initial metadata + custom trailer */
   grpc_metadata init_md[] = {{.key = "x-init", .value = "yes"}};
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_call_send_metadata(call, init_md, 1));
+  HCHECK(grpc_call_send_metadata(call, init_md, 1) == GRPC_OK);
   grpc_metadata tr[] = {{.key = "x-tags-seen", .value = tag_count == 2 ? "2" : "0"}};
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_call_add_trailers(call, tr, 1));
+  HCHECK(grpc_call_add_trailers(call, tr, 1) == GRPC_OK);
 
-  /* Test per-call compression override */
-  (void)grpc_call_set_compression(call, GRPC_COMPRESS_DEFLATE, 6);
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_call_send_data(call, req->data, req->len));
+  /* Test per-call compression override (the client accepts deflate) */
+  HCHECK(grpc_call_set_compression(call, GRPC_COMPRESS_DEFLATE, 6) == GRPC_OK);
+  HCHECK(grpc_call_send_data(call, req->data, req->len) == GRPC_OK);
   /* Setting compression or initial metadata after send returns GRPC_ERR_STATE */
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_STATE, grpc_call_set_compression(call, GRPC_COMPRESS_GZIP, -1));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_STATE, grpc_call_send_metadata(call, init_md, 1));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_call_finish(call, GRPC_STATUS_OK, nullptr));
+  HCHECK(grpc_call_set_compression(call, GRPC_COMPRESS_GZIP, -1) == GRPC_ERR_STATE);
+  HCHECK(grpc_call_send_metadata(call, init_md, 1) == GRPC_ERR_STATE);
+  HCHECK(grpc_call_finish(call, GRPC_STATUS_OK, nullptr) == GRPC_OK);
 }
 
 static void rich_error_handler(grpc_call *call, [[maybe_unused]] const grpc_message *req,
@@ -96,12 +527,7 @@ static void *async_worker_ok(void *arg) {
 
 static void async_ok_handler(grpc_call *call, [[maybe_unused]] const grpc_message *req,
                              [[maybe_unused]] void *userdata) {
-  grpc_call_ref(call);
-  pthread_t th;
-  if (pthread_create(&th, nullptr, async_worker_ok, call) == 0)
-    pthread_detach(th);
-  else
-    grpc_call_unref(call);
+  spawn_call_worker(call, async_worker_ok);
 }
 
 static void *async_worker_err(void *arg) {
@@ -120,12 +546,7 @@ static void *async_worker_err(void *arg) {
 
 static void async_err_handler(grpc_call *call, [[maybe_unused]] const grpc_message *req,
                               [[maybe_unused]] void *userdata) {
-  grpc_call_ref(call);
-  pthread_t th;
-  if (pthread_create(&th, nullptr, async_worker_err, call) == 0)
-    pthread_detach(th);
-  else
-    grpc_call_unref(call);
+  spawn_call_worker(call, async_worker_err);
 }
 
 static void on_cancel_cb([[maybe_unused]] grpc_call *c, void *ud) {
@@ -135,6 +556,7 @@ static void on_cancel_cb([[maybe_unused]] grpc_call *c, void *ud) {
 static void slow_cancel_handler(grpc_call *call, [[maybe_unused]] const grpc_message *req,
                                 void *userdata) {
   grpc_call_on_cancel(call, on_cancel_cb, userdata);
+  atomic_store(&g_cancel_started, 1);
 }
 
 static void slow_deadline_handler(grpc_call *call, [[maybe_unused]] const grpc_message *req,
@@ -143,27 +565,25 @@ static void slow_deadline_handler(grpc_call *call, [[maybe_unused]] const grpc_m
   (void)call;
 }
 
-static void writable_cb(grpc_call *call, void *userdata) {
-  int *fired = userdata;
-  *fired = 1;
+static void writable_cb(grpc_call *call, [[maybe_unused]] void *userdata) {
+  atomic_store(&g_bp_writable_fired, 1);
   (void)grpc_call_finish(call, GRPC_STATUS_OK, nullptr);
 }
 
 static void backpressure_handler(grpc_call *call, [[maybe_unused]] const grpc_message *req,
-                                 void *userdata) {
-  int *hit_limit = userdata;
-  grpc_call_on_writable(call, writable_cb, hit_limit + 1);
+                                 [[maybe_unused]] void *userdata) {
+  grpc_call_on_writable(call, writable_cb, nullptr);
   char chunk[4096];
   memset(chunk, 'A', sizeof(chunk));
   for (int i = 0; i < 4; i++) {
     grpc_err err = grpc_call_send_data(call, chunk, sizeof(chunk));
     if (err == GRPC_ERR_LIMIT) {
-      hit_limit[0] = 1;
+      atomic_store(&g_bp_hit_limit, 1);
       break;
     }
   }
-  TEST_ASSERT_TRUE(grpc_call_send_queue_bytes(call) > 0);
-  if (!hit_limit[0])
+  HCHECK(grpc_call_send_queue_bytes(call) > 0);
+  if (!atomic_load(&g_bp_hit_limit))
     (void)grpc_call_finish(call, GRPC_STATUS_OK, nullptr);
 }
 
@@ -193,15 +613,13 @@ static grpc_status reject_send_bad([[maybe_unused]] grpc_call *call, const grpc_
 /* ---- Integration Test 1: Metadata, Async, Rich Errors, Interceptors, Compression ---- */
 
 void test_integration_full_server_and_client(void) {
-  int bp_hit[2] = {0, 0};
-  grpc_server *server = grpc_server_new(&(grpc_config){
+  grpc_server *server = fx_server(grpc_server_new(&(grpc_config){
       .port = 0,
       .ipv4_addr = "127.0.0.1",
       .max_message_size = 256 * 1024,
       .max_send_queue_bytes = 4096,
       .log_level = GRPC_LOG_OFF,
-  });
-  TEST_ASSERT_NOT_NULL(server);
+  }));
 
   TEST_ASSERT_EQUAL_INT(
       GRPC_OK, grpc_server_handle(server, "/int.Svc/Meta", inspect_metadata_handler, nullptr));
@@ -211,13 +629,12 @@ void test_integration_full_server_and_client(void) {
                         grpc_server_handle(server, "/int.Svc/AsyncOk", async_ok_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(
       GRPC_OK, grpc_server_handle(server, "/int.Svc/AsyncErr", async_err_handler, nullptr));
-  atomic_int cancel_hits = 0;
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_handle(server, "/int.Svc/Cancel", slow_cancel_handler,
-                                                    (void *)&cancel_hits));
+                                                    (void *)&g_cancel_hits));
   TEST_ASSERT_EQUAL_INT(
       GRPC_OK, grpc_server_handle(server, "/int.Svc/Deadline", slow_deadline_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_server_handle(server, "/int.Svc/Backpressure", backpressure_handler, bp_hit));
+      GRPC_OK, grpc_server_handle(server, "/int.Svc/Backpressure", backpressure_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(
       GRPC_OK, grpc_server_handle(server, "/int.Svc/LargeEcho", large_echo_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(
@@ -235,18 +652,17 @@ void test_integration_full_server_and_client(void) {
                                                                 .on_send_message = reject_send_bad,
                                                             }));
 
-  pthread_t th;
-  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, server));
+  fx_start(server);
 
   grpc_err err = GRPC_OK;
-  grpc_client *client = grpc_client_new(
+  grpc_client *client = fx_client(grpc_client_new(
       &(grpc_client_config){
           .host = "127.0.0.1",
           .port = grpc_server_port(server),
           .timeout_ms = 5000,
           .compression = GRPC_COMPRESS_GZIP,
       },
-      &err);
+      &err));
   TEST_ASSERT_NOT_NULL(client);
 
   /* 1. Metadata, repeated keys, deadline, initial md, trailers, deflate compression, traceparent a-f */
@@ -258,22 +674,26 @@ void test_integration_full_server_and_client(void) {
   grpc_client_response resp = {0};
   TEST_ASSERT_EQUAL_INT(
       GRPC_OK, grpc_client_unary(client, "/int.Svc/Meta", "payload", 7, md, 3, 3000, &resp));
+  ASSERT_HANDLER_CHECKS();
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   TEST_ASSERT_NOT_NULL(resp.message);
   TEST_ASSERT_EQUAL_MEMORY("payload", resp.message->data, 7);
-  TEST_ASSERT_TRUE(resp.nb_headers > 0);
-  TEST_ASSERT_TRUE(resp.nb_trailers > 0);
+  const char *x_init = md_find(resp.headers, resp.nb_headers, "x-init");
+  TEST_ASSERT_NOT_NULL(x_init);
+  TEST_ASSERT_EQUAL_STRING("yes", x_init);
+  const char *enc = md_find(resp.headers, resp.nb_headers, "grpc-encoding");
+  TEST_ASSERT_NOT_NULL(enc);
+  TEST_ASSERT_EQUAL_STRING("deflate", enc);
+  const char *tags_seen = md_find(resp.trailers, resp.nb_trailers, "x-tags-seen");
+  TEST_ASSERT_NOT_NULL(tags_seen);
+  TEST_ASSERT_EQUAL_STRING("2", tags_seen);
   grpc_client_response_free(&resp);
 
   /* 2. Rich error details + percent-encoded grpc-message */
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_client_unary(client, "/int.Svc/RichErr", "", 0, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_INVALID_ARGUMENT, resp.status);
-  const char *details_b64 = nullptr;
-  for (size_t i = 0; i < resp.nb_trailers; i++) {
-    if (strcmp(resp.trailers[i].key, GRPC_STATUS_DETAILS_TRAILER) == 0)
-      details_b64 = resp.trailers[i].value;
-  }
+  const char *details_b64 = md_find(resp.trailers, resp.nb_trailers, GRPC_STATUS_DETAILS_TRAILER);
   TEST_ASSERT_NOT_NULL(details_b64);
   grpc_status_details decoded = {0};
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_status_details_decode_all(details_b64, &decoded));
@@ -291,6 +711,7 @@ void test_integration_full_server_and_client(void) {
       GRPC_OK, grpc_client_unary(client, "/int.Svc/AsyncErr", "x", 1, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_FAILED_PRECONDITION, resp.status);
   grpc_client_response_free(&resp);
+  join_call_workers();
 
   /* 4. Bearer auth: missing, malformed, wrong token, valid token */
   TEST_ASSERT_EQUAL_INT(
@@ -328,8 +749,7 @@ void test_integration_full_server_and_client(void) {
   grpc_client_response_free(&resp);
 
   /* 6. Large multi-frame message (> 32 KiB) & unknown method (UNIMPLEMENTED) */
-  char *big = malloc(48 * 1024);
-  TEST_ASSERT_NOT_NULL(big);
+  char *big = fx_mem(grpc_malloc(48 * 1024));
   memset(big, 'Z', 48 * 1024);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_unary(client, "/int.Svc/LargeEcho", big, 48 * 1024,
                                                    nullptr, 0, 0, &resp));
@@ -337,7 +757,7 @@ void test_integration_full_server_and_client(void) {
   TEST_ASSERT_NOT_NULL(resp.message);
   TEST_ASSERT_EQUAL_UINT32(48 * 1024, resp.message->len);
   grpc_client_response_free(&resp);
-  free(big);
+  fx_free(big);
 
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_client_unary(client, "/no.Such/Method", "", 0, nullptr, 0, 0, &resp));
@@ -348,8 +768,8 @@ void test_integration_full_server_and_client(void) {
   TEST_ASSERT_EQUAL_INT(
       GRPC_OK, grpc_client_unary(client, "/int.Svc/Backpressure", "", 0, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
-  TEST_ASSERT_EQUAL_INT(1, bp_hit[0]);
-  TEST_ASSERT_EQUAL_INT(1, bp_hit[1]);
+  TEST_ASSERT_EQUAL_INT(1, atomic_load(&g_bp_hit_limit));
+  TEST_ASSERT_EQUAL_INT(1, atomic_load(&g_bp_writable_fired));
   grpc_client_response_free(&resp);
 
   /* 8. Server-side deadline expiration (grpc-timeout: 50m) & client stream cancel */
@@ -360,27 +780,35 @@ void test_integration_full_server_and_client(void) {
   grpc_client_response_free(&resp);
 
   grpc_client_stream *cs_cancel =
-      grpc_client_stream_open(client, "/int.Svc/Cancel", nullptr, 0, 2000, &err);
+      fx_stream(grpc_client_stream_open(client, "/int.Svc/Cancel", nullptr, 0, 2000, &err));
   TEST_ASSERT_NOT_NULL(cs_cancel);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(cs_cancel, "wait", 4));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_close_send(cs_cancel));
-  uv_sleep(20);
-  grpc_client_stream_cancel(cs_cancel);
-  uv_sleep(30);
-  TEST_ASSERT_TRUE(atomic_load(&cancel_hits) >= 1);
+  /* the handler registered its on_cancel callback; now cancel and wait for it to run */
+  ASSERT_EVENTUALLY(atomic_load(&g_cancel_started) == 1);
+  fx_stream_cancel(cs_cancel);
+  ASSERT_EVENTUALLY(atomic_load(&g_cancel_hits) >= 1);
+  TEST_ASSERT_EQUAL_INT(1, atomic_load(&g_cancel_hits));
 
-  grpc_client_free(client);
-  grpc_server_stop(server);
-  pthread_join(th, nullptr);
-  grpc_server_free(server);
+  fx_client_free(client);
+  fx_server_free(server);
+  ASSERT_HANDLER_CHECKS();
 }
 
 /* ---- Integration Test 2: Health Check & Watch + Reflection v1/v1alpha ------- */
 
+/* The first field after the echoed original_request (0x12 <len> <request>) of a reflection
+ * response, or 0 when the message is too short. */
+static uint8_t reflection_reply_field(const grpc_message *m, size_t req_len) {
+  size_t off = 2 + req_len;
+  if (m->len < 2 || m->data[0] != 0x12 || m->data[1] != req_len || m->len <= off)
+    return 0;
+  return m->data[off];
+}
+
 void test_integration_health_watch_and_reflection(void) {
-  grpc_server *server = grpc_server_new(
-      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
-  TEST_ASSERT_NOT_NULL(server);
+  grpc_server *server = fx_server(grpc_server_new(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF}));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_health_enable(server));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_reflection_enable(server));
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
@@ -392,14 +820,13 @@ void test_integration_health_watch_and_reflection(void) {
                                                                      sizeof(fake_fdp)));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_health_set_status(server, "demo.Echo", GRPC_HEALTH_SERVING));
 
-  pthread_t th;
-  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, server));
+  fx_start(server);
 
   grpc_err err = GRPC_OK;
-  grpc_client *client = grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
-                                                              .port = grpc_server_port(server),
-                                                              .timeout_ms = 3000},
-                                        &err);
+  grpc_client *client = fx_client(grpc_client_new(
+      &(grpc_client_config){
+          .host = "127.0.0.1", .port = grpc_server_port(server), .timeout_ms = 3000},
+      &err));
   TEST_ASSERT_NOT_NULL(client);
 
   /* 1. Health Check for "" and "demo.Echo" */
@@ -417,12 +844,13 @@ void test_integration_health_watch_and_reflection(void) {
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_unary(client, GRPC_HEALTH_PATH_CHECK, hreq,
                                                    sizeof(hreq), nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  TEST_ASSERT_NOT_NULL(resp.message);
   TEST_ASSERT_EQUAL_UINT8(GRPC_HEALTH_SERVING, resp.message->data[1]);
   grpc_client_response_free(&resp);
 
   /* 2. Health Watch: receive initial SERVING, update to NOT_SERVING, receive update, cancel */
   grpc_client_stream *watch =
-      grpc_client_stream_open(client, GRPC_HEALTH_PATH_WATCH, nullptr, 0, 3000, &err);
+      fx_stream(grpc_client_stream_open(client, GRPC_HEALTH_PATH_WATCH, nullptr, 0, 3000, &err));
   TEST_ASSERT_NOT_NULL(watch);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(watch, hreq, sizeof(hreq)));
   grpc_message *wmsg = nullptr;
@@ -431,17 +859,18 @@ void test_integration_health_watch_and_reflection(void) {
   TEST_ASSERT_EQUAL_UINT8(GRPC_HEALTH_SERVING, wmsg->data[1]);
   grpc_message_free(wmsg);
 
+  /* grpc_health_set_status() is safe from any thread */
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_health_set_status(server, "demo.Echo", GRPC_HEALTH_NOT_SERVING));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_recv(watch, &wmsg));
   TEST_ASSERT_NOT_NULL(wmsg);
   TEST_ASSERT_EQUAL_UINT8(GRPC_HEALTH_NOT_SERVING, wmsg->data[1]);
   grpc_message_free(wmsg);
-  grpc_client_stream_cancel(watch);
+  fx_stream_cancel(watch);
 
   /* 3. Reflection v1: list_services (field 7), file_by_filename (field 3), file_containing_symbol (field 4) */
   grpc_client_stream *ref =
-      grpc_client_stream_open(client, GRPC_REFLECTION_V1_PATH, nullptr, 0, 3000, &err);
+      fx_stream(grpc_client_stream_open(client, GRPC_REFLECTION_V1_PATH, nullptr, 0, 3000, &err));
   TEST_ASSERT_NOT_NULL(ref);
 
   /* list_services = "" -> tag (7<<3)|2 = 0x3A, len 0 */
@@ -468,29 +897,47 @@ void test_integration_health_watch_and_reflection(void) {
   TEST_ASSERT_TRUE(wmsg->len > 0);
   grpc_message_free(wmsg);
 
-  /* missing symbol -> error_response */
-  const uint8_t req_miss[] = {0x22, 4, 'n', 'o', 'p', 'e'};
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(ref, req_miss, sizeof(req_miss)));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_recv(ref, &wmsg));
-  TEST_ASSERT_NOT_NULL(wmsg);
-  grpc_message_free(wmsg);
+  /* lookups: a key answers itself and the names inside it ("demo.Echo" answers
+   * "demo.Echo.Say"), but not a prefix that is not a name boundary or an empty query; misses get
+   * an error_response. reflection_reply_field() is the field after the echoed request:
+   * 0x22 = file_descriptor_response, 0x3A = error_response. */
+  const struct {
+    const char *symbol;
+    uint8_t expect;
+  } lookups[] = {
+      {"nope", 0x3A}, {"demo.Echo.Say", 0x22}, {"demo", 0x3A}, {"demo.Ech", 0x3A},
+      {"", 0x3A},     {"demo.EchoX", 0x3A},
+  };
+  for (size_t i = 0; i < sizeof(lookups) / sizeof(lookups[0]); i++) {
+    uint8_t req[64];
+    size_t slen = strlen(lookups[i].symbol);
+    req[0] = 0x22; /* file_containing_symbol */
+    req[1] = (uint8_t)slen;
+    memcpy(req + 2, lookups[i].symbol, slen);
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(ref, req, slen + 2));
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_recv(ref, &wmsg));
+    TEST_ASSERT_NOT_NULL(wmsg);
+    TEST_ASSERT_EQUAL_HEX8_MESSAGE(lookups[i].expect, reflection_reply_field(wmsg, slen + 2),
+                                   lookups[i].symbol);
+    grpc_message_free(wmsg);
+  }
 
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_finish(ref, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, fx_stream_finish(ref, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   grpc_client_response_free(&resp);
 
-  grpc_client_free(client);
-  grpc_server_stop(server);
-  pthread_join(th, nullptr);
-  grpc_server_free(server);
+  fx_client_free(client);
+  fx_server_free(server);
 }
 
 /* ---- Integration Test 3: Poll-driven events, Keepalive/Idle, Max Conns ------ */
 
 typedef struct poll_client_arg {
   uint16_t port;
-  int ok;
+  atomic_int ok;
 } poll_client_arg;
+
+static poll_client_arg g_poll_carg;
 
 static void *run_poll_client(void *arg) {
   poll_client_arg *a = arg;
@@ -502,15 +949,36 @@ static void *run_poll_client(void *arg) {
   grpc_client_response resp = {0};
   if (grpc_client_unary(c, "/poll.Svc/Echo", "ev", 2, nullptr, 0, 0, &resp) == GRPC_OK &&
       resp.status == GRPC_STATUS_OK && resp.message != nullptr && resp.message->len == 2) {
-    a->ok = 1;
+    atomic_store(&a->ok, 1);
   }
   grpc_client_response_free(&resp);
   grpc_client_free(c);
   return nullptr;
 }
 
+#ifndef _WIN32
+/* Plain TCP connection to 127.0.0.1:port (asserted). */
+static int raw_connect4(uint16_t port) {
+  int fd = fx_fd(socket(AF_INET, SOCK_STREAM, 0));
+  struct sockaddr_in sin = {0};
+  sin.sin_family = AF_INET;
+  sin.sin_port = htons(port);
+  inet_pton(AF_INET, "127.0.0.1", &sin.sin_addr);
+  TEST_ASSERT_EQUAL_INT_MESSAGE(0, connect(fd, (struct sockaddr *)&sin, sizeof(sin)),
+                                strerror(errno));
+  return fd;
+}
+
+/* True once the peer closed the connection (EOF or reset), without blocking. */
+static bool fd_peer_closed(int fd) {
+  char b;
+  ssize_t n = recv(fd, &b, 1, MSG_DONTWAIT);
+  return n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR);
+}
+#endif
+
 void test_integration_poll_events_and_maintenance(void) {
-  grpc_server *server = grpc_server_new(&(grpc_config){
+  grpc_server *server = fx_server(grpc_server_new(&(grpc_config){
       .port = 0,
       .ipv4_addr = "127.0.0.1",
       .max_connections = 2,
@@ -518,13 +986,13 @@ void test_integration_poll_events_and_maintenance(void) {
       .keepalive_timeout_ms = 500,
       .max_connection_idle_ms = 120,
       .log_level = GRPC_LOG_OFF,
-  });
-  TEST_ASSERT_NOT_NULL(server);
+  }));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_register_path(server, "/poll.Svc/Echo", nullptr));
 
-  poll_client_arg carg = {.port = grpc_server_port(server), .ok = 0};
+  g_poll_carg.port = grpc_server_port(server);
+  atomic_store(&g_poll_carg.ok, 0);
   pthread_t th;
-  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_poll_client, &carg));
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_poll_client, &g_poll_carg));
 
   int replied = 0;
   for (int iter = 0; iter < 50 && !replied; iter++) {
@@ -543,35 +1011,48 @@ void test_integration_poll_events_and_maintenance(void) {
   }
   pthread_join(th, nullptr);
   TEST_ASSERT_EQUAL_INT(1, replied);
-  TEST_ASSERT_EQUAL_INT(1, carg.ok);
+  TEST_ASSERT_EQUAL_INT(1, atomic_load(&g_poll_carg.ok));
 
-  /* Exercise maintenance timer tick with an active idle client (PING + GOAWAY + close) */
+  /* Let the server see the poll client's close, so both slots are free again */
+  ASSERT_POLL_EVENTUALLY(server, srv_stats(server).active_connections == 0);
+
+  /* Fill max_connections=2 with two idle clients */
   grpc_err cerr = GRPC_OK;
-  grpc_client *idle_c = grpc_client_new(
-      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(server)}, &cerr);
+  grpc_client *idle_c = fx_client(grpc_client_new(
+      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(server)}, &cerr));
   TEST_ASSERT_NOT_NULL(idle_c);
-  /* Open a 2nd & 3rd client to hit max_connections=2 rejection */
-  grpc_client *c2 = grpc_client_new(
-      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(server)}, &cerr);
-  grpc_client *c3 = grpc_client_new(
-      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(server)}, &cerr);
+  grpc_client *c2 = fx_client(grpc_client_new(
+      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(server)}, &cerr));
+  TEST_ASSERT_NOT_NULL(c2);
+  ASSERT_POLL_EVENTUALLY(server, srv_stats(server).active_connections == 2);
+  uint64_t total_before = srv_stats(server).total_connections;
+
+#ifndef _WIN32
+  /* A 3rd connection is accepted and closed at once (reject_connection), never counted */
+  int c3 = raw_connect4(grpc_server_port(server));
+  ASSERT_POLL_EVENTUALLY(server, fd_peer_closed(c3));
+  TEST_ASSERT_EQUAL_UINT64(total_before, srv_stats(server).total_connections);
+  fx_close(c3);
+#else
+  grpc_client *c3 = fx_client(grpc_client_new(
+      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(server)}, &cerr));
   for (int i = 0; i < 6; i++)
     (void)grpc_server_poll(server, 60);
-  grpc_client_free(c3);
-  grpc_client_free(c2);
-  grpc_client_free(idle_c);
+  TEST_ASSERT_EQUAL_UINT64(total_before, srv_stats(server).total_connections);
+  fx_client_free(c3);
+#endif
+
+  /* Maintenance timer (250 ms tick): idle clients never answer the keepalive PING and have no
+   * streams, so the server sends GOAWAY and then closes both connections */
+  ASSERT_POLL_EVENTUALLY(server, srv_stats(server).active_connections == 0);
+  fx_client_free(c2);
+  fx_client_free(idle_c);
 
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_drain(server, 100));
-  grpc_server_free(server);
+  fx_server_free(server);
 }
 
 /* ---- Integration Test 4: gRPC-Web, gRPC-Web-Text, CORS OPTIONS, 415, IPv6 --- */
-
-typedef struct raw_h2_buf {
-  uint8_t *data;
-  size_t len;
-  size_t cap;
-} raw_h2_buf;
 
 #ifndef _WIN32
 static void raw_h2_send_all(int fd, const uint8_t *data, size_t len) {
@@ -625,125 +1106,359 @@ static ssize_t raw_h2_chunked_read_cb([[maybe_unused]] nghttp2_session *s,
   return (ssize_t)n;
 }
 
-static int raw_h2_on_frame([[maybe_unused]] nghttp2_session *s, const nghttp2_frame *f, void *ud) {
-  int *done = ud;
-  if (f->hd.stream_id > 0 &&
-      ((f->hd.flags & NGHTTP2_FLAG_END_STREAM) || f->hd.type == NGHTTP2_RST_STREAM))
-    (*done)++;
+/* What a raw HTTP/2 client session received, per stream and per connection. */
+typedef struct h2_stream_rec {
+  int32_t sid;
+  int http_status; /* :status, 0 when none */
+  int grpc_status; /* grpc-status in a HEADERS frame, -1 when none */
+  char grpc_encoding[16];
+  bool closed;
+  bool rst;
+  uint32_t rst_code;
+  size_t body_total;
+  uint8_t body[1024]; /* first bytes of the response body */
+  size_t body_len;
+} h2_stream_rec;
+
+typedef struct h2_rec {
+  h2_stream_rec streams[20];
+  size_t nb_streams;
+  size_t nb_closed;
+  int goaways;
+  uint32_t goaway_code;
+  int ping_acks;
+} h2_rec;
+
+static h2_stream_rec *h2_rec_find(h2_rec *r, int32_t sid) {
+  for (size_t i = 0; i < r->nb_streams; i++) {
+    if (r->streams[i].sid == sid)
+      return &r->streams[i];
+  }
+  return nullptr;
+}
+
+/* Registers a submitted request so its response is recorded. */
+static int32_t h2_track(h2_rec *r, int32_t sid) {
+  TEST_ASSERT_TRUE_MESSAGE(sid > 0, "nghttp2_submit_request failed");
+  TEST_ASSERT_TRUE(r->nb_streams < sizeof(r->streams) / sizeof(r->streams[0]));
+  r->streams[r->nb_streams++] = (h2_stream_rec){.sid = sid, .grpc_status = -1};
+  return sid;
+}
+
+static int h2_rec_on_header([[maybe_unused]] nghttp2_session *s, const nghttp2_frame *f,
+                            const uint8_t *name, size_t namelen, const uint8_t *value,
+                            size_t valuelen, [[maybe_unused]] uint8_t flags, void *ud) {
+  h2_stream_rec *st = h2_rec_find(ud, f->hd.stream_id);
+  if (f->hd.type != NGHTTP2_HEADERS || st == nullptr)
+    return 0;
+  char v[32];
+  size_t vl = valuelen < sizeof(v) - 1 ? valuelen : sizeof(v) - 1;
+  memcpy(v, value, vl);
+  v[vl] = '\0';
+  if (namelen == 7 && memcmp(name, ":status", 7) == 0)
+    st->http_status = atoi(v);
+  else if (namelen == 11 && memcmp(name, "grpc-status", 11) == 0)
+    st->grpc_status = atoi(v);
+  else if (namelen == 13 && memcmp(name, "grpc-encoding", 13) == 0) {
+    size_t el = vl < sizeof(st->grpc_encoding) - 1 ? vl : sizeof(st->grpc_encoding) - 1;
+    memcpy(st->grpc_encoding, v, el);
+    st->grpc_encoding[el] = '\0';
+  }
   return 0;
 }
+
+static int h2_rec_on_data([[maybe_unused]] nghttp2_session *s, [[maybe_unused]] uint8_t flags,
+                          int32_t sid, const uint8_t *data, size_t len, void *ud) {
+  h2_stream_rec *st = h2_rec_find(ud, sid);
+  if (st == nullptr)
+    return 0;
+  st->body_total += len;
+  size_t room = sizeof(st->body) - st->body_len;
+  size_t n = len < room ? len : room;
+  memcpy(st->body + st->body_len, data, n);
+  st->body_len += n;
+  return 0;
+}
+
+static int h2_rec_on_frame([[maybe_unused]] nghttp2_session *s, const nghttp2_frame *f, void *ud) {
+  h2_rec *r = ud;
+  if (f->hd.type == NGHTTP2_RST_STREAM) {
+    h2_stream_rec *st = h2_rec_find(r, f->hd.stream_id);
+    if (st != nullptr) {
+      st->rst = true;
+      st->rst_code = f->rst_stream.error_code;
+    }
+  } else if (f->hd.type == NGHTTP2_GOAWAY) {
+    r->goaways++;
+    r->goaway_code = f->goaway.error_code;
+  } else if (f->hd.type == NGHTTP2_PING && (f->hd.flags & NGHTTP2_FLAG_ACK)) {
+    r->ping_acks++;
+  }
+  return 0;
+}
+
+static int h2_rec_on_close([[maybe_unused]] nghttp2_session *s, int32_t sid,
+                           [[maybe_unused]] uint32_t error_code, void *ud) {
+  h2_rec *r = ud;
+  h2_stream_rec *st = h2_rec_find(r, sid);
+  if (st != nullptr && !st->closed) {
+    st->closed = true;
+    r->nb_closed++;
+  }
+  return 0;
+}
+
+/* Client session recording into r, tracked by the fixture. */
+static nghttp2_session *h2_client_session(h2_rec *r) {
+  nghttp2_session_callbacks *cbs = nullptr;
+  TEST_ASSERT_EQUAL_INT(0, nghttp2_session_callbacks_new(&cbs));
+  nghttp2_session_callbacks_set_on_header_callback(cbs, h2_rec_on_header);
+  nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, h2_rec_on_data);
+  nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, h2_rec_on_frame);
+  nghttp2_session_callbacks_set_on_stream_close_callback(cbs, h2_rec_on_close);
+  nghttp2_session *sess = nullptr;
+  int rc = nghttp2_session_client_new(&sess, cbs, r);
+  nghttp2_session_callbacks_del(cbs);
+  TEST_ASSERT_EQUAL_INT(0, rc);
+  fx_put(g_fx.sessions, sess);
+  return sess;
+}
+
+static void h2_flush(nghttp2_session *sess, int fd) {
+  for (;;) {
+    const uint8_t *out;
+    ssize_t n = nghttp2_session_mem_send(sess, &out);
+    if (n <= 0)
+      break;
+    raw_h2_send_all(fd, out, (size_t)n);
+  }
+}
+
+/* Feeds what arrives within timeout_ms to the session and flushes its replies. Returns false
+ * once the connection is closed. */
+static bool h2_pump(nghttp2_session *sess, int fd, int timeout_ms) {
+  struct pollfd pfd = {.fd = fd, .events = POLLIN};
+  int pr = poll(&pfd, 1, timeout_ms);
+  if (pr <= 0)
+    return pr == 0 || errno == EINTR;
+  uint8_t buf[32768];
+  ssize_t n = recv(fd, buf, sizeof(buf), 0);
+  if (n < 0)
+    return errno == EINTR || errno == EAGAIN;
+  if (n == 0 || nghttp2_session_mem_recv(sess, buf, (size_t)n) < 0)
+    return false;
+  h2_flush(sess, fd);
+  return true;
+}
+
+#define H2_PUMP_UNTIL(sess, fd, cond, ms)                                \
+  do {                                                                   \
+    const uint64_t hp_end_ = now_ms() + (ms);                            \
+    while (!(cond) && now_ms() < hp_end_ && h2_pump((sess), (fd), 10)) { \
+    }                                                                    \
+  } while (0)
+
+/* The gRPC-Web response body as frames: base64 chunks (each padded) decoded for -text. */
+static size_t web_body_decode(const h2_stream_rec *st, bool text, uint8_t *out, size_t cap) {
+  if (!text) {
+    size_t n = st->body_len < cap ? st->body_len : cap;
+    memcpy(out, st->body, n);
+    return n;
+  }
+  size_t len = 0, seg = 0;
+  for (size_t i = 0; i + 4 <= st->body_len || seg < st->body_len; i += 4) {
+    bool end = i + 4 >= st->body_len || memchr(st->body + i, '=', 4) != nullptr;
+    if (!end)
+      continue;
+    size_t seg_end = i + 4 < st->body_len ? i + 4 : st->body_len;
+    size_t dl = 0;
+    uint8_t *dec = grpc_metadata_decode_bin((const char *)st->body + seg, seg_end - seg, &dl);
+    if (dec != nullptr) {
+      size_t n = dl < cap - len ? dl : cap - len;
+      memcpy(out + len, dec, n);
+      len += n;
+      grpc_free(dec);
+    }
+    seg = seg_end;
+  }
+  return len;
+}
+
+/* grpc-status from a gRPC-Web trailer frame (flag 0x80) in the body, or -1. When msg is given,
+ * the first data frame must equal it. */
+static int web_grpc_status(const h2_stream_rec *st, bool text, const char *msg) {
+  uint8_t buf[1024];
+  size_t len = web_body_decode(st, text, buf, sizeof(buf));
+  bool msg_ok = msg == nullptr;
+  size_t off = 0;
+  while (off + 5 <= len) {
+    uint8_t flag = buf[off];
+    uint32_t mlen = ((uint32_t)buf[off + 1] << 24) | ((uint32_t)buf[off + 2] << 16) |
+                    ((uint32_t)buf[off + 3] << 8) | buf[off + 4];
+    if (mlen > len - off - 5)
+      break;
+    const char *payload = (const char *)buf + off + 5;
+    if (flag & 0x80) {
+      static const char key[] = "grpc-status:";
+      for (size_t i = 0; i + sizeof(key) - 1 <= mlen; i++) {
+        if (memcmp(payload + i, key, sizeof(key) - 1) == 0) {
+          size_t j = i + sizeof(key) - 1;
+          while (j < mlen && payload[j] == ' ')
+            j++;
+          int v = 0;
+          bool any = false;
+          while (j < mlen && payload[j] >= '0' && payload[j] <= '9') {
+            v = v * 10 + (payload[j++] - '0');
+            any = true;
+          }
+          return any && msg_ok ? v : -1;
+        }
+      }
+      return -1;
+    }
+    if (!msg_ok && mlen == strlen(msg) && memcmp(payload, msg, mlen) == 0)
+      msg_ok = true;
+    off += 5 + mlen;
+  }
+  return -1;
+}
+
+static const h2_stream_rec *h2_get(h2_rec *r, int32_t sid) {
+  const h2_stream_rec *st = h2_rec_find(r, sid);
+  TEST_ASSERT_NOT_NULL(st);
+  TEST_ASSERT_TRUE_MESSAGE(st->closed, "stream not closed");
+  return st;
+}
+
+/* Answered with a complete gRPC response (HTTP 200, no reset) whose grpc-status is `status`. */
+static void assert_grpc_stream(h2_rec *r, int32_t sid, int status) {
+  const h2_stream_rec *st = h2_get(r, sid);
+  TEST_ASSERT_FALSE(st->rst);
+  TEST_ASSERT_EQUAL_INT(200, st->http_status);
+  TEST_ASSERT_EQUAL_INT(status, st->grpc_status);
+}
+
+/* Same for gRPC-Web, whose status travels in the body. */
+static void assert_web_stream(h2_rec *r, int32_t sid, bool text, int status, const char *msg) {
+  const h2_stream_rec *st = h2_get(r, sid);
+  TEST_ASSERT_FALSE(st->rst);
+  TEST_ASSERT_EQUAL_INT(200, st->http_status);
+  TEST_ASSERT_EQUAL_INT(status, web_grpc_status(st, text, msg));
+}
+
+#define NV(n, v) \
+  {(uint8_t *)(n), (uint8_t *)(v), sizeof(n) - 1, sizeof(v) - 1, NGHTTP2_NV_FLAG_NONE}
+
+static h2_rec g_raw_rec;
 #endif
 
 static void run_raw_h2_requests(uint16_t port) {
 #ifndef _WIN32
-  int fd = socket(AF_INET6, SOCK_STREAM, 0);
-  if (fd < 0)
-    return;
+  int fd = fx_fd(socket(AF_INET6, SOCK_STREAM, 0));
   struct sockaddr_in6 sin6 = {0};
   sin6.sin6_family = AF_INET6;
   sin6.sin6_port = htons(port);
   inet_pton(AF_INET6, "::1", &sin6.sin6_addr);
-  if (connect(fd, (struct sockaddr *)&sin6, sizeof(sin6)) != 0) {
-    close(fd);
-    return;
-  }
+  TEST_ASSERT_EQUAL_INT_MESSAGE(0, connect(fd, (struct sockaddr *)&sin6, sizeof(sin6)),
+                                strerror(errno));
 
-  int streams_done = 0;
-  nghttp2_session_callbacks *cbs = nullptr;
-  nghttp2_session_callbacks_new(&cbs);
-  nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, raw_h2_on_frame);
-  nghttp2_session *sess = nullptr;
-  nghttp2_session_client_new(&sess, cbs, &streams_done);
-  nghttp2_session_callbacks_del(cbs);
+  h2_rec *rec = &g_raw_rec;
+  memset(rec, 0, sizeof(*rec));
+  nghttp2_session *sess = h2_client_session(rec);
   nghttp2_submit_settings(sess, NGHTTP2_FLAG_NONE, nullptr, 0);
 
   /* 1. CORS OPTIONS preflight */
   nghttp2_nv opt_hdrs[] = {
-      {(uint8_t *)":method", (uint8_t *)"OPTIONS", 7, 7, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":scheme", (uint8_t *)"http", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":path", (uint8_t *)"/web.Svc/Echo", 5, 13, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
+      NV(":method", "OPTIONS"),
+      NV(":scheme", "http"),
+      NV(":path", "/web.Svc/Echo"),
+      NV(":authority", "localhost"),
   };
-  nghttp2_submit_request(sess, nullptr, opt_hdrs, 4, nullptr, nullptr);
+  int32_t s_opt =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, opt_hdrs, 4, nullptr, nullptr));
 
   /* 2. Unsupported content-type (415) */
   nghttp2_nv bad_ct[] = {
-      {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":scheme", (uint8_t *)"http", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":path", (uint8_t *)"/web.Svc/Echo", 5, 13, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"content-type", (uint8_t *)"text/plain", 12, 10, NGHTTP2_NV_FLAG_NONE},
+      NV(":method", "POST"),
+      NV(":scheme", "http"),
+      NV(":path", "/web.Svc/Echo"),
+      NV(":authority", "localhost"),
+      NV("content-type", "text/plain"),
   };
-  nghttp2_submit_request(sess, nullptr, bad_ct, 5, nullptr, nullptr);
+  int32_t s_415 = h2_track(rec, nghttp2_submit_request(sess, nullptr, bad_ct, 5, nullptr, nullptr));
 
   /* 3. gRPC-Web binary request */
   const uint8_t web_frame[] = {0x00, 0x00, 0x00, 0x00, 0x02, 'h', 'i'};
   raw_h2_payload p_web = {.data = web_frame, .len = sizeof(web_frame), .off = 0};
   nghttp2_data_provider dp_web = {.source.ptr = &p_web, .read_callback = raw_h2_read_cb};
   nghttp2_nv web_hdrs[] = {
-      {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":scheme", (uint8_t *)"http", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":path", (uint8_t *)"/web.Svc/Echo", 5, 13, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"content-type", (uint8_t *)"application/grpc-web+proto", 12, 26,
-       NGHTTP2_NV_FLAG_NONE},
+      NV(":method", "POST"),
+      NV(":scheme", "http"),
+      NV(":path", "/web.Svc/Echo"),
+      NV(":authority", "localhost"),
+      NV("content-type", "application/grpc-web+proto"),
   };
-  nghttp2_submit_request(sess, nullptr, web_hdrs, 5, &dp_web, nullptr);
+  int32_t s_web =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, web_hdrs, 5, &dp_web, nullptr));
 
   /* 4. gRPC-Web-Text (Base64) request */
   size_t b64_len = 0;
-  char *b64 = grpc_metadata_encode_bin(web_frame, sizeof(web_frame), &b64_len);
+  char *b64 = fx_mem(grpc_metadata_encode_bin(web_frame, sizeof(web_frame), &b64_len));
   raw_h2_payload p_txt = {.data = (const uint8_t *)b64, .len = b64_len, .off = 0};
   nghttp2_data_provider dp_txt = {.source.ptr = &p_txt, .read_callback = raw_h2_read_cb};
   nghttp2_nv txt_hdrs[] = {
-      {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":scheme", (uint8_t *)"http", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":path", (uint8_t *)"/web.Svc/Echo", 5, 13, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"content-type", (uint8_t *)"application/grpc-web-text", 12, 25,
-       NGHTTP2_NV_FLAG_NONE},
+      NV(":method", "POST"),
+      NV(":scheme", "http"),
+      NV(":path", "/web.Svc/Echo"),
+      NV(":authority", "localhost"),
+      NV("content-type", "application/grpc-web-text"),
   };
-  nghttp2_submit_request(sess, nullptr, txt_hdrs, 5, &dp_txt, nullptr);
+  int32_t s_txt =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, txt_hdrs, 5, &dp_txt, nullptr));
 
   /* 5. gRPC-Web trailers-only (handler calls finish without send) */
   raw_h2_payload p_nobody = {.data = web_frame, .len = sizeof(web_frame), .off = 0};
   nghttp2_data_provider dp_nobody = {.source.ptr = &p_nobody, .read_callback = raw_h2_read_cb};
   nghttp2_nv nobody_hdrs[] = {
-      {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":scheme", (uint8_t *)"http", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":path", (uint8_t *)"/web.Svc/NoBody", 5, 15, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"content-type", (uint8_t *)"application/grpc-web", 12, 20, NGHTTP2_NV_FLAG_NONE},
+      NV(":method", "POST"),
+      NV(":scheme", "http"),
+      NV(":path", "/web.Svc/NoBody"),
+      NV(":authority", "localhost"),
+      NV("content-type", "application/grpc-web"),
   };
-  nghttp2_submit_request(sess, nullptr, nobody_hdrs, 5, &dp_nobody, nullptr);
+  int32_t s_nobody =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, nobody_hdrs, 5, &dp_nobody, nullptr));
 
   /* 6. gRPC-Web-Text invalid base64 -> INVALID_ARGUMENT */
   const uint8_t bad_b64[] = "!!!not-base64!!!";
   raw_h2_payload p_badb64 = {.data = bad_b64, .len = sizeof(bad_b64) - 1, .off = 0};
   nghttp2_data_provider dp_badb64 = {.source.ptr = &p_badb64, .read_callback = raw_h2_read_cb};
-  nghttp2_submit_request(sess, nullptr, txt_hdrs, 5, &dp_badb64, nullptr);
+  int32_t s_badb64 =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, txt_hdrs, 5, &dp_badb64, nullptr));
 
   /* 7. gRPC-Web-Text truncated message -> DATA_LOSS */
   const uint8_t trunc_frame[] = {0x00, 0x00, 0x00, 0x00, 0x10, 'a'};
   size_t tb64_len = 0;
-  char *tb64 = grpc_metadata_encode_bin(trunc_frame, sizeof(trunc_frame), &tb64_len);
+  char *tb64 = fx_mem(grpc_metadata_encode_bin(trunc_frame, sizeof(trunc_frame), &tb64_len));
   raw_h2_payload p_tb64 = {.data = (const uint8_t *)tb64, .len = tb64_len, .off = 0};
   nghttp2_data_provider dp_tb64 = {.source.ptr = &p_tb64, .read_callback = raw_h2_read_cb};
-  nghttp2_submit_request(sess, nullptr, txt_hdrs, 5, &dp_tb64, nullptr);
+  int32_t s_tb64 =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, txt_hdrs, 5, &dp_tb64, nullptr));
 
   /* 8. Raw gRPC truncated message + grpc-encoding: identity -> DATA_LOSS */
   raw_h2_payload p_trunc = {.data = trunc_frame, .len = sizeof(trunc_frame), .off = 0};
   nghttp2_data_provider dp_trunc = {.source.ptr = &p_trunc, .read_callback = raw_h2_read_cb};
   nghttp2_nv id_hdrs[] = {
-      {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":scheme", (uint8_t *)"http", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":path", (uint8_t *)"/web.Svc/Echo", 5, 13, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"te", (uint8_t *)"trailers", 2, 8, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"grpc-encoding", (uint8_t *)"identity", 13, 8, NGHTTP2_NV_FLAG_NONE},
+      NV(":method", "POST"),
+      NV(":scheme", "http"),
+      NV(":path", "/web.Svc/Echo"),
+      NV(":authority", "localhost"),
+      NV("content-type", "application/grpc"),
+      NV("te", "trailers"),
+      NV("grpc-encoding", "identity"),
   };
-  nghttp2_submit_request(sess, nullptr, id_hdrs, 7, &dp_trunc, nullptr);
+  int32_t s_trunc =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, id_hdrs, 7, &dp_trunc, nullptr));
 
   /* 9 & 10. Oversized gzip-compressed message (both gRPC and gRPC-Web-Text) -> RESOURCE_EXHAUSTED */
   char big_plain[2048];
@@ -753,73 +1468,77 @@ static void run_raw_h2_requests(uint16_t port) {
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_compress(GRPC_COMPRESS_GZIP, GRPC_COMPRESSION_LEVEL_DEFAULT,
                                       (const uint8_t *)big_plain, sizeof(big_plain), &zbuf, &zlen));
-  uint8_t *zframe = grpc_malloc(5 + zlen);
-  TEST_ASSERT_NOT_NULL(zframe);
+  fx_mem(zbuf);
+  uint8_t *zframe = fx_mem(grpc_malloc(5 + zlen));
   zframe[0] = 0x01;
   uint32_t zlen_be = htonl((uint32_t)zlen);
   memcpy(zframe + 1, &zlen_be, 4);
   memcpy(zframe + 5, zbuf, zlen);
-  grpc_free(zbuf);
+  fx_free(zbuf);
 
   raw_h2_payload p_zraw = {.data = zframe, .len = 5 + zlen, .off = 0};
   nghttp2_data_provider dp_zraw = {.source.ptr = &p_zraw, .read_callback = raw_h2_read_cb};
   nghttp2_nv gz_hdrs[] = {
-      {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":scheme", (uint8_t *)"http", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":path", (uint8_t *)"/web.Svc/Echo", 5, 13, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"te", (uint8_t *)"trailers", 2, 8, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"grpc-encoding", (uint8_t *)"gzip", 13, 4, NGHTTP2_NV_FLAG_NONE},
+      NV(":method", "POST"),
+      NV(":scheme", "http"),
+      NV(":path", "/web.Svc/Echo"),
+      NV(":authority", "localhost"),
+      NV("content-type", "application/grpc"),
+      NV("te", "trailers"),
+      NV("grpc-encoding", "gzip"),
   };
-  nghttp2_submit_request(sess, nullptr, gz_hdrs, 7, &dp_zraw, nullptr);
+  int32_t s_zraw =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, gz_hdrs, 7, &dp_zraw, nullptr));
 
   size_t zb64_len = 0;
-  char *zb64 = grpc_metadata_encode_bin(zframe, 5 + zlen, &zb64_len);
+  char *zb64 = fx_mem(grpc_metadata_encode_bin(zframe, 5 + zlen, &zb64_len));
   raw_h2_payload p_zb64 = {.data = (const uint8_t *)zb64, .len = zb64_len, .off = 0};
   nghttp2_data_provider dp_zb64 = {.source.ptr = &p_zb64, .read_callback = raw_h2_read_cb};
   nghttp2_nv gz_txt_hdrs[] = {
-      {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":scheme", (uint8_t *)"http", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":path", (uint8_t *)"/web.Svc/Echo", 5, 13, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"content-type", (uint8_t *)"application/grpc-web-text", 12, 25,
-       NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"grpc-encoding", (uint8_t *)"gzip", 13, 4, NGHTTP2_NV_FLAG_NONE},
+      NV(":method", "POST"),
+      NV(":scheme", "http"),
+      NV(":path", "/web.Svc/Echo"),
+      NV(":authority", "localhost"),
+      NV("content-type", "application/grpc-web-text"),
+      NV("grpc-encoding", "gzip"),
   };
-  nghttp2_submit_request(sess, nullptr, gz_txt_hdrs, 6, &dp_zb64, nullptr);
+  int32_t s_zb64 =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, gz_txt_hdrs, 6, &dp_zb64, nullptr));
 
-  /* 10b. grpc-accept-encoding with trailing space not matching server's gzip */
+  /* 10b. grpc-accept-encoding with a space-padded token list not naming the server's gzip (a
+   * trailing space at the end of the value would make nghttp2 reset the stream as malformed) */
   const uint8_t gz_req_frame[] = {0x00, 0x00, 0x00, 0x00, 0x04, 'g', 'z', 'i', 'p'};
   raw_h2_payload p_ae = {.data = gz_req_frame, .len = sizeof(gz_req_frame), .off = 0};
   nghttp2_data_provider dp_ae = {.source.ptr = &p_ae, .read_callback = raw_h2_read_cb};
   nghttp2_nv ae_hdrs[] = {
-      {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":scheme", (uint8_t *)"http", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":path", (uint8_t *)"/web.Svc/Codec", 5, 14, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"te", (uint8_t *)"trailers", 2, 8, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"grpc-accept-encoding", (uint8_t *)"deflate ", 20, 8, NGHTTP2_NV_FLAG_NONE},
+      NV(":method", "POST"),
+      NV(":scheme", "http"),
+      NV(":path", "/web.Svc/Codec"),
+      NV(":authority", "localhost"),
+      NV("content-type", "application/grpc"),
+      NV("te", "trailers"),
+      NV("grpc-accept-encoding", "deflate , identity"),
   };
-  nghttp2_submit_request(sess, nullptr, ae_hdrs, 7, &dp_ae, nullptr);
+  int32_t s_ae = h2_track(rec, nghttp2_submit_request(sess, nullptr, ae_hdrs, 7, &dp_ae, nullptr));
 
   /* 10c. Headers-only END_STREAM (no DATA) on valid gRPC path -> half_closed + call_queue */
   nghttp2_nv empty_hdrs[] = {
-      {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":scheme", (uint8_t *)"http", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":path", (uint8_t *)"/web.Svc/NoBody", 5, 15, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"te", (uint8_t *)"trailers", 2, 8, NGHTTP2_NV_FLAG_NONE},
+      NV(":method", "POST"),
+      NV(":scheme", "http"),
+      NV(":path", "/web.Svc/NoBody"),
+      NV(":authority", "localhost"),
+      NV("content-type", "application/grpc"),
+      NV("te", "trailers"),
   };
-  nghttp2_submit_request(sess, nullptr, empty_hdrs, 6, nullptr, nullptr);
+  int32_t s_empty =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, empty_hdrs, 6, nullptr, nullptr));
 
   /* 10d. Invalid compressed payload (cflag=1, bad gzip) + trailing 2 bytes after msg (L27, L56) */
   const uint8_t bad_gz_frame[] = {0x01, 0x00, 0x00, 0x00, 0x03, 'b', 'a', 'd', 0x00, 0x00};
   raw_h2_payload p_bgz = {.data = bad_gz_frame, .len = sizeof(bad_gz_frame), .off = 0};
   nghttp2_data_provider dp_bgz = {.source.ptr = &p_bgz, .read_callback = raw_h2_read_cb};
-  nghttp2_submit_request(sess, nullptr, gz_hdrs, 7, &dp_bgz, nullptr);
+  int32_t s_bgz =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, gz_hdrs, 7, &dp_bgz, nullptr));
 
   /* 10e. Two-chunk DATA stream to trigger recv_data memmove compaction (recv_start > 0) */
   uint8_t compact_buf[310];
@@ -833,94 +1552,106 @@ static void run_raw_h2_requests(uint16_t port) {
   raw_h2_payload p_cmp = {.data = compact_buf, .len = sizeof(compact_buf), .off = 0};
   nghttp2_data_provider dp_cmp = {.source.ptr = &p_cmp, .read_callback = raw_h2_chunked_read_cb};
   nghttp2_nv cmp_hdrs[] = {
-      {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":scheme", (uint8_t *)"http", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":path", (uint8_t *)"/web.Svc/Echo", 5, 13, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"te", (uint8_t *)"trailers", 2, 8, NGHTTP2_NV_FLAG_NONE},
+      NV(":method", "POST"),
+      NV(":scheme", "http"),
+      NV(":path", "/web.Svc/Echo"),
+      NV(":authority", "localhost"),
+      NV("content-type", "application/grpc"),
+      NV("te", "trailers"),
   };
-  nghttp2_submit_request(sess, nullptr, cmp_hdrs, 6, &dp_cmp, nullptr);
+  int32_t s_cmp =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, cmp_hdrs, 6, &dp_cmp, nullptr));
 
-  /* Flush outbound HTTP/2 frames */
-  for (;;) {
-    const uint8_t *out;
-    ssize_t n = nghttp2_session_mem_send(sess, &out);
-    if (n <= 0)
-      break;
-    raw_h2_send_all(fd, out, (size_t)n);
-  }
+  h2_flush(sess, fd);
+  H2_PUMP_UNTIL(sess, fd, rec->nb_closed == rec->nb_streams, WAIT_DEADLINE_MS);
+  TEST_ASSERT_EQUAL_UINT64(rec->nb_streams, rec->nb_closed);
 
-  struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
-  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  uint8_t rbuf[4096];
-  for (int i = 0; i < 200 && streams_done < 14; i++) {
-    ssize_t n = recv(fd, rbuf, sizeof(rbuf), 0);
-    if (n < 0 && errno == EINTR)
-      continue;
-    if (n <= 0)
-      break;
-    nghttp2_session_mem_recv(sess, rbuf, (size_t)n);
-    for (;;) {
-      const uint8_t *out;
-      ssize_t wn = nghttp2_session_mem_send(sess, &out);
-      if (wn <= 0)
-        break;
-      raw_h2_send_all(fd, out, (size_t)wn);
-    }
-  }
-  TEST_ASSERT_TRUE(streams_done >= 12);
+  /* Every stream got the answer the server is specified to give */
+  const h2_stream_rec *st_opt = h2_get(rec, s_opt);
+  TEST_ASSERT_FALSE(st_opt->rst);
+  TEST_ASSERT_EQUAL_INT(204, st_opt->http_status);
+  const h2_stream_rec *st_415 = h2_get(rec, s_415);
+  TEST_ASSERT_FALSE(st_415->rst);
+  TEST_ASSERT_EQUAL_INT(415, st_415->http_status);
+  assert_web_stream(rec, s_web, false, GRPC_STATUS_OK, "hi");
+  assert_web_stream(rec, s_txt, true, GRPC_STATUS_OK, "hi");
+  assert_web_stream(rec, s_nobody, false, GRPC_STATUS_OK, nullptr);
+  /* characters outside the base64 alphabet are rejected before decoding */
+  const h2_stream_rec *st_badb64 = h2_get(rec, s_badb64);
+  TEST_ASSERT_FALSE(st_badb64->rst);
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_INVALID_ARGUMENT, web_grpc_status(st_badb64, true, nullptr));
+  assert_web_stream(rec, s_tb64, true, GRPC_STATUS_DATA_LOSS, nullptr);
+  assert_grpc_stream(rec, s_trunc, GRPC_STATUS_DATA_LOSS);
+  assert_grpc_stream(rec, s_zraw, GRPC_STATUS_RESOURCE_EXHAUSTED);
+  assert_web_stream(rec, s_zb64, true, GRPC_STATUS_RESOURCE_EXHAUSTED, nullptr);
+  /* gzip is not in the client's grpc-accept-encoding, so the reply is not gzip-encoded */
+  assert_grpc_stream(rec, s_ae, GRPC_STATUS_OK);
+  TEST_ASSERT_TRUE(strcmp(h2_get(rec, s_ae)->grpc_encoding, "gzip") != 0);
+  /* a unary method needs exactly one request message: none or two end with INTERNAL */
+  assert_grpc_stream(rec, s_empty, GRPC_STATUS_INTERNAL);
+  assert_grpc_stream(rec, s_bgz, GRPC_STATUS_DATA_LOSS);
+  assert_grpc_stream(rec, s_cmp, GRPC_STATUS_INTERNAL);
 
-  /* 11. Too many headers (> 256) + Rapid PINGs to trigger ping-strike ENHANCE_YOUR_CALM */
+  /* 11. Too many headers (> CONFIG_STREAM_MAX_HEADERS): only that stream is reset */
   nghttp2_nv many_hdrs[265];
-  many_hdrs[0] = (nghttp2_nv){(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE};
-  many_hdrs[1] = (nghttp2_nv){(uint8_t *)":scheme", (uint8_t *)"http", 7, 4, NGHTTP2_NV_FLAG_NONE};
-  many_hdrs[2] =
-      (nghttp2_nv){(uint8_t *)":path", (uint8_t *)"/web.Svc/NoBody", 5, 15, NGHTTP2_NV_FLAG_NONE};
-  many_hdrs[3] =
-      (nghttp2_nv){(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE};
-  many_hdrs[4] = (nghttp2_nv){(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16,
-                              NGHTTP2_NV_FLAG_NONE};
-  for (int h = 5; h < 265; h++) {
-    many_hdrs[h] = (nghttp2_nv){(uint8_t *)"x-h", (uint8_t *)"1", 3, 1, NGHTTP2_NV_FLAG_NONE};
-  }
-  nghttp2_submit_request(sess, nullptr, many_hdrs, 265, nullptr, nullptr);
+  many_hdrs[0] = (nghttp2_nv)NV(":method", "POST");
+  many_hdrs[1] = (nghttp2_nv)NV(":scheme", "http");
+  many_hdrs[2] = (nghttp2_nv)NV(":path", "/web.Svc/NoBody");
+  many_hdrs[3] = (nghttp2_nv)NV(":authority", "localhost");
+  many_hdrs[4] = (nghttp2_nv)NV("content-type", "application/grpc");
+  for (int h = 5; h < 265; h++)
+    many_hdrs[h] = (nghttp2_nv)NV("x-h", "1");
+  int32_t s_many =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, many_hdrs, 265, nullptr, nullptr));
+  h2_flush(sess, fd);
+  H2_PUMP_UNTIL(sess, fd, h2_rec_find(rec, s_many)->closed, WAIT_DEADLINE_MS);
+  const h2_stream_rec *st_many = h2_get(rec, s_many);
+  TEST_ASSERT_TRUE(st_many->rst);
+  TEST_ASSERT_EQUAL_UINT32(NGHTTP2_INTERNAL_ERROR, st_many->rst_code);
+
+  /* ... while the connection survives: the next request on it is served */
+  raw_h2_payload p_after = {.data = web_frame, .len = sizeof(web_frame), .off = 0};
+  nghttp2_data_provider dp_after = {.source.ptr = &p_after, .read_callback = raw_h2_read_cb};
+  int32_t s_after =
+      h2_track(rec, nghttp2_submit_request(sess, nullptr, nobody_hdrs, 5, &dp_after, nullptr));
+  h2_flush(sess, fd);
+  H2_PUMP_UNTIL(sess, fd, h2_rec_find(rec, s_after)->closed, WAIT_DEADLINE_MS);
+  assert_web_stream(rec, s_after, false, GRPC_STATUS_OK, nullptr);
+  TEST_ASSERT_EQUAL_INT(0, rec->goaways);
+
+  /* 12. Rapid PINGs: more than max_ping_strikes=1 inside min_ping_interval_ms earn a GOAWAY with
+   * ENHANCE_YOUR_CALM */
   static const uint8_t ping_bytes[8] = {1, 2, 3, 4, 5, 6, 7, 8};
   for (int i = 0; i < 4; i++)
     nghttp2_submit_ping(sess, NGHTTP2_FLAG_NONE, ping_bytes);
-  for (;;) {
-    const uint8_t *out;
-    ssize_t wn = nghttp2_session_mem_send(sess, &out);
-    if (wn <= 0)
-      break;
-    raw_h2_send_all(fd, out, (size_t)wn);
-  }
-  (void)recv(fd, rbuf, sizeof(rbuf), 0);
+  h2_flush(sess, fd);
+  H2_PUMP_UNTIL(sess, fd, rec->goaways > 0, WAIT_DEADLINE_MS);
+  TEST_ASSERT_TRUE_MESSAGE(rec->goaways > 0, "no GOAWAY after excess PINGs");
+  TEST_ASSERT_EQUAL_UINT32(NGHTTP2_ENHANCE_YOUR_CALM, rec->goaway_code);
 
-  grpc_free(b64);
-  grpc_free(tb64);
-  grpc_free(zframe);
-  grpc_free(zb64);
-  nghttp2_session_del(sess);
-  close(fd);
+  fx_free(b64);
+  fx_free(tb64);
+  fx_free(zframe);
+  fx_free(zb64);
+  fx_session_del(sess);
+  fx_close(fd);
 #else
   (void)port;
 #endif
 }
 
-static atomic_int g_on_done_calls = 0;
 static void test_on_done_cb([[maybe_unused]] grpc_call *call, [[maybe_unused]] grpc_status status,
                             [[maybe_unused]] uint64_t duration_ms, [[maybe_unused]] void *ud) {
   atomic_fetch_add(&g_on_done_calls, 1);
 }
 
-static atomic_int g_cancel_cb_fired = 0;
 static void test_cancel_cb([[maybe_unused]] grpc_call *call, [[maybe_unused]] void *ud) {
   atomic_fetch_add(&g_cancel_cb_fired, 1);
 }
 
 static void cancel_watch_on_start(grpc_call *call, [[maybe_unused]] void *ud) {
   grpc_call_on_cancel(call, test_cancel_cb, nullptr);
+  atomic_store(&g_hold_started, 1);
 }
 
 static void no_body_handler(grpc_call *call, [[maybe_unused]] const grpc_message *req,
@@ -945,7 +1676,7 @@ static void codec_resp_handler(grpc_call *call, const grpc_message *req,
 }
 
 void test_integration_grpc_web_cors_ipv6_and_client_edge_cases(void) {
-  grpc_server *server = grpc_server_new(&(grpc_config){
+  grpc_server *server = fx_server(grpc_server_new(&(grpc_config){
       .port = 0,
       .ipv6_addr = "::1",
       .max_message_size = 1024,
@@ -953,8 +1684,7 @@ void test_integration_grpc_web_cors_ipv6_and_client_edge_cases(void) {
       .min_ping_interval_ms = 5000,
       .max_connection_age_ms = 5000,
       .log_level = GRPC_LOG_OFF,
-  });
-  TEST_ASSERT_NOT_NULL(server);
+  }));
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_server_handle(server, "/web.Svc/Echo", large_echo_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(
@@ -964,8 +1694,17 @@ void test_integration_grpc_web_cors_ipv6_and_client_edge_cases(void) {
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_server_handle(server, "/web.Svc/Codec", codec_resp_handler, nullptr));
 
-  pthread_t th;
-  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, server));
+  /* Server edge-case validation & fallback set/disable (before the server thread starts: only
+   * the server thread may configure a running server) */
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_register_path(nullptr, "/a/b", nullptr));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_set_fallback(
+                   server, &(grpc_stream_handler){.on_message = no_body_handler}, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_set_fallback(server, nullptr, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_set_fallback(nullptr, nullptr, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_set_fallback(server, nullptr, nullptr));
+
+  fx_start(server);
   uint16_t port = grpc_server_port(server);
 
   run_raw_h2_requests(port);
@@ -1016,14 +1755,14 @@ void test_integration_grpc_web_cors_ipv6_and_client_edge_cases(void) {
 #endif
   };
   for (size_t i = 0; i < sizeof(algs) / sizeof(algs[0]); i++) {
-    grpc_client *c = grpc_client_new(
+    grpc_client *c = fx_client(grpc_client_new(
         &(grpc_client_config){
             .targets = t6,
             .nb_targets = 1,
             .compression = algs[i],
             .timeout_ms = 2000,
         },
-        &err);
+        &err));
     TEST_ASSERT_NOT_NULL(c);
     grpc_client_response resp = {0};
     TEST_ASSERT_EQUAL_INT(
@@ -1032,12 +1771,12 @@ void test_integration_grpc_web_cors_ipv6_and_client_edge_cases(void) {
     TEST_ASSERT_NOT_NULL(resp.message);
     TEST_ASSERT_EQUAL_MEMORY("codec-test", resp.message->data, 10);
     grpc_client_response_free(&resp);
-    grpc_client_free(c);
+    fx_client_free(c);
   }
 
   /* Client timeout (GRPC_ERR_TIMEOUT) & oversized request (RESOURCE_EXHAUSTED) */
-  grpc_client *c = grpc_client_new(
-      &(grpc_client_config){.targets = t6, .nb_targets = 1, .timeout_ms = 2000}, &err);
+  grpc_client *c = fx_client(grpc_client_new(
+      &(grpc_client_config){.targets = t6, .nb_targets = 1, .timeout_ms = 2000}, &err));
   TEST_ASSERT_NOT_NULL(c);
   grpc_client_response resp = {0};
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_TIMEOUT,
@@ -1061,19 +1800,18 @@ void test_integration_grpc_web_cors_ipv6_and_client_edge_cases(void) {
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   grpc_client_response_free(&resp);
 
-  /* Client max_message_size exceeded on compressed response -> GRPC_ERR_LIMIT */
-  grpc_client *c_tiny = grpc_client_new(
+  /* Client max_message_size exceeded by an (uncompressed) 64-byte response -> GRPC_ERR_LIMIT */
+  grpc_client *c_tiny = fx_client(grpc_client_new(
       &(grpc_client_config){
           .targets = t6, .nb_targets = 1, .max_message_size = 8, .timeout_ms = 2000},
-      &err);
+      &err));
   TEST_ASSERT_NOT_NULL(c_tiny);
   char msg64[64];
   memset(msg64, 'M', sizeof(msg64));
-  grpc_err tiny_rc =
-      grpc_client_unary(c_tiny, "/web.Svc/Echo", msg64, sizeof(msg64), nullptr, 0, 0, &resp);
-  TEST_ASSERT_NOT_EQUAL_INT(GRPC_OK, tiny_rc);
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_LIMIT, grpc_client_unary(c_tiny, "/web.Svc/Echo", msg64,
+                                                          sizeof(msg64), nullptr, 0, 0, &resp));
   grpc_client_response_free(&resp);
-  grpc_client_free(c_tiny);
+  fx_client_free(c_tiny);
 #if defined(GRPC_ENABLE_ZSTD)
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_client_unary(c, "/web.Svc/Codec", "zstd", 4, nullptr, 0, 0, &resp));
@@ -1083,16 +1821,10 @@ void test_integration_grpc_web_cors_ipv6_and_client_edge_cases(void) {
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
                         grpc_client_unary(c, "/web.Svc/Codec", "id", 2, nullptr, 0, 0, nullptr));
 
-  /* Server edge-case validation & fallback disable */
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_register_path(nullptr, "/a/b", nullptr));
-  TEST_ASSERT_EQUAL_INT(
-      GRPC_OK, grpc_server_set_fallback(
-                   server, &(grpc_stream_handler){.on_message = no_body_handler}, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_set_fallback(server, nullptr, nullptr));
 #if defined(GRPC_ENABLE_TLS)
   TEST_ASSERT_NULL(grpc_server_new_ex(
       &(grpc_config){
-          .port = 0, .tls = {.cert_file = "a.pem", .cert_pem = "pem"}, .log_level = GRPC_LOG_INFO},
+          .port = 0, .tls = {.cert_file = "a.pem", .cert_pem = "pem"}, .log_level = GRPC_LOG_OFF},
       &err));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
 #endif
@@ -1111,10 +1843,9 @@ void test_integration_grpc_web_cors_ipv6_and_client_edge_cases(void) {
   char tp_buf[64];
   TEST_ASSERT_FALSE(grpc_call_trace_context(nullptr, &bad_tc));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_traceparent_format(&bad_tc, tp_buf, sizeof(tp_buf)));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_set_fallback(nullptr, nullptr, nullptr));
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_set_fallback(server, nullptr, nullptr));
 
-  grpc_client_stream *st = grpc_client_stream_open(c, "/web.Svc/Echo", nullptr, 0, 2000, &err);
+  grpc_client_stream *st =
+      fx_stream(grpc_client_stream_open(c, "/web.Svc/Echo", nullptr, 0, 2000, &err));
   TEST_ASSERT_NOT_NULL(st);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(st, "hi", 2));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_close_send(st));
@@ -1125,13 +1856,11 @@ void test_integration_grpc_web_cors_ipv6_and_client_edge_cases(void) {
   grpc_message_free(m);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_recv(st, &m));
   TEST_ASSERT_NULL(m);
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_finish(st, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, fx_stream_finish(st, &resp));
   grpc_client_response_free(&resp);
 
-  grpc_client_free(c);
-  grpc_server_stop(server);
-  pthread_join(th, nullptr);
-  grpc_server_free(server);
+  fx_client_free(c);
+  fx_server_free(server);
 }
 
 static void *async_worker_finish_only(void *arg) {
@@ -1143,44 +1872,100 @@ static void *async_worker_finish_only(void *arg) {
 
 static void async_finish_only_handler(grpc_call *call, [[maybe_unused]] const grpc_message *req,
                                       [[maybe_unused]] void *userdata) {
-  grpc_call_ref(call);
-  pthread_t th;
-  if (pthread_create(&th, nullptr, async_worker_finish_only, call) == 0)
-    pthread_detach(th);
-  else
-    grpc_call_unref(call);
+  spawn_call_worker(call, async_worker_finish_only);
 }
 
 static void comp_codecs_handler(grpc_call *call, const grpc_message *req,
                                 [[maybe_unused]] void *userdata) {
   (void)grpc_call_set_compression(call, GRPC_COMPRESS_IDENTITY, -1);
 #if defined(GRPC_ENABLE_ZSTD)
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_call_set_compression(call, GRPC_COMPRESS_ZSTD, 3));
+  HCHECK(grpc_call_set_compression(call, GRPC_COMPRESS_ZSTD, 3) == GRPC_OK);
 #endif
 #if defined(GRPC_ENABLE_SNAPPY)
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_call_set_compression(call, GRPC_COMPRESS_SNAPPY, -1));
+  HCHECK(grpc_call_set_compression(call, GRPC_COMPRESS_SNAPPY, -1) == GRPC_OK);
 #endif
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_UNSUPPORTED,
-                        grpc_call_set_compression(call, (grpc_compression_algorithm)99, -1));
+  HCHECK(grpc_call_set_compression(call, (grpc_compression_algorithm)99, -1) ==
+         GRPC_ERR_UNSUPPORTED);
   grpc_metadata bad_md[] = {{.key = ":bad", .value = "v"}};
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_send_metadata(call, bad_md, 1));
-  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_call_send_metadata_async(call, bad_md, 1));
+  HCHECK(grpc_call_send_metadata(call, bad_md, 1) == GRPC_ERR_INVALID);
+  HCHECK(grpc_call_send_metadata_async(call, bad_md, 1) == GRPC_ERR_INVALID);
   (void)grpc_call_reply(call, grpc_message_new(req->data, req->len));
 }
 
+/* A client for a server whose connection slots are all taken: the server accepts the connection
+ * and closes it at once, so either grpc_client_new() fails or the client's first call does. */
+static bool extra_connection_rejected(const grpc_client_config *cfg, const char *method) {
+  grpc_err err = GRPC_OK;
+  grpc_client *c = fx_client(grpc_client_new(cfg, &err));
+  if (c == nullptr)
+    return err == GRPC_ERR_IO || err == GRPC_ERR_CLOSED;
+  grpc_client_response resp = {0};
+  grpc_err rc = grpc_client_unary(c, method, "x", 1, nullptr, 0, 0, &resp);
+  bool failed = rc == GRPC_ERR_CLOSED || rc == GRPC_ERR_IO;
+  grpc_client_response_free(&resp);
+  fx_client_free(c);
+  return failed;
+}
+
+#ifndef _WIN32
+/* Raw HTTP/2 frames read off a socket that never answers anything (no PING ACK). */
+typedef struct raw_frames {
+  uint8_t buf[4096];
+  size_t len;
+  int pings;
+  bool closed;
+} raw_frames;
+
+static void raw_frames_pump(raw_frames *r, int fd, int timeout_ms) {
+  struct pollfd pfd = {.fd = fd, .events = POLLIN};
+  if (r->closed || poll(&pfd, 1, timeout_ms) <= 0)
+    return;
+  ssize_t n = recv(fd, r->buf + r->len, sizeof(r->buf) - r->len, 0);
+  if (n == 0 || (n < 0 && errno != EINTR && errno != EAGAIN)) {
+    r->closed = true;
+    return;
+  }
+  if (n < 0)
+    return;
+  r->len += (size_t)n;
+  while (r->len >= 9) {
+    size_t flen = ((size_t)r->buf[0] << 16) | ((size_t)r->buf[1] << 8) | r->buf[2];
+    if (9 + flen > sizeof(r->buf)) {
+      r->len = 0; /* not expected from this server: drop it */
+      break;
+    }
+    if (r->len < 9 + flen)
+      break;
+    if (r->buf[3] == NGHTTP2_PING && !(r->buf[4] & NGHTTP2_FLAG_ACK))
+      r->pings++;
+    memmove(r->buf, r->buf + 9 + flen, r->len - 9 - flen);
+    r->len -= 9 + flen;
+  }
+}
+
+#define RAW_FRAMES_UNTIL(r, fd, cond)                     \
+  do {                                                    \
+    const uint64_t rf_end_ = now_ms() + WAIT_DEADLINE_MS; \
+    while (!(cond) && !(r)->closed && now_ms() < rf_end_) \
+      raw_frames_pump((r), (fd), 10);                     \
+  } while (0)
+
+static raw_frames g_ka_frames;
+#endif
+
 void test_integration_maintenance_drain_and_edge_paths(void) {
-  /* 1. Maintenance timer firing PING + max_connection_age GOAWAY + close */
-  grpc_server *srv = grpc_server_new(&(grpc_config){
+  /* 1. Maintenance timer: keepalive PING to a client that stopped reading, then the
+   * keepalive-timeout close (logged at DEBUG; the TRACE level is captured, not printed) */
+  FILE *srv_log = fx_log();
+  grpc_server *srv = fx_server(grpc_server_new(&(grpc_config){
       .port = 0,
       .ipv4_addr = "127.0.0.1",
       .keepalive_time_ms = 30,
-      .keepalive_timeout_ms = 500,
-      .max_connection_age_ms = 80,
-      .max_connection_age_grace_ms = 40,
+      .keepalive_timeout_ms = 200,
       .max_message_size = 5 * 1024 * 1024,
       .log_level = GRPC_LOG_TRACE,
-  });
-  TEST_ASSERT_NOT_NULL(srv);
+      .log_file = srv_log,
+  }));
   TEST_ASSERT_EQUAL_INT(
       GRPC_OK, grpc_server_handle(srv, "/m.Svc/AsyncFin", async_finish_only_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
@@ -1190,15 +1975,13 @@ void test_integration_maintenance_drain_and_edge_paths(void) {
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_server_handle(srv, "/m.Svc/Hold", slow_deadline_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_health_enable(srv));
-
-  pthread_t th;
-  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, srv));
+  fx_start(srv);
 
   /* Connect via DNS "localhost" + test async_finish_only, codecs, and 512 KiB big write */
   grpc_err err = GRPC_OK;
-  grpc_client *c = grpc_client_new(
+  grpc_client *c = fx_client(grpc_client_new(
       &(grpc_client_config){.host = "localhost", .port = grpc_server_port(srv), .timeout_ms = 3000},
-      &err);
+      &err));
   TEST_ASSERT_NOT_NULL(c);
 
   grpc_client_response resp = {0};
@@ -1206,9 +1989,11 @@ void test_integration_maintenance_drain_and_edge_paths(void) {
                         grpc_client_unary(c, "/m.Svc/AsyncFin", "", 0, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_ALREADY_EXISTS, resp.status);
   grpc_client_response_free(&resp);
+  join_call_workers();
 
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_client_unary(c, "/m.Svc/Codecs", "hello", 5, nullptr, 0, 0, &resp));
+  ASSERT_HANDLER_CHECKS();
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   grpc_client_response_free(&resp);
 
@@ -1221,8 +2006,7 @@ void test_integration_maintenance_drain_and_edge_paths(void) {
 
   /* 4 MiB payload to overflow loopback socket buffers and exercise async uv_write / on_sub_write / on_session_write */
   size_t big_sz = 4 * 1024 * 1024;
-  char *big = malloc(big_sz);
-  TEST_ASSERT_NOT_NULL(big);
+  char *big = fx_mem(grpc_malloc(big_sz));
   memset(big, 'M', big_sz);
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_client_unary(c, "/m.Svc/Big", big, big_sz, nullptr, 0, 5000, &resp));
@@ -1230,17 +2014,17 @@ void test_integration_maintenance_drain_and_edge_paths(void) {
   TEST_ASSERT_NOT_NULL(resp.message);
   TEST_ASSERT_EQUAL_UINT32((uint32_t)big_sz, resp.message->len);
   grpc_client_response_free(&resp);
-  free(big);
+  fx_free(big);
 
   /* Client max_message_size limit exceeded + invalid request metadata */
-  grpc_client *c_small = grpc_client_new(
+  grpc_client *c_small = fx_client(grpc_client_new(
       &(grpc_client_config){
           .host = "127.0.0.1",
           .port = grpc_server_port(srv),
           .max_message_size = 64,
           .timeout_ms = 2000,
       },
-      &err);
+      &err));
   TEST_ASSERT_NOT_NULL(c_small);
   char med[256];
   memset(med, 'R', sizeof(med));
@@ -1250,68 +2034,76 @@ void test_integration_maintenance_drain_and_edge_paths(void) {
   grpc_metadata null_key[] = {{.key = nullptr, .value = "v"}};
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
                         grpc_client_unary(c_small, "/m.Svc/Big", "a", 1, null_key, 1, 0, &resp));
-  grpc_client_free(c_small);
+  fx_client_free(c_small);
 
-  /* Wait for maintenance_timer (250ms) to send PING / GOAWAY and close */
-  uv_sleep(380);
-  grpc_client_free(c);
+  /* c is idle now and reads nothing: a maintenance tick (every 250 ms) sends it a keepalive PING
+   * and a later one closes the connection, as no ACK came within keepalive_timeout_ms */
+  ASSERT_EVENTUALLY(srv_stats(srv).active_connections == 0);
+  TEST_ASSERT_TRUE(log_contains(srv_log, "keepalive timeout"));
+  fx_client_free(c);
+  fx_server_free(srv);
 
-  /* Leave an active Health/Watch open across server shutdown to cover health_free watcher cleanup */
-  grpc_client *c2 = grpc_client_new(
-      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(srv), .timeout_ms = 2000},
-      &err);
-  if (c2 != nullptr) {
-    grpc_client_stream *w =
-        grpc_client_stream_open(c2, GRPC_HEALTH_PATH_WATCH, nullptr, 0, 2000, &err);
-    if (w != nullptr) {
-      (void)grpc_client_stream_send(w, "", 0);
-      grpc_message *wm = nullptr;
-      (void)grpc_client_stream_recv(w, &wm);
-      grpc_message_free(wm);
-      grpc_server_stop(srv);
-      pthread_join(th, nullptr);
-      /* Drain with active stream times out (GRPC_ERR_TIMEOUT) */
-      TEST_ASSERT_EQUAL_INT(GRPC_ERR_TIMEOUT, grpc_server_drain(srv, 30));
-      grpc_client_stream_cancel(w);
-      grpc_client_free(c2);
-      grpc_server_free(srv);
-      goto uds_test;
-    }
-    grpc_client_free(c2);
-  }
-  grpc_server_stop(srv);
-  pthread_join(th, nullptr);
-  grpc_server_free(srv);
+  /* 2. An active Health/Watch kept open across server shutdown: drain times out on it, and
+   * grpc_server_free() covers health_free's watcher cleanup */
+  grpc_server *dsrv = fx_server(grpc_server_new(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF}));
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_health_enable(dsrv));
+  fx_start(dsrv);
+  grpc_client *c2 = fx_client(grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
+                                                                    .port = grpc_server_port(dsrv),
+                                                                    .timeout_ms = 2000},
+                                              &err));
+  TEST_ASSERT_NOT_NULL(c2);
+  grpc_client_stream *w =
+      fx_stream(grpc_client_stream_open(c2, GRPC_HEALTH_PATH_WATCH, nullptr, 0, 2000, &err));
+  TEST_ASSERT_NOT_NULL(w);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(w, "", 0));
+  grpc_message *wm = nullptr;
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_recv(w, &wm));
+  TEST_ASSERT_NOT_NULL(wm);
+  TEST_ASSERT_EQUAL_UINT8(GRPC_HEALTH_SERVING, wm->data[1]);
+  grpc_message_free(wm);
+  fx_stop_join(dsrv);
+  /* Drain with active stream times out (GRPC_ERR_TIMEOUT) */
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_TIMEOUT, grpc_server_drain(dsrv, 30));
+  fx_stream_cancel(w);
+  fx_client_free(c2);
+  fx_server_free(dsrv);
 
-uds_test:;
 #ifndef _WIN32
-  /* 2. Unix target via targets[] ("unix:/path") + UDS max_connections=1 rejection */
-  const char *upath = "/tmp/ezgrpc_uds_reject.sock";
-  grpc_server *usrv = grpc_server_new(
-      &(grpc_config){.unix_path = upath, .max_connections = 1, .log_level = GRPC_LOG_OFF});
-  TEST_ASSERT_NOT_NULL(usrv);
+  /* 3. Unix target via targets[] ("unix:///path") + UDS max_connections=1 rejection */
+  const char *upath = fx_tmp_path("uds.sock");
+  grpc_server *usrv = fx_server(grpc_server_new(
+      &(grpc_config){.unix_path = upath, .max_connections = 1, .log_level = GRPC_LOG_OFF}));
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_server_handle(usrv, "/u.Svc/Echo", large_echo_handler, nullptr));
-  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, usrv));
+  fx_start(usrv);
 
-  const char *utargets[] = {"unix:///tmp/ezgrpc_uds_reject.sock"};
-  grpc_client *uc1 = grpc_client_new(
-      &(grpc_client_config){.targets = utargets, .nb_targets = 1, .timeout_ms = 2000}, &err);
+  char utarget[400];
+  snprintf(utarget, sizeof(utarget), "unix://%s", upath);
+  const char *utargets[] = {utarget};
+  grpc_client *uc1 = fx_client(grpc_client_new(
+      &(grpc_client_config){.targets = utargets, .nb_targets = 1, .timeout_ms = 2000}, &err));
   TEST_ASSERT_NOT_NULL(uc1);
-  grpc_client *uc2 = grpc_client_new(
-      &(grpc_client_config){.targets = utargets, .nb_targets = 1, .timeout_ms = 2000}, &err);
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_client_unary(uc1, "/u.Svc/Echo", "u", 1, nullptr, 0, 0, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   grpc_client_response_free(&resp);
-  grpc_client_free(uc2);
-  grpc_client_free(uc1);
-  grpc_server_stop(usrv);
-  pthread_join(th, nullptr);
-  grpc_server_free(usrv);
+  /* uc1 holds the only slot: the server accepts uc2 and closes it at once, so uc2 fails to
+   * connect or, if the close lands after the connect, its first call fails */
+  TEST_ASSERT_TRUE(extra_connection_rejected(
+      &(grpc_client_config){.targets = utargets, .nb_targets = 1, .timeout_ms = 2000},
+      "/u.Svc/Echo"));
+  TEST_ASSERT_EQUAL_UINT64(1, srv_stats(usrv).total_connections);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(uc1, "/u.Svc/Echo", "u", 1, nullptr, 0, 0, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  grpc_client_response_free(&resp);
+  fx_client_free(uc1);
+  fx_server_free(usrv);
 #endif
 
-  /* 3. Server invalid IPv6 & invalid log level & keepalive-timeout + idle-GOAWAY */
+  /* 4. Server invalid IPv6 & invalid log level & keepalive-timeout + idle-GOAWAY */
   TEST_ASSERT_NULL(grpc_server_new_ex(
       &(grpc_config){.port = 0, .ipv6_addr = "not-ipv6", .log_level = GRPC_LOG_OFF}, &err));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
@@ -1320,87 +2112,97 @@ uds_test:;
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, err);
 
   /* Keepalive timeout + PING ACK: raw socket ignores PING (timeout), grpc_client ACKs PING */
-  grpc_server *ka_srv = grpc_server_new(&(grpc_config){
+  FILE *ka_log = fx_log();
+  grpc_server *ka_srv = fx_server(grpc_server_new(&(grpc_config){
       .port = 0,
       .ipv4_addr = "127.0.0.1",
       .keepalive_time_ms = 20,
       .keepalive_timeout_ms = 50,
       .log_level = GRPC_LOG_DEBUG,
-  });
-  TEST_ASSERT_NOT_NULL(ka_srv);
+      .log_file = ka_log,
+  }));
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_server_handle(ka_srv, "/ka.Svc/Ping", no_body_handler, nullptr));
-  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, ka_srv));
+  fx_start(ka_srv);
 #ifndef _WIN32
-  grpc_client *ka_c = grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
-                                                            .port = grpc_server_port(ka_srv),
-                                                            .timeout_ms = 2000},
-                                      &err);
+  grpc_client *ka_c = fx_client(grpc_client_new(
+      &(grpc_client_config){
+          .host = "127.0.0.1", .port = grpc_server_port(ka_srv), .timeout_ms = 2000},
+      &err));
   TEST_ASSERT_NOT_NULL(ka_c);
-  int raw_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (raw_fd >= 0) {
-    struct sockaddr_in sin = {0};
-    sin.sin_family = AF_INET;
-    sin.sin_port = htons(grpc_server_port(ka_srv));
-    inet_pton(AF_INET, "127.0.0.1", &sin.sin_addr);
-    if (connect(raw_fd, (struct sockaddr *)&sin, sizeof(sin)) == 0) {
-      /* Wait for 250ms timer to send PING, let ka_c ACK it, then wait for raw_fd timeout */
-      uv_sleep(280);
-      (void)grpc_client_unary(ka_c, "/ka.Svc/Ping", "", 0, nullptr, 0, 1000, &resp);
-      grpc_client_response_free(&resp);
-      uv_sleep(280);
-    }
-    close(raw_fd);
-  }
-  grpc_client_free(ka_c);
+  int raw_fd = raw_connect4(grpc_server_port(ka_srv));
+  /* client connection preface + empty SETTINGS; the raw peer never ACKs anything */
+  static const uint8_t preface[] = {
+      'P',  'R',  'I',  ' ',  '*', ' ', 'H',  'T',  'T',  'P',  '/', '2', '.', '0',
+      '\r', '\n', '\r', '\n', 'S', 'M', '\r', '\n', '\r', '\n', 0,   0,   0,   NGHTTP2_SETTINGS,
+      0,    0,    0,    0,    0};
+  raw_h2_send_all(raw_fd, preface, sizeof(preface));
+  raw_frames *kaf = &g_ka_frames;
+  memset(kaf, 0, sizeof(*kaf));
+  /* the first maintenance tick (250 ms) PINGs both idle connections */
+  RAW_FRAMES_UNTIL(kaf, raw_fd, kaf->pings > 0);
+  TEST_ASSERT_TRUE_MESSAGE(kaf->pings > 0, "no keepalive PING");
+  /* ka_c reads (and ACKs) its PING during this call */
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_client_unary(ka_c, "/ka.Svc/Ping", "", 0, nullptr, 0, 1000, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  grpc_client_response_free(&resp);
+  /* the raw connection never ACKs, so it is closed after keepalive_timeout_ms */
+  RAW_FRAMES_UNTIL(kaf, raw_fd, false);
+  TEST_ASSERT_TRUE_MESSAGE(kaf->closed, "keepalive timeout did not close the connection");
+  TEST_ASSERT_TRUE(log_contains(ka_log, "keepalive timeout"));
+  fx_close(raw_fd);
+  fx_client_free(ka_c);
 #endif
-  grpc_server_stop(ka_srv);
-  pthread_join(th, nullptr);
-  grpc_server_free(ka_srv);
+  fx_server_free(ka_srv);
 
   /* Idle timeout: client connects and stays idle -> server sends GOAWAY and closes */
-  grpc_server *idle_srv = grpc_server_new(&(grpc_config){
+  grpc_server *idle_srv = fx_server(grpc_server_new(&(grpc_config){
       .port = 0,
       .ipv4_addr = "127.0.0.1",
       .max_connection_idle_ms = 30,
       .max_connection_age_grace_ms = 30,
       .log_level = GRPC_LOG_OFF,
-  });
+  }));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_status_details_decode_all(nullptr, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID,
                         grpc_server_handle(nullptr, "/a/b", no_body_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_handle_stream(
                                               nullptr, "/a/b", &(grpc_stream_handler){0}, nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_unregister(nullptr, "/a/b"));
-  TEST_ASSERT_NOT_NULL(idle_srv);
-  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, idle_srv));
-  grpc_client *ic = grpc_client_new(
-      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(idle_srv)}, &err);
+  fx_start(idle_srv);
+  grpc_client *ic = fx_client(grpc_client_new(
+      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(idle_srv)}, &err));
   TEST_ASSERT_NOT_NULL(ic);
-  uv_sleep(560);
-  grpc_client_free(ic);
-  grpc_server_stop(idle_srv);
-  pthread_join(th, nullptr);
-  grpc_server_free(idle_srv);
+  ASSERT_EVENTUALLY(srv_stats(idle_srv).total_connections == 1 &&
+                    srv_stats(idle_srv).active_connections == 0);
+  fx_client_free(ic);
+  fx_server_free(idle_srv);
 
-  /* Max connection age + grace timeout: GOAWAY then close */
-  grpc_server *age_srv = grpc_server_new(&(grpc_config){
+  /* Max connection age + grace timeout: GOAWAY, then close although a stream is still open */
+  grpc_server *age_srv = fx_server(grpc_server_new(&(grpc_config){
       .port = 0,
       .ipv4_addr = "127.0.0.1",
       .max_connection_age_ms = 30,
       .max_connection_age_grace_ms = 30,
       .log_level = GRPC_LOG_OFF,
-  });
-  TEST_ASSERT_NOT_NULL(age_srv);
-  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, age_srv));
-  grpc_client *ac = grpc_client_new(
-      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(age_srv)}, &err);
+  }));
+  TEST_ASSERT_EQUAL_INT(
+      GRPC_OK, grpc_server_handle(age_srv, "/age.Svc/Hold", slow_deadline_handler, nullptr));
+  fx_start(age_srv);
+  grpc_client *ac = fx_client(grpc_client_new(
+      &(grpc_client_config){.host = "127.0.0.1", .port = grpc_server_port(age_srv)}, &err));
   TEST_ASSERT_NOT_NULL(ac);
-  uv_sleep(560);
-  grpc_client_free(ac);
-  grpc_server_stop(age_srv);
-  pthread_join(th, nullptr);
-  grpc_server_free(age_srv);
+  grpc_client_stream *as =
+      fx_stream(grpc_client_stream_open(ac, "/age.Svc/Hold", nullptr, 0, 0, &err));
+  TEST_ASSERT_NOT_NULL(as);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(as, "x", 1));
+  ASSERT_EVENTUALLY(srv_stats(age_srv).active_streams == 1);
+  ASSERT_EVENTUALLY(srv_stats(age_srv).active_connections == 0);
+  TEST_ASSERT_EQUAL_UINT64(1, srv_stats(age_srv).total_connections);
+  fx_stream_cancel(as);
+  fx_client_free(ac);
+  fx_server_free(age_srv);
 
   /* Unreachable port with retries -> GRPC_ERR_IO */
   TEST_ASSERT_NULL(grpc_client_new(
@@ -1414,16 +2216,16 @@ uds_test:;
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_IO, err);
 
   /* Poll-driven GRPC_EVENT_CANCEL when client cancels stream */
-  grpc_server *pc_srv = grpc_server_new(
-      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
-  TEST_ASSERT_NOT_NULL(pc_srv);
+  grpc_server *pc_srv = fx_server(grpc_server_new(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF}));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_register_path(pc_srv, "/pc.Svc/Hold", nullptr));
-  grpc_client *pc_c = grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
-                                                            .port = grpc_server_port(pc_srv),
-                                                            .timeout_ms = 2000},
-                                      &err);
+  grpc_client *pc_c = fx_client(grpc_client_new(
+      &(grpc_client_config){
+          .host = "127.0.0.1", .port = grpc_server_port(pc_srv), .timeout_ms = 2000},
+      &err));
   TEST_ASSERT_NOT_NULL(pc_c);
-  grpc_client_stream *pc_st = grpc_client_stream_open(pc_c, "/pc.Svc/Hold", nullptr, 0, 2000, &err);
+  grpc_client_stream *pc_st =
+      fx_stream(grpc_client_stream_open(pc_c, "/pc.Svc/Hold", nullptr, 0, 2000, &err));
   TEST_ASSERT_NOT_NULL(pc_st);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(pc_st, "x", 1));
   int saw_msg = 0;
@@ -1439,7 +2241,7 @@ uds_test:;
     }
   }
   TEST_ASSERT_EQUAL_INT(1, saw_msg);
-  grpc_client_stream_cancel(pc_st);
+  fx_stream_cancel(pc_st);
   int saw_cancel = 0;
   for (int i = 0; i < 20 && !saw_cancel; i++) {
     int n = grpc_server_poll(pc_srv, 30);
@@ -1455,18 +2257,19 @@ uds_test:;
     }
   }
   TEST_ASSERT_EQUAL_INT(1, saw_cancel);
-  grpc_client_free(pc_c);
-  grpc_server_free(pc_srv);
+  fx_client_free(pc_c);
+  fx_server_free(pc_srv);
 
   /* Large client payload (4 MiB) to exercise async uv_write / on_sub_write + TCP max_connections */
-  grpc_server *big_srv = grpc_server_new(&(grpc_config){
+  FILE *big_log = fx_log();
+  grpc_server *big_srv = fx_server(grpc_server_new(&(grpc_config){
       .port = 0,
       .ipv4_addr = "127.0.0.1",
       .max_connections = 1,
       .max_message_size = 8 * 1024 * 1024,
       .log_level = GRPC_LOG_INFO,
-  });
-  TEST_ASSERT_NOT_NULL(big_srv);
+      .log_file = big_log,
+  }));
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_server_handle(big_srv, "/big.Svc/Echo", large_echo_handler, nullptr));
   TEST_ASSERT_EQUAL_INT(
@@ -1474,6 +2277,12 @@ uds_test:;
                                          &(grpc_stream_handler){.on_start = cancel_watch_on_start},
                                          nullptr));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_health_enable(big_srv));
+  /* a service name longer than the 127 bytes kept: found again by the same long name */
+  char long_name[131];
+  memset(long_name, 'a', 130);
+  long_name[130] = '\0';
+  TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                        grpc_health_set_status(big_srv, long_name, GRPC_HEALTH_NOT_SERVING));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_channelz_enable(big_srv));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_reflection_enable(big_srv));
   TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_reflection_enable(nullptr));
@@ -1486,28 +2295,31 @@ uds_test:;
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_add_interceptor(big_srv, &ba_inc));
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_server_handle(big_srv, "/big.Svc/Auth", no_body_handler, nullptr));
-  grpc_interceptor rl_inc = grpc_interceptor_rate_limit(100.0, 2);
+  /* 10 tokens/s, burst 2 */
+  grpc_interceptor rl_inc = grpc_interceptor_rate_limit(10.0, 2);
   rl_inc.path_prefix = "/big.Svc/RL";
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_add_interceptor(big_srv, &rl_inc));
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_server_handle(big_srv, "/big.Svc/RL", no_body_handler, nullptr));
-  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, big_srv));
-  grpc_client *bc1 = grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
-                                                           .port = grpc_server_port(big_srv),
-                                                           .max_message_size = 8 * 1024 * 1024,
-                                                           .timeout_ms = 5000},
-                                     &err);
+  fx_start(big_srv);
+  grpc_client *bc1 =
+      fx_client(grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
+                                                      .port = grpc_server_port(big_srv),
+                                                      .max_message_size = 8 * 1024 * 1024,
+                                                      .timeout_ms = 5000},
+                                &err));
   TEST_ASSERT_NOT_NULL(bc1);
-  /* 2nd TCP connection while max_connections=1 -> triggers reject_connection() */
-  grpc_client *bc2 = grpc_client_new(&(grpc_client_config){.host = "127.0.0.1",
-                                                           .port = grpc_server_port(big_srv),
-                                                           .timeout_ms = 500},
-                                     &err);
-  grpc_client_free(bc2);
+  ASSERT_EVENTUALLY(srv_stats(big_srv).active_connections == 1);
+  /* 2nd TCP connection while max_connections=1 -> reject_connection() */
+  TEST_ASSERT_TRUE(extra_connection_rejected(
+      &(grpc_client_config){
+          .host = "127.0.0.1", .port = grpc_server_port(big_srv), .timeout_ms = 500},
+      "/big.Svc/Echo"));
+  TEST_ASSERT_TRUE(log_contains(big_log, "max_connections (1) reached"));
+  TEST_ASSERT_EQUAL_UINT64(1, srv_stats(big_srv).total_connections);
 
   size_t c_big_sz = 4 * 1024 * 1024;
-  char *c_big_buf = grpc_malloc(c_big_sz);
-  TEST_ASSERT_NOT_NULL(c_big_buf);
+  char *c_big_buf = fx_mem(grpc_malloc(c_big_sz));
   memset(c_big_buf, 'A', c_big_sz);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_unary(bc1, "/big.Svc/Echo", c_big_buf, c_big_sz,
                                                    nullptr, 0, 5000, &resp));
@@ -1515,7 +2327,7 @@ uds_test:;
   TEST_ASSERT_NOT_NULL(resp.message);
   TEST_ASSERT_EQUAL_UINT32((uint32_t)c_big_sz, resp.message->len);
   grpc_client_response_free(&resp);
-  grpc_free(c_big_buf);
+  fx_free(c_big_buf);
 
   /* Channelz GetServers after >127 bytes transferred (multi-byte varints) */
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_unary(bc1, GRPC_CHANNELZ_PATH_GET_SERVERS, "", 0,
@@ -1525,93 +2337,141 @@ uds_test:;
 
   /* Reflection with unknown protobuf fields (varint, len-delimited, fixed64) */
   grpc_client_stream *rf =
-      grpc_client_stream_open(bc1, GRPC_REFLECTION_V1_PATH, nullptr, 0, 2000, &err);
+      fx_stream(grpc_client_stream_open(bc1, GRPC_REFLECTION_V1_PATH, nullptr, 0, 2000, &err));
   TEST_ASSERT_NOT_NULL(rf);
   const uint8_t unk_rf[] = {0xF8, 0x06, 0x01, 0xFA, 0x06, 0x01, 'A', 0xF9, 0x06,
                             0,    0,    0,    0,    0,    0,    0,   0};
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(rf, unk_rf, sizeof(unk_rf)));
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_close_send(rf));
+  /* 0xF8 0x06 / 0xFA 0x06 / 0xF9 0x06 are two-byte tags of field 111 (varint, bytes, fixed64);
+   * all three are skipped, and a request with no supported field is answered with an
+   * error_response (field 7) carrying UNIMPLEMENTED (12), after the echoed original_request */
   grpc_message *rfm = nullptr;
-  (void)grpc_client_stream_recv(rf, &rfm);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_recv(rf, &rfm));
+  TEST_ASSERT_NOT_NULL(rfm);
+  TEST_ASSERT_TRUE(rfm->len > 2 + sizeof(unk_rf) + 4);
+  TEST_ASSERT_EQUAL_HEX8(0x12, rfm->data[0]); /* original_request */
+  TEST_ASSERT_EQUAL_UINT8(sizeof(unk_rf), rfm->data[1]);
+  TEST_ASSERT_EQUAL_MEMORY(unk_rf, rfm->data + 2, sizeof(unk_rf));
+  const uint8_t *er = rfm->data + 2 + sizeof(unk_rf);
+  TEST_ASSERT_EQUAL_HEX8(0x3A, er[0]); /* error_response */
+  TEST_ASSERT_EQUAL_HEX8(0x08, er[2]); /* error_code */
+  TEST_ASSERT_EQUAL_UINT8(12, er[3]);  /* UNIMPLEMENTED */
   grpc_message_free(rfm);
-  (void)grpc_client_stream_finish(rf, &resp);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, fx_stream_finish(rf, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   grpc_client_response_free(&resp);
 
-  /* Bearer auth with extra spaces + rate-limit refill after sleep + on_cancel callback */
+  /* Bearer auth with extra spaces */
   grpc_metadata sp_auth[] = {{.key = "authorization", .value = "Bearer   valid-token"}};
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_client_unary(bc1, "/big.Svc/Auth", "", 0, sp_auth, 1, 2000, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   grpc_client_response_free(&resp);
 
-  TEST_ASSERT_EQUAL_INT(GRPC_OK,
-                        grpc_client_unary(bc1, "/big.Svc/RL", "", 0, nullptr, 0, 2000, &resp));
-  grpc_client_response_free(&resp);
-  uv_sleep(40);
-  TEST_ASSERT_EQUAL_INT(GRPC_OK,
-                        grpc_client_unary(bc1, "/big.Svc/RL", "", 0, nullptr, 0, 2000, &resp));
-  grpc_client_response_free(&resp);
+  /* Rate limit: the burst of 2 passes, the bucket then runs dry (RESOURCE_EXHAUSTED) and refills */
+  for (int i = 0; i < 2; i++) {
+    TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                          grpc_client_unary(bc1, "/big.Svc/RL", "", 0, nullptr, 0, 2000, &resp));
+    TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+    grpc_client_response_free(&resp);
+  }
+  bool limited = false;
+  for (int i = 0; i < 20 && !limited; i++) {
+    TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                          grpc_client_unary(bc1, "/big.Svc/RL", "", 0, nullptr, 0, 2000, &resp));
+    limited = resp.status == GRPC_STATUS_RESOURCE_EXHAUSTED;
+    if (!limited)
+      TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+    grpc_client_response_free(&resp);
+  }
+  TEST_ASSERT_TRUE_MESSAGE(limited, "rate limiter never rejected a call");
+  grpc_status rl_status = GRPC_STATUS_RESOURCE_EXHAUSTED;
+  const uint64_t rl_end = now_ms() + WAIT_DEADLINE_MS;
+  while (rl_status == GRPC_STATUS_RESOURCE_EXHAUSTED && now_ms() < rl_end) {
+    uv_sleep(20);
+    TEST_ASSERT_EQUAL_INT(GRPC_OK,
+                          grpc_client_unary(bc1, "/big.Svc/RL", "", 0, nullptr, 0, 2000, &resp));
+    rl_status = resp.status;
+    grpc_client_response_free(&resp);
+  }
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, rl_status);
 
-  atomic_store(&g_cancel_cb_fired, 0);
-  grpc_client_stream *hs = grpc_client_stream_open(bc1, "/big.Svc/Hold", nullptr, 0, 2000, &err);
+  /* on_cancel callback + on_done interceptor for a cancelled stream */
+  int done_before = atomic_load(&g_on_done_calls);
+  grpc_client_stream *hs =
+      fx_stream(grpc_client_stream_open(bc1, "/big.Svc/Hold", nullptr, 0, 2000, &err));
   TEST_ASSERT_NOT_NULL(hs);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(hs, "x", 1));
-  uv_sleep(20);
-  grpc_client_stream_cancel(hs);
-  uv_sleep(30);
-  TEST_ASSERT_TRUE(atomic_load(&g_on_done_calls) > 0);
+  ASSERT_EVENTUALLY(atomic_load(&g_hold_started) == 1);
+  fx_stream_cancel(hs);
+  ASSERT_EVENTUALLY(atomic_load(&g_cancel_cb_fired) >= 1);
+  TEST_ASSERT_EQUAL_INT(1, atomic_load(&g_cancel_cb_fired));
+  ASSERT_EVENTUALLY(atomic_load(&g_on_done_calls) > done_before);
 
   /* Health check with >127-byte service name (multi-byte varint) + 2 concurrent watchers */
   uint8_t long_hc[140];
   long_hc[0] = 0x0A;
   long_hc[1] = 0x82; /* varint 130: (0x02 | 0x80), 0x01 */
   long_hc[2] = 0x01;
-  memset(long_hc + 3, 'a', 130);
+  memcpy(long_hc + 3, long_name, 130);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_unary(bc1, GRPC_HEALTH_PATH_CHECK, long_hc, 133,
                                                    nullptr, 0, 2000, &resp));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  TEST_ASSERT_NOT_NULL(resp.message);
+  TEST_ASSERT_EQUAL_UINT32(2, resp.message->len);
+  TEST_ASSERT_EQUAL_UINT8(GRPC_HEALTH_NOT_SERVING, resp.message->data[1]);
   grpc_client_response_free(&resp);
 
   grpc_client_stream *w1 =
-      grpc_client_stream_open(bc1, GRPC_HEALTH_PATH_WATCH, nullptr, 0, 2000, &err);
+      fx_stream(grpc_client_stream_open(bc1, GRPC_HEALTH_PATH_WATCH, nullptr, 0, 2000, &err));
   TEST_ASSERT_NOT_NULL(w1);
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_send(w1, "", 0));
   grpc_message *wm1 = nullptr;
   TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_client_stream_recv(w1, &wm1));
+  TEST_ASSERT_NOT_NULL(wm1);
   grpc_message_free(wm1);
-  grpc_client_stream_cancel(w1);
+  fx_stream_cancel(w1);
 
   /* Client retry when first subchannel's server shuts down mid-connection */
-  grpc_server *srv_ok = grpc_server_new(
-      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
-  TEST_ASSERT_NOT_NULL(srv_ok);
+  grpc_server *srv_ok = fx_server(grpc_server_new(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF}));
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_server_handle(srv_ok, "/big.Svc/Echo", large_echo_handler, nullptr));
-  pthread_t th_ok;
-  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th_ok, nullptr, run_server_fn, srv_ok));
+  fx_start(srv_ok);
   char ep_a[64], ep_b[64];
   snprintf(ep_a, sizeof(ep_a), "127.0.0.1:%u", grpc_server_port(big_srv));
   snprintf(ep_b, sizeof(ep_b), "127.0.0.1:%u", grpc_server_port(srv_ok));
   const char *rr_targets[] = {ep_a, ep_b};
-  grpc_client_free(bc1);
-  grpc_client *rr = grpc_client_new(&(grpc_client_config){.targets = rr_targets,
-                                                          .nb_targets = 2,
-                                                          .max_retries = 2,
-                                                          .retry_backoff_ms = 5,
-                                                          .timeout_ms = 2000},
-                                    &err);
+  fx_client_free(bc1);
+  grpc_client *rr = fx_client(grpc_client_new(&(grpc_client_config){.targets = rr_targets,
+                                                                    .nb_targets = 2,
+                                                                    .max_retries = 2,
+                                                                    .retry_backoff_ms = 5,
+                                                                    .timeout_ms = 2000},
+                                              &err));
   TEST_ASSERT_NOT_NULL(rr);
   /* Stop big_srv so first subchannel fails on send/recv and retries on srv_ok */
-  grpc_server_stop(big_srv);
-  pthread_join(th, nullptr);
-  grpc_server_free(big_srv);
+  fx_server_free(big_srv);
+  /* Control: without retries, the first call (round robin starts at targets[0]) fails */
+  grpc_client *rr0 = fx_client(grpc_client_new(
+      &(grpc_client_config){.targets = rr_targets, .nb_targets = 2, .timeout_ms = 2000}, &err));
+  TEST_ASSERT_NOT_NULL(rr0);
+  grpc_err rc0 = grpc_client_unary(rr0, "/big.Svc/Echo", "retry", 5, nullptr, 0, 2000, &resp);
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_IO, rc0);
+  grpc_client_response_free(&resp);
+  fx_client_free(rr0);
+  TEST_ASSERT_EQUAL_UINT64(0, srv_stats(srv_ok).total_calls);
+  /* With retries the call fails on targets[0] and succeeds on targets[1] */
   TEST_ASSERT_EQUAL_INT(
       GRPC_OK, grpc_client_unary(rr, "/big.Svc/Echo", "retry", 5, nullptr, 0, 2000, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
+  TEST_ASSERT_NOT_NULL(resp.message);
+  TEST_ASSERT_EQUAL_MEMORY("retry", resp.message->data, 5);
   grpc_client_response_free(&resp);
-  grpc_client_free(rr);
-  grpc_server_stop(srv_ok);
-  pthread_join(th_ok, nullptr);
-  grpc_server_free(srv_ok);
+  TEST_ASSERT_EQUAL_UINT64(1, srv_stats(srv_ok).total_calls);
+  fx_client_free(rr);
+  fx_server_free(srv_ok);
 }
 
 #ifndef _WIN32
@@ -1628,6 +2488,23 @@ static void burst_8mb_handler(grpc_call *call, [[maybe_unused]] const grpc_messa
   }
 }
 
+/* Best effort, not asserted: waits (bounded) until a peer's large write has filled this socket's
+ * small receive buffer (FIONREAD stops growing), so the writer must fall back to an async
+ * uv_write. */
+static void wait_socket_backlog(int fd) {
+  int prev = -1;
+  const uint64_t end = now_ms() + WAIT_DEADLINE_MS;
+  while (now_ms() < end) {
+    int n = 0;
+    if (ioctl(fd, FIONREAD, &n) != 0)
+      return;
+    if (n >= 2048 && n == prev)
+      return;
+    prev = n;
+    uv_sleep(5);
+  }
+}
+
 typedef struct slow_h2_srv_ctx {
   int listen_fd;
   bool abort_mid_write;
@@ -1638,9 +2515,9 @@ static int slow_h2_on_frame(nghttp2_session *s, const nghttp2_frame *f, void *ud
   if (f->hd.stream_id > 0 && (f->hd.flags & NGHTTP2_FLAG_END_STREAM)) {
     *got_eos = 1;
     nghttp2_nv resp_hdrs[] = {
-        {(uint8_t *)":status", (uint8_t *)"200", 7, 3, NGHTTP2_NV_FLAG_NONE},
-        {(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16, NGHTTP2_NV_FLAG_NONE},
-        {(uint8_t *)"grpc-status", (uint8_t *)"0", 11, 1, NGHTTP2_NV_FLAG_NONE},
+        NV(":status", "200"),
+        NV("content-type", "application/grpc"),
+        NV("grpc-status", "0"),
     };
     nghttp2_submit_response(s, f->hd.stream_id, resp_hdrs, 3, nullptr);
   }
@@ -1666,16 +2543,10 @@ static void *slow_h2_server_thread(void *arg) {
   };
   nghttp2_submit_settings(sess, NGHTTP2_FLAG_NONE, iv, 1);
   nghttp2_session_set_local_window_size(sess, NGHTTP2_FLAG_NONE, 0, 16 * 1024 * 1024);
-  for (;;) {
-    const uint8_t *out;
-    ssize_t n = nghttp2_session_mem_send(sess, &out);
-    if (n <= 0)
-      break;
-    raw_h2_send_all(cfd, out, (size_t)n);
-  }
+  h2_flush(sess, cfd);
 
-  /* Pause so client's 8 MiB write fills the socket buffer and triggers async uv_write */
-  uv_sleep(50);
+  /* Let the client's 8 MiB write fill the socket buffer and go async */
+  wait_socket_backlog(cfd);
 
   if (ctx->abort_mid_write) {
     struct linger lg = {.l_onoff = 1, .l_linger = 0};
@@ -1693,42 +2564,32 @@ static void *slow_h2_server_thread(void *arg) {
     if (n <= 0)
       break;
     nghttp2_session_mem_recv(sess, rbuf, (size_t)n);
-    for (;;) {
-      const uint8_t *out;
-      ssize_t wn = nghttp2_session_mem_send(sess, &out);
-      if (wn <= 0)
-        break;
-      raw_h2_send_all(cfd, out, (size_t)wn);
-    }
+    h2_flush(sess, cfd);
   }
-  for (;;) {
-    const uint8_t *out;
-    ssize_t wn = nghttp2_session_mem_send(sess, &out);
-    if (wn <= 0)
-      break;
-    raw_h2_send_all(cfd, out, (size_t)wn);
-  }
+  h2_flush(sess, cfd);
   nghttp2_session_del(sess);
   close(cfd);
   return nullptr;
 }
 
+static h2_rec g_burst_rec;
+static h2_rec g_burst_rec2;
+static slow_h2_srv_ctx g_slow_ctx;
+static slow_h2_srv_ctx g_slow_ctx2;
+
 void test_integration_async_write_backpressure(void) {
   /* 1. Server-side async uv_write / on_session_write via 8 MiB burst + small SO_RCVBUF */
-  grpc_server *srv = grpc_server_new(&(grpc_config){
+  grpc_server *srv = fx_server(grpc_server_new(&(grpc_config){
       .port = 0,
       .ipv4_addr = "127.0.0.1",
       .max_message_size = 16 * 1024 * 1024,
       .log_level = GRPC_LOG_OFF,
-  });
-  TEST_ASSERT_NOT_NULL(srv);
+  }));
   TEST_ASSERT_EQUAL_INT(GRPC_OK,
                         grpc_server_handle(srv, "/bp.Svc/Burst", burst_8mb_handler, nullptr));
-  pthread_t th;
-  TEST_ASSERT_EQUAL_INT(0, pthread_create(&th, nullptr, run_server_fn, srv));
+  fx_start(srv);
 
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  TEST_ASSERT_TRUE(fd >= 0);
+  int fd = fx_fd(socket(AF_INET, SOCK_STREAM, 0));
   int rcvbuf = 4096;
   setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
   struct sockaddr_in sin = {0};
@@ -1737,14 +2598,9 @@ void test_integration_async_write_backpressure(void) {
   inet_pton(AF_INET, "127.0.0.1", &sin.sin_addr);
   TEST_ASSERT_EQUAL_INT(0, connect(fd, (struct sockaddr *)&sin, sizeof(sin)));
 
-  int done = 0;
-  nghttp2_session_callbacks *cbs = nullptr;
-  nghttp2_session_callbacks_new(&cbs);
-  nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, raw_h2_on_frame);
-  nghttp2_session *sess = nullptr;
-  nghttp2_session_client_new(&sess, cbs, &done);
-  nghttp2_session_callbacks_del(cbs);
-
+  h2_rec *rec = &g_burst_rec;
+  memset(rec, 0, sizeof(*rec));
+  nghttp2_session *sess = h2_client_session(rec);
   nghttp2_settings_entry iv[] = {{NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, 16 * 1024 * 1024}};
   nghttp2_submit_settings(sess, NGHTTP2_FLAG_NONE, iv, 1);
   nghttp2_session_set_local_window_size(sess, NGHTTP2_FLAG_NONE, 0, 16 * 1024 * 1024);
@@ -1752,82 +2608,51 @@ void test_integration_async_write_backpressure(void) {
   raw_h2_payload p = {.data = req_frame, .len = sizeof(req_frame), .off = 0};
   nghttp2_data_provider dp = {.source.ptr = &p, .read_callback = raw_h2_read_cb};
   nghttp2_nv hdrs[] = {
-      {(uint8_t *)":method", (uint8_t *)"POST", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":scheme", (uint8_t *)"http", 7, 4, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":path", (uint8_t *)"/bp.Svc/Burst", 5, 13, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)":authority", (uint8_t *)"localhost", 10, 9, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"content-type", (uint8_t *)"application/grpc", 12, 16, NGHTTP2_NV_FLAG_NONE},
-      {(uint8_t *)"te", (uint8_t *)"trailers", 2, 8, NGHTTP2_NV_FLAG_NONE},
+      NV(":method", "POST"),
+      NV(":scheme", "http"),
+      NV(":path", "/bp.Svc/Burst"),
+      NV(":authority", "localhost"),
+      NV("content-type", "application/grpc"),
+      NV("te", "trailers"),
   };
-  nghttp2_submit_request(sess, nullptr, hdrs, 6, &dp, nullptr);
-  for (;;) {
-    const uint8_t *out;
-    ssize_t n = nghttp2_session_mem_send(sess, &out);
-    if (n <= 0)
-      break;
-    raw_h2_send_all(fd, out, (size_t)n);
-  }
-  /* Pause so server's 8 MiB burst fills the tiny socket buffer -> uv_write + on_session_write */
-  uv_sleep(50);
-  struct timeval tv = {.tv_sec = 3, .tv_usec = 0};
-  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-  uint8_t rbuf[32768];
-  while (!done) {
-    ssize_t n = recv(fd, rbuf, sizeof(rbuf), 0);
-    if (n <= 0)
-      break;
-    nghttp2_session_mem_recv(sess, rbuf, (size_t)n);
-    for (;;) {
-      const uint8_t *out;
-      ssize_t wn = nghttp2_session_mem_send(sess, &out);
-      if (wn <= 0)
-        break;
-      raw_h2_send_all(fd, out, (size_t)wn);
-    }
-  }
-  TEST_ASSERT_EQUAL_INT(1, done);
-  nghttp2_session_del(sess);
-  close(fd);
+  int32_t sid = h2_track(rec, nghttp2_submit_request(sess, nullptr, hdrs, 6, &dp, nullptr));
+  h2_flush(sess, fd);
+  /* The handler queued its 8 MiB reply; let it fill the tiny socket buffer so the server's write
+   * goes through uv_write + on_session_write */
+  ASSERT_EVENTUALLY(srv_stats(srv).messages_sent >= 1);
+  wait_socket_backlog(fd);
+  H2_PUMP_UNTIL(sess, fd, h2_rec_find(rec, sid)->closed, 4 * WAIT_DEADLINE_MS);
+  assert_grpc_stream(rec, sid, GRPC_STATUS_OK);
+  TEST_ASSERT_EQUAL_UINT64(5 + 8 * 1024 * 1024, h2_rec_find(rec, sid)->body_total);
+  fx_session_del(sess);
+  fx_close(fd);
 
   /* 1b. Server-side abort mid async uv_write (on_session_write status < 0) */
-  int fd2 = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd2 >= 0) {
-    setsockopt(fd2, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-    if (connect(fd2, (struct sockaddr *)&sin, sizeof(sin)) == 0) {
-      int done2 = 0;
-      nghttp2_session_callbacks *cbs2 = nullptr;
-      nghttp2_session_callbacks_new(&cbs2);
-      nghttp2_session *sess2 = nullptr;
-      nghttp2_session_client_new(&sess2, cbs2, &done2);
-      nghttp2_session_callbacks_del(cbs2);
-      nghttp2_submit_settings(sess2, NGHTTP2_FLAG_NONE, iv, 1);
-      nghttp2_session_set_local_window_size(sess2, NGHTTP2_FLAG_NONE, 0, 16 * 1024 * 1024);
-      raw_h2_payload p2 = {.data = req_frame, .len = sizeof(req_frame), .off = 0};
-      nghttp2_data_provider dp2 = {.source.ptr = &p2, .read_callback = raw_h2_read_cb};
-      nghttp2_submit_request(sess2, nullptr, hdrs, 6, &dp2, nullptr);
-      for (;;) {
-        const uint8_t *out;
-        ssize_t n = nghttp2_session_mem_send(sess2, &out);
-        if (n <= 0)
-          break;
-        raw_h2_send_all(fd2, out, (size_t)n);
-      }
-      uv_sleep(50);
-      struct linger lg = {.l_onoff = 1, .l_linger = 0};
-      setsockopt(fd2, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
-      nghttp2_session_del(sess2);
-    }
-    close(fd2);
-    uv_sleep(30);
-  }
+  int fd2 = fx_fd(socket(AF_INET, SOCK_STREAM, 0));
+  setsockopt(fd2, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+  TEST_ASSERT_EQUAL_INT(0, connect(fd2, (struct sockaddr *)&sin, sizeof(sin)));
+  h2_rec *rec2 = &g_burst_rec2;
+  memset(rec2, 0, sizeof(*rec2));
+  nghttp2_session *sess2 = h2_client_session(rec2);
+  nghttp2_submit_settings(sess2, NGHTTP2_FLAG_NONE, iv, 1);
+  nghttp2_session_set_local_window_size(sess2, NGHTTP2_FLAG_NONE, 0, 16 * 1024 * 1024);
+  raw_h2_payload p2 = {.data = req_frame, .len = sizeof(req_frame), .off = 0};
+  nghttp2_data_provider dp2 = {.source.ptr = &p2, .read_callback = raw_h2_read_cb};
+  h2_track(rec2, nghttp2_submit_request(sess2, nullptr, hdrs, 6, &dp2, nullptr));
+  h2_flush(sess2, fd2);
+  ASSERT_EVENTUALLY(srv_stats(srv).messages_sent >= 2);
+  wait_socket_backlog(fd2);
+  struct linger lg = {.l_onoff = 1, .l_linger = 0};
+  setsockopt(fd2, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+  fx_session_del(sess2);
+  fx_close(fd2);
+  /* the server sees the reset under its pending write and closes the connection */
+  ASSERT_EVENTUALLY(srv_stats(srv).active_connections == 0);
 
-  grpc_server_stop(srv);
-  pthread_join(th, nullptr);
-  grpc_server_free(srv);
+  fx_server_free(srv);
 
   /* 2. Client-side async uv_write / on_sub_write via 8 MiB upload to slow raw HTTP/2 server */
-  int lfd = socket(AF_INET, SOCK_STREAM, 0);
-  TEST_ASSERT_TRUE(lfd >= 0);
+  int lfd = fx_fd(socket(AF_INET, SOCK_STREAM, 0));
   int opt = 1;
   setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
   int lrcv = 4096;
@@ -1842,42 +2667,44 @@ void test_integration_async_write_backpressure(void) {
   TEST_ASSERT_EQUAL_INT(0, getsockname(lfd, (struct sockaddr *)&lsin, &slen));
   uint16_t lport = ntohs(lsin.sin_port);
 
-  slow_h2_srv_ctx sctx = {.listen_fd = lfd};
+  g_slow_ctx = (slow_h2_srv_ctx){.listen_fd = lfd};
   pthread_t sth;
-  TEST_ASSERT_EQUAL_INT(0, pthread_create(&sth, nullptr, slow_h2_server_thread, &sctx));
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&sth, nullptr, slow_h2_server_thread, &g_slow_ctx));
+  fx_raw_thread(sth, lfd);
 
   grpc_err err = GRPC_OK;
-  grpc_client *c = grpc_client_new(
-      &(grpc_client_config){.host = "127.0.0.1", .port = lport, .timeout_ms = 5000}, &err);
+  grpc_client *c = fx_client(grpc_client_new(
+      &(grpc_client_config){.host = "127.0.0.1", .port = lport, .timeout_ms = 5000}, &err));
   TEST_ASSERT_NOT_NULL(c);
   size_t big = 8 * 1024 * 1024;
-  char *payload = grpc_malloc(big);
-  TEST_ASSERT_NOT_NULL(payload);
+  char *payload = fx_mem(grpc_malloc(big));
   memset(payload, 'C', big);
   grpc_client_response resp = {0};
   TEST_ASSERT_EQUAL_INT(
       GRPC_OK, grpc_client_unary(c, "/bp.Svc/Upload", payload, big, nullptr, 0, 5000, &resp));
   TEST_ASSERT_EQUAL_INT(GRPC_STATUS_OK, resp.status);
   grpc_client_response_free(&resp);
-  grpc_free(payload);
-  grpc_client_free(c);
-  pthread_join(sth, nullptr);
+  fx_free(payload);
+  fx_client_free(c);
+  fx_raw_join(sth);
 
-  /* 3. Abort mid async uv_write on client (on_sub_write status < 0) */
-  slow_h2_srv_ctx sctx2 = {.listen_fd = lfd, .abort_mid_write = true};
-  TEST_ASSERT_EQUAL_INT(0, pthread_create(&sth, nullptr, slow_h2_server_thread, &sctx2));
-  grpc_client *c2 = grpc_client_new(
-      &(grpc_client_config){.host = "127.0.0.1", .port = lport, .timeout_ms = 2000}, &err);
+  /* 3. Abort mid async uv_write on client (on_sub_write status < 0): the call fails */
+  g_slow_ctx2 = (slow_h2_srv_ctx){.listen_fd = lfd, .abort_mid_write = true};
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&sth, nullptr, slow_h2_server_thread, &g_slow_ctx2));
+  fx_raw_thread(sth, lfd);
+  grpc_client *c2 = fx_client(grpc_client_new(
+      &(grpc_client_config){.host = "127.0.0.1", .port = lport, .timeout_ms = 2000}, &err));
   TEST_ASSERT_NOT_NULL(c2);
-  payload = grpc_malloc(big);
-  TEST_ASSERT_NOT_NULL(payload);
+  payload = fx_mem(grpc_malloc(big));
   memset(payload, 'D', big);
-  (void)grpc_client_unary(c2, "/bp.Svc/Upload", payload, big, nullptr, 0, 2000, &resp);
+  grpc_err arc = grpc_client_unary(c2, "/bp.Svc/Upload", payload, big, nullptr, 0, 2000, &resp);
+  TEST_ASSERT_TRUE_MESSAGE(arc == GRPC_ERR_IO || arc == GRPC_ERR_CLOSED,
+                           "upload to a peer that reset the connection did not fail");
   grpc_client_response_free(&resp);
-  grpc_free(payload);
-  grpc_client_free(c2);
-  pthread_join(sth, nullptr);
-  close(lfd);
+  fx_free(payload);
+  fx_client_free(c2);
+  fx_raw_join(sth);
+  fx_close(lfd);
 }
 #endif
 

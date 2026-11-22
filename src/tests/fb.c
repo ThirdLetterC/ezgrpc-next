@@ -76,11 +76,13 @@ void test_fb_rejects_invalid(void) {
 
   /* truncated */
   grpc_message *cut = grpc_message_new(msg->data, msg->len / 2);
+  TEST_ASSERT_NOT_NULL(cut);
   TEST_ASSERT_NULL(GRPC_FB_UNPACK(test_Echo, cut));
   grpc_message_free(cut);
 
   /* root offset pointing outside the buffer */
   grpc_message *bad = grpc_message_new(msg->data, msg->len);
+  TEST_ASSERT_NOT_NULL(bad);
   bad->data[0] = 0xff;
   bad->data[1] = 0xff;
   TEST_ASSERT_NULL(GRPC_FB_UNPACK(test_Echo, bad));
@@ -88,11 +90,13 @@ void test_fb_rejects_invalid(void) {
 
   /* not a FlatBuffer at all */
   grpc_message *junk = grpc_message_new("junk", 4);
+  TEST_ASSERT_NOT_NULL(junk);
   TEST_ASSERT_NULL(GRPC_FB_UNPACK(test_Echo, junk));
   grpc_message_free(junk);
 
   /* empty */
   grpc_message *empty = grpc_message_new(nullptr, 0);
+  TEST_ASSERT_NOT_NULL(empty);
   TEST_ASSERT_NULL(GRPC_FB_UNPACK(test_Echo, empty));
   grpc_message_free(empty);
 
@@ -122,7 +126,11 @@ void test_fb_null_safety(void) {
 }
 
 int main(void) {
-  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_fb_builder_init(&builder));
+  /* outside RUN_TEST a failed assertion has no test to abort, so check it by hand */
+  if (grpc_fb_builder_init(&builder) != GRPC_OK) {
+    fprintf(stderr, "grpc_fb_builder_init failed\n");
+    return 1;
+  }
   UNITY_BEGIN();
   RUN_TEST(test_fb_pack_and_unpack);
   RUN_TEST(test_fb_builder_reuse);
