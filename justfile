@@ -26,7 +26,7 @@ test filter="": build
 unit: build
     ctest --test-dir {{build_dir}} --output-on-failure -j {{jobs}} -L unit
 
-# Run integration tests only (needs python3 with grpcio, grpcio-tools, protobuf)
+# Run integration tests only (configure finds python with grpcio, grpcio-tools, protobuf, or makes build/_deps/python-venv)
 integration: build
     ctest --test-dir {{build_dir}} --output-on-failure -L integration
 

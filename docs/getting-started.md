@@ -6,14 +6,52 @@
 - **Compiler**: GCC 11+ or Clang 14+ (`-std=c23` or `-std=c2x`), or MSVC 19.44+ (Visual Studio 2022 17.14+).
 - **Build system**: CMake 3.20 or newer.
 - **Logger dependency**: CMake fetches the pinned [ulog](https://github.com/ThirdLetterC/ulog) source at configure time. For offline builds, set `-DFETCHCONTENT_SOURCE_DIR_ULOG=/path/to/ulog`.
-- **Required libraries**: `libuv`, `libnghttp2`, and `pthread` on Unix.
-- **Optional libraries** (auto-detected when installed):
-  - TLS: OpenSSL (default), LibreSSL, BoringSSL, AWS-LC, wolfSSL, GnuTLS, or rustls
-  - Compression: `zlib` (gzip/deflate), `libzstd`, `libsnappy`
-  - Serialization: `protobuf-c`, `flatcc` (build via `scripts/build-flatcc.sh`)
-  - Allocators: `mimalloc`, `jemalloc`
+- **Required libraries**: `libuv`, `libnghttp2`, and `pthread` on Unix. They are downloaded and built by default (see below).
+- **Optional libraries**:
+  - TLS: OpenSSL (default), LibreSSL, BoringSSL, AWS-LC, wolfSSL, GnuTLS, or rustls. Always taken from the system or `GRPC_TLS_PREFIX`.
+  - Compression: `zlib` (gzip/deflate), `libzstd`, `libsnappy`. Downloaded by default.
+  - Serialization: `protobuf-c` (runtime downloaded by default; the `protoc-c` generator, needed only by its test and example, comes from the system) and `flatcc` (build it with `scripts/build-flatcc.sh`).
+  - Allocators: `mimalloc`, `jemalloc`.
 
-### Debian / Ubuntu
+A fresh Linux machine needs only a compiler, CMake, and OpenSSL headers. A C++ compiler is also needed for Snappy, which is skipped without one:
+
+```bash
+sudo apt-get install -y build-essential cmake libssl-dev
+```
+
+### Third-party libraries: bundled by default
+
+With `GRPC_DEPENDENCIES=BUNDLED` (the default), configure downloads pinned releases of nghttp2, libuv, zlib, zstd, Snappy and the protobuf-c runtime. Each archive comes from its GitHub release (or a listed mirror) and is checked against a SHA-256. Each library is built once, as a static position-independent library, into `build/_deps/bundled`. Nothing installed on the system can shadow these builds. They are linked into `libgrpc` and are not re-exported from `libgrpc.so`. `cmake --install` puts them in `<libdir>/ezgrpc-next/`, so the installed CMake package and `pkg-config --static` keep working.
+
+The first configure takes about half a minute; later ones reuse the build. Archives are cached in `~/.cache/ezgrpc-next` (`%LOCALAPPDATA%\ezgrpc-next\cache` on Windows), which every build directory shares. Deleting `build/` therefore does not download them again.
+
+| Option | Description |
+|:---|:---|
+| `-DGRPC_DEPENDENCIES=SYSTEM` | Use installed packages (CMake packages, then pkg-config, then a header/library search). The default under a vcpkg toolchain |
+| `-DGRPC_SYSTEM_DEPENDENCIES="libuv;zlib"` | In bundled mode, take only these from the system: any of `nghttp2;libuv;zlib;zstd;snappy;protobuf-c;python` |
+| `-DGRPC_DEPS_MIRRORS="https://mirror.example/ezgrpc"` | Base URLs tried before upstream. Each one serves the archive file names listed in `cmake/GrpcBundledDeps.cmake`. Also read from the `GRPC_DEPS_MIRRORS` environment variable |
+| `-DGRPC_DEPS_CACHE_DIR=path` | Download cache (env `GRPC_DEPS_CACHE_DIR`). For an offline machine, copy the archives here |
+
+If a download fails, configure warns and falls back to the system copy of that library. The pins (version, URLs, SHA-256) are in `cmake/GrpcBundledDeps.cmake`.
+
+### Library checks and the configuration summary
+
+Each candidate library, bundled or from the system, must compile and link a small test program before it is accepted. When the shared library is built on Linux, that program is linked as a shared object. This rejects a static archive built without `-fPIC` (for example an old `~/.local/lib/libprotobuf-c.a`) at configure time, instead of failing at the final `libgrpc.so` link. A rejected candidate does not stop the search: the next source is tried. If nothing fits, the error lists every rejected candidate with its reason (missing header, not PIC, link error) and the install command for common package managers.
+
+The configuration summary ends with where each dependency came from:
+
+```text
+     dependencies   BUNDLED (GRPC_DEPENDENCIES)
+       nghttp2        bundled 1.71.0
+       libuv          bundled 1.53.0
+       ...
+       tls            system openssl 3.0.13 (/usr/lib/x86_64-linux-gnu/libssl.so)
+       python         system (/usr/bin/python3)
+```
+
+### Using system packages instead (`-DGRPC_DEPENDENCIES=SYSTEM`)
+
+Debian / Ubuntu (note `libnghttp2-dev`; the `nghttp2` package only has the command-line tools):
 
 ```bash
 sudo apt-get update
@@ -23,7 +61,9 @@ sudo apt-get install -y \
   libmimalloc-dev libjemalloc-dev
 ```
 
-For Python integration tests: `pip install grpcio grpcio-tools protobuf`.
+### Python for the integration tests
+
+The integration tests need `grpcio`, `grpcio-tools` and `protobuf` (`scripts/requirements-test.txt`). Configure picks the first interpreter that has them: `Python3_EXECUTABLE`, then `python3` and `python` on `PATH`. If none does, bundled mode creates `build/_deps/python-venv` and installs the requirements there. Otherwise the integration tests are skipped with a warning that names the interpreter and the `pip install` command; the build itself is not affected. To choose an interpreter: `-DPython3_EXECUTABLE=/path/to/python`.
 
 ---
 
@@ -108,7 +148,8 @@ cc my_app.c $(pkg-config --cflags ezgrpc-next) /usr/local/lib/libgrpc.a $(pkg-co
 
 | Preset | Configuration |
 |:---|:---|
-| `dev` | Debug, every feature found on the system, tests and examples |
+| `dev` | Debug, every feature (bundled dependencies), tests and examples |
+| `system` | Debug like `dev`, with installed packages (`GRPC_DEPENDENCIES=SYSTEM`) |
 | `release` | Release with IPO |
 | `asan` | Debug under AddressSanitizer + UndefinedBehaviorSanitizer |
 | `tsan` | Debug under ThreadSanitizer (run tests with `setarch -R` on kernels with high ASLR entropy) |
@@ -131,6 +172,7 @@ Put personal presets in `CMakeUserPresets.json` (ignored by git).
 | Option / Target | Description |
 |:---|:---|
 | `cmake --build build --target check` | Builds and runs registered unit and integration tests |
+| `-DGRPC_DEPENDENCIES=BUNDLED\|SYSTEM` | Download and build third-party libraries (default) or use installed ones; see [above](#third-party-libraries-bundled-by-default) |
 | `-DGRPC_BUILD_SHARED=OFF` | Builds only the static library |
 | `-DGRPC_IPO=ON` | Enables compiler-checked IPO/LTO in optimized builds |
 | `-DGRPC_ALLOCATOR=<name>` | `default`, `mimalloc`, or `jemalloc` |

@@ -13,9 +13,16 @@
     {
       "name": "dev",
       "displayName": "Development (Debug)",
-      "description": "Debug build with every feature found on the system, tests and examples.",
+      "description": "Debug build with every feature, tests and examples; third-party libraries are downloaded and built (GRPC_DEPENDENCIES=BUNDLED).",
       "inherits": "base",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "system",
+      "displayName": "Development with system packages",
+      "description": "Like dev, but every third-party library comes from installed packages instead of the bundled, downloaded builds.",
+      "inherits": "base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "GRPC_DEPENDENCIES": "SYSTEM" }
     },
     {
       "name": "release",
@@ -89,6 +96,7 @@
   ],
   "buildPresets": [
     { "name": "dev", "configurePreset": "dev" },
+    { "name": "system", "configurePreset": "system" },
     { "name": "release", "configurePreset": "release" },
     { "name": "asan", "configurePreset": "asan" },
     { "name": "tsan", "configurePreset": "tsan" },
@@ -104,6 +112,7 @@
       "execution": { "noTestsAction": "error" }
     },
     { "name": "dev", "inherits": "base", "configurePreset": "dev" },
+    { "name": "system", "inherits": "base", "configurePreset": "system" },
     { "name": "release", "inherits": "base", "configurePreset": "release" },
     { "name": "asan", "inherits": "base", "configurePreset": "asan" },
     { "name": "tsan", "inherits": "base", "configurePreset": "tsan" },

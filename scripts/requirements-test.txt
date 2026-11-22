@@ -1,0 +1,8 @@
+# Python packages for the integration tests and the Python example clients.
+#   python3 -m pip install -r scripts/requirements-test.txt
+# With GRPC_DEPENDENCIES=BUNDLED (the default), CMake installs them into build/_deps/python-venv
+# when the interpreter it finds lacks them.
+grpcio>=1.60
+grpcio-tools>=1.60
+protobuf>=4.25
+flatbuffers==25.12.19

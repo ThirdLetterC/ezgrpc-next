@@ -60,9 +60,40 @@ set(GRPC_TLS_BACKEND "AUTO" CACHE STRING "TLS backend: AUTO, openssl, libressl, 
 set_property(CACHE GRPC_TLS_BACKEND PROPERTY STRINGS AUTO openssl libressl boringssl awslc wolfssl gnutls rustls none)
 set(GRPC_TLS_PREFIX "" CACHE PATH "Prefix containing a non-system TLS backend")
 set(GRPC_FLATCC_PREFIX "" CACHE PATH "Prefix containing flatcc, headers, and runtime library")
-if(GRPC_BUILD_INTEGRATION_TESTS AND GRPC_BUILD_EXAMPLES)
-  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
+# Where third-party libraries come from (cmake/GrpcBundledDeps.cmake). BUNDLED downloads pinned,
+# checksummed releases and builds them; SYSTEM uses installed packages. A vcpkg toolchain means the
+# caller already manages packages, so SYSTEM is the default there.
+if(CMAKE_TOOLCHAIN_FILE MATCHES "vcpkg\\.cmake$" OR VCPKG_TOOLCHAIN)
+  set(_grpc_default_dependencies SYSTEM)
+else()
+  set(_grpc_default_dependencies BUNDLED)
 endif()
+set(GRPC_DEPENDENCIES "${_grpc_default_dependencies}" CACHE STRING
+  "Third-party libraries: BUNDLED (download pinned releases and build them) or SYSTEM (installed packages)")
+set_property(CACHE GRPC_DEPENDENCIES PROPERTY STRINGS BUNDLED SYSTEM)
+string(TOUPPER "${GRPC_DEPENDENCIES}" GRPC_DEPENDENCIES)
+if(NOT GRPC_DEPENDENCIES MATCHES "^(BUNDLED|SYSTEM)$")
+  message(FATAL_ERROR "GRPC_DEPENDENCIES must be BUNDLED or SYSTEM")
+endif()
+set(GRPC_SYSTEM_DEPENDENCIES "" CACHE STRING
+  "With GRPC_DEPENDENCIES=BUNDLED, dependencies to take from the system anyway: any of nghttp2;libuv;zlib;zstd;snappy;protobuf-c;python")
+set(GRPC_DEPS_MIRRORS "$ENV{GRPC_DEPS_MIRRORS}" CACHE STRING
+  "Base URLs tried before upstream when downloading bundled dependencies (each serves the archive file names)")
+if(DEFINED ENV{GRPC_DEPS_CACHE_DIR})
+  set(_grpc_default_cache "$ENV{GRPC_DEPS_CACHE_DIR}")
+elseif(WIN32 AND DEFINED ENV{LOCALAPPDATA})
+  set(_grpc_default_cache "$ENV{LOCALAPPDATA}/ezgrpc-next/cache")
+elseif(DEFINED ENV{XDG_CACHE_HOME})
+  set(_grpc_default_cache "$ENV{XDG_CACHE_HOME}/ezgrpc-next")
+elseif(DEFINED ENV{HOME})
+  set(_grpc_default_cache "$ENV{HOME}/.cache/ezgrpc-next")
+else()
+  set(_grpc_default_cache "${FETCHCONTENT_BASE_DIR}/downloads")
+endif()
+file(TO_CMAKE_PATH "${_grpc_default_cache}" _grpc_default_cache)
+set(GRPC_DEPS_CACHE_DIR "${_grpc_default_cache}" CACHE PATH
+  "Download cache for bundled dependency archives, shared by build directories")
 
 foreach(feature IN ITEMS PROTOBUF_C FLATCC ZLIB ZSTD SNAPPY HTTP3)
   set(GRPC_${feature} "AUTO" CACHE STRING "${feature} support: AUTO, ON, or OFF")
@@ -106,7 +137,11 @@ include(cmake/GrpcCompiler.cmake)
 
 include(cmake/GrpcUlog.cmake)
 
+include(cmake/GrpcBundledDeps.cmake)
+
 include(cmake/GrpcDependencies.cmake)
+
+include(cmake/GrpcPython.cmake)
 
 set(GRPC_GENERATED_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
 file(MAKE_DIRECTORY "${GRPC_GENERATED_INCLUDE_DIR}")
@@ -239,6 +274,15 @@ endif()
     # after install; system library directories are never added
     set_target_properties(grpc_shared PROPERTIES INSTALL_RPATH_USE_LINK_PATH ON)
     target_link_options(grpc_shared PRIVATE ${GRPC_HARDENING_LINK_FLAGS})
+    if(NOT WIN32 AND NOT APPLE)
+      # the static archives linked in (bundled nghttp2, libuv, ...) stay private to libgrpc.so,
+      # so they cannot interpose on another copy an application loads
+      include(CheckLinkerFlag)
+      check_linker_flag(C "LINKER:--exclude-libs,ALL" GRPC_HAS_LINK_EXCLUDE_LIBS)
+      if(GRPC_HAS_LINK_EXCLUDE_LIBS)
+        target_link_options(grpc_shared PRIVATE "LINKER:--exclude-libs,ALL")
+      endif()
+    endif()
   if(WIN32)
     # The DLL import library and the static archive must not both be grpc.lib.
     set_target_properties(grpc_shared PROPERTIES ARCHIVE_OUTPUT_NAME grpc_dll
@@ -278,11 +322,38 @@ target_link_libraries(grpc_objects PRIVATE ${GRPC_LINK_LIBRARIES})
 # Installed consumers of the static library also need ulog and every dependency; the shared
 # library records its dependencies itself.
 grpc_resolve_link_files(GRPC_INSTALL_LINK_FILES ${GRPC_LINK_LIBRARIES})
+# Bundled dependency archives are installed next to the library, in <libdir>/ezgrpc-next, so
+# their install-interface paths point there instead of into this build tree.
+set(GRPC_BUNDLED_INSTALL_FILES)
+set(GRPC_INSTALL_LINK_ITEMS)
 foreach(item IN LISTS GRPC_INSTALL_LINK_FILES)
-  if(NOT item STREQUAL "Threads::Threads")
+  string(FIND "${item}" "${GRPC_BUNDLED_DIR}/install/" _grpc_bundled_pos)
+  if(_grpc_bundled_pos EQUAL 0)
+    set(_grpc_item_in_bundled TRUE)
+  else()
+    set(_grpc_item_in_bundled FALSE)
+  endif()
+  if(item STREQUAL "Threads::Threads")
+    list(APPEND GRPC_INSTALL_LINK_ITEMS "${item}")
+  elseif(IS_ABSOLUTE "${item}" AND _grpc_item_in_bundled)
+    get_filename_component(name "${item}" NAME)
+    list(APPEND GRPC_BUNDLED_INSTALL_FILES "${item}")
+    list(APPEND GRPC_INSTALL_LINK_ITEMS "@bundled@/${name}")
+    target_link_libraries(grpc_static PUBLIC
+      "$<INSTALL_INTERFACE:$<INSTALL_PREFIX>/${CMAKE_INSTALL_LIBDIR}/ezgrpc-next/${name}>")
+  else()
+    list(APPEND GRPC_INSTALL_LINK_ITEMS "${item}")
     target_link_libraries(grpc_static PUBLIC "$<INSTALL_INTERFACE:${item}>")
   endif()
 endforeach()
+list(REMOVE_DUPLICATES GRPC_BUNDLED_INSTALL_FILES)
+# the public grpc_protobuf_c.h includes <protobuf-c/protobuf-c.h>, so a bundled copy is installed
+set(GRPC_BUNDLED_PUBLIC_HEADERS FALSE)
+if(GRPC_PROTOBUF_C_ENABLED AND GRPC_PROTOBUF_C_TARGET MATCHES "^grpc_bundled_")
+  set(GRPC_BUNDLED_PUBLIC_HEADERS TRUE)
+  target_include_directories(grpc_static PUBLIC
+    "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/ezgrpc-next>")
+endif()
 target_link_libraries(grpc_static PUBLIC $<INSTALL_INTERFACE:ulog>)
 foreach(library_target IN LISTS GRPC_LIBRARY_TARGETS)
   target_link_libraries(${library_target} PUBLIC $<BUILD_INTERFACE:${GRPC_LINK_LIBRARIES}>)
@@ -400,7 +471,7 @@ if(GRPC_BUILD_TESTS)
     endif()
   endif()
 
-  if(GRPC_PROTOBUF_C_ENABLED)
+  if(GRPC_PROTOBUF_C_ENABLED AND PROTOC_C_EXECUTABLE)
     set(proto_test_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/protobuf-tests")
     file(MAKE_DIRECTORY "${proto_test_dir}")
     add_custom_command(OUTPUT "${proto_test_dir}/test_msg.pb-c.c" "${proto_test_dir}/test_msg.pb-c.h"
@@ -489,7 +560,7 @@ function(grpc_add_integration_test name)
     list(APPEND extra --python-path "${arg_PYTHON_PATH}")
   endif()
   add_test(NAME integration_${name}
-    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run-integration-test.py"
+    COMMAND "${GRPC_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run-integration-test.py"
       --server "$<TARGET_FILE:${arg_SERVER}>" --client "${arg_CLIENT}"
       --port ${arg_PORT} --cwd "${arg_CWD}" ${extra})
 endfunction()
@@ -503,7 +574,7 @@ if(GRPC_BUILD_EXAMPLES)
   target_link_libraries(example_multi_threaded PRIVATE grpc_static)
   list(APPEND GRPC_EXAMPLE_TARGETS example_single_threaded example_multi_threaded)
 
-  if(GRPC_PROTOBUF_C_ENABLED)
+  if(GRPC_PROTOBUF_C_ENABLED AND PROTOC_C_EXECUTABLE)
     set(proto_example_dir "${CMAKE_CURRENT_BINARY_DIR}/generated/protobuf-example")
     file(MAKE_DIRECTORY "${proto_example_dir}")
     add_custom_command(OUTPUT "${proto_example_dir}/helloworld.pb-c.c" "${proto_example_dir}/helloworld.pb-c.h"
@@ -514,7 +585,7 @@ if(GRPC_BUILD_EXAMPLES)
     if(GRPC_BUILD_INTEGRATION_TESTS)
       set(proto_python_outputs "${proto_python_dir}/helloworld_pb2.py" "${proto_python_dir}/helloworld_pb2_grpc.py")
       add_custom_command(OUTPUT ${proto_python_outputs}
-        COMMAND "${Python3_EXECUTABLE}" -m grpc_tools.protoc
+        COMMAND "${GRPC_PYTHON_EXECUTABLE}" -m grpc_tools.protoc
           -I "${CMAKE_CURRENT_SOURCE_DIR}/examples/python_client_c_server"
           "--python_out=${proto_python_dir}" "--grpc_python_out=${proto_python_dir}"
           "${CMAKE_CURRENT_SOURCE_DIR}/examples/python_client_c_server/helloworld.proto"
@@ -581,10 +652,7 @@ if(GRPC_BUILD_EXAMPLES)
       list(APPEND GRPC_EXAMPLE_TARGETS example_http3_${side})
     endforeach()
     # the runner needs only the Python standard library, so this runs wherever tests do
-    if(NOT Python3_EXECUTABLE)
-      find_package(Python3 COMPONENTS Interpreter QUIET)
-    endif()
-    if((GRPC_BUILD_TESTS OR GRPC_BUILD_INTEGRATION_TESTS) AND Python3_EXECUTABLE)
+    if((GRPC_BUILD_TESTS OR GRPC_BUILD_INTEGRATION_TESTS) AND GRPC_PYTHON_EXECUTABLE)
       grpc_add_integration_test(http3_example SERVER example_http3_server
         CLIENT "$<TARGET_FILE:example_http3_client>" PORT 19051 CWD "${http3_example_dir}")
     endif()
@@ -663,6 +731,15 @@ if(GRPC_INSTALL)
     PATTERN "internal" EXCLUDE)
   install(FILES "${GRPC_GENERATED_INCLUDE_DIR}/grpc_version_config.h"
     DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
+  if(GRPC_BUNDLED_INSTALL_FILES)
+    install(FILES ${GRPC_BUNDLED_INSTALL_FILES}
+      DESTINATION "${CMAKE_INSTALL_LIBDIR}/ezgrpc-next")
+  endif()
+  if(GRPC_BUNDLED_PUBLIC_HEADERS)
+    get_target_property(_pbc_include ${GRPC_PROTOBUF_C_TARGET} INTERFACE_INCLUDE_DIRECTORIES)
+    install(DIRECTORY "${_pbc_include}/protobuf-c"
+      DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/ezgrpc-next")
+  endif()
   install(EXPORT ezGRPC-nextTargets
     FILE ezGRPC-nextTargets.cmake
     NAMESPACE grpc::
@@ -691,9 +768,11 @@ if(GRPC_INSTALL)
     DESTINATION "${GRPC_INSTALL_CMAKEDIR}")
   # pkg-config: the same dependency files for `--static`, and the feature defines in Cflags
   set(GRPC_PC_LIBS_PRIVATE "-lulog")
-  foreach(item IN LISTS GRPC_INSTALL_LINK_FILES)
+  foreach(item IN LISTS GRPC_INSTALL_LINK_ITEMS)
     if(item STREQUAL "Threads::Threads")
       string(APPEND GRPC_PC_LIBS_PRIVATE " -pthread")
+    elseif(item MATCHES "^@bundled@/(.*)$")
+      string(APPEND GRPC_PC_LIBS_PRIVATE " \${libdir}/ezgrpc-next/${CMAKE_MATCH_1}")
     elseif(IS_ABSOLUTE "${item}")
       string(APPEND GRPC_PC_LIBS_PRIVATE " ${item}")
     else()
@@ -701,6 +780,9 @@ if(GRPC_INSTALL)
     endif()
   endforeach()
   set(GRPC_PC_CFLAGS "")
+  if(GRPC_BUNDLED_PUBLIC_HEADERS)
+    string(APPEND GRPC_PC_CFLAGS " -I\${includedir}/ezgrpc-next")
+  endif()
   foreach(def IN LISTS GRPC_PUBLIC_COMPILE_DEFINITIONS)
     if(NOT def MATCHES "^\\$<")
       string(APPEND GRPC_PC_CFLAGS " -D${def}")
@@ -737,6 +819,19 @@ set(_s_sanitizers "none")
 if(_grpc_sanitizers)
   list(JOIN _grpc_sanitizers "," _s_sanitizers)
 endif()
+set(_s_dependencies "")
+foreach(_entry IN LISTS GRPC_DEPENDENCY_REPORT)
+  string(REPLACE "|" ";" _entry "${_entry}")
+  list(GET _entry 0 _dep_name)
+  list(GET _entry 1 _dep_source)
+  string(LENGTH "${_dep_name}" _dep_len)
+  math(EXPR _pad "15 - ${_dep_len}")
+  if(_pad LESS 1)
+    set(_pad 1)
+  endif()
+  string(REPEAT " " ${_pad} _spaces)
+  string(APPEND _s_dependencies "\n       ${_dep_name}${_spaces}${_dep_source}")
+endforeach()
 message(STATUS "ezGRPC-next ${PROJECT_VERSION} configuration:
      build type     ${CMAKE_BUILD_TYPE}
      TLS backend    ${_tls_backend}
@@ -745,4 +840,5 @@ message(STATUS "ezGRPC-next ${PROJECT_VERSION} configuration:
      serialization  protobuf-c=${_s_PROTOBUF_C} flatcc=${_s_FLATCC}
      HTTP/3         ${_s_HTTP3}${_s_http3_detail}
      shared library ${_s_BUILD_SHARED}   IPO ${_s_IPO}   sanitizers ${_s_sanitizers}
-     tests          unit=${_s_BUILD_TESTS} integration=${_s_BUILD_INTEGRATION_TESTS} examples=${_s_BUILD_EXAMPLES}")
+     tests          unit=${_s_BUILD_TESTS} integration=${_s_BUILD_INTEGRATION_TESTS} examples=${_s_BUILD_EXAMPLES}
+     dependencies   ${GRPC_DEPENDENCIES} (GRPC_DEPENDENCIES)${_s_dependencies}")

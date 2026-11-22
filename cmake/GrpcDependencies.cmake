@@ -46,7 +46,11 @@ endfunction()
 function(grpc_feature_enabled feature found description)
   string(TOUPPER "${GRPC_${feature}}" setting)
   if(setting STREQUAL "ON" AND NOT found)
-    message(FATAL_ERROR "${description} was requested but its dependency was not found")
+    set(detail "")
+    if(ARGC GREATER 3)
+      set(detail "\n${ARGV3}")
+    endif()
+    message(FATAL_ERROR "${description} was requested (GRPC_${feature}=ON) but is not available.${detail}\nSet -DGRPC_${feature}=AUTO to build without it.")
   endif()
   if(setting STREQUAL "OFF")
     set(enabled FALSE)
@@ -58,16 +62,130 @@ function(grpc_feature_enabled feature found description)
   set(GRPC_${feature}_ENABLED "${enabled}" PARENT_SCOPE)
 endfunction()
 
-# Finds a library and returns an imported target for it, trying in order:
+# Install commands for each dependency's development files, quoted in error messages.
+set(GRPC_HINT_nghttp2 "apt install libnghttp2-dev | dnf install libnghttp2-devel | brew install nghttp2 | vcpkg install nghttp2")
+set(GRPC_HINT_libuv "apt install libuv1-dev | dnf install libuv-devel | brew install libuv | vcpkg install libuv")
+set(GRPC_HINT_zlib "apt install zlib1g-dev | dnf install zlib-devel | brew install zlib | vcpkg install zlib")
+set(GRPC_HINT_zstd "apt install libzstd-dev | dnf install libzstd-devel | brew install zstd | vcpkg install zstd")
+set(GRPC_HINT_snappy "apt install libsnappy-dev | dnf install snappy-devel | brew install snappy | vcpkg install snappy")
+set(GRPC_HINT_protobuf_c "apt install libprotobuf-c-dev protobuf-c-compiler | dnf install protobuf-c-devel protobuf-c-compiler | brew install protobuf-c")
+
+# grpc_check_library(<out> <target> <header> <symbol>)
+# Accepts a candidate only if a program including <header> compiles and links a reference to
+# <symbol> through <target>. On ELF platforms, when the shared library is built, the program is
+# linked as a shared object. That rejects static archives built without -fPIC, which could not go
+# into libgrpc.so. Sets <out> and, on failure, <out>_REASON.
+function(grpc_check_library out target header symbol)
+  string(MAKE_C_IDENTIFIER "${target}" id)
+  set(dir "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/grpc-library-checks")
+  set(source "${dir}/${id}.c")
+  file(MAKE_DIRECTORY "${dir}")
+  file(WRITE "${source}" "#include <${header}>\nint main(void) {\n  void (*volatile probe)(void) = (void (*)(void))&${symbol};\n  return probe == 0;\n}\n")
+  set(compile_options)
+  set(link_options)
+  set(as_shared FALSE)
+  if(GRPC_BUILD_SHARED AND NOT WIN32 AND NOT APPLE)
+    set(as_shared TRUE)
+    set(compile_options -fPIC)
+    set(link_options -shared)
+  endif()
+  # this try_compile signature caches its result; read it, then drop it so the next configure checks again
+  try_compile(GRPC_LIBRARY_CHECK_${id} "${dir}/build-${id}" SOURCES "${source}"
+    COMPILE_DEFINITIONS ${compile_options}
+    LINK_OPTIONS ${link_options}
+    LINK_LIBRARIES ${target}
+    OUTPUT_VARIABLE output)
+  set(ok "${GRPC_LIBRARY_CHECK_${id}}")
+  unset(GRPC_LIBRARY_CHECK_${id} CACHE)
+  set(${out} "${ok}" PARENT_SCOPE)
+  if(ok)
+    return()
+  endif()
+  string(REGEX MATCH "[^\n]*(recompile with -fPIC|can not be used when making a shared object)[^\n]*" pic "${output}")
+  if(pic)
+    set(reason "is a static archive built without -fPIC, so it cannot be linked into the shared libgrpc (${pic})")
+  elseif(output MATCHES "${header}[^\n]*(No such file|not found|cannot open)")
+    get_target_property(includes ${target} INTERFACE_INCLUDE_DIRECTORIES)
+    set(reason "has no <${header}> (searched: ${includes}); the development package is probably missing")
+  elseif(output MATCHES "undefined reference|unresolved external|Undefined symbols|cannot find -l|No such file")
+    string(REGEX MATCH "[^\n]*(undefined reference|unresolved external|Undefined symbols|cannot find -l|No such file)[^\n]*" line "${output}")
+    set(reason "does not link: ${line}")
+  else()
+    string(REGEX MATCHALL "[^\n]*(error|Error)[^\n]*" lines "${output}")
+    list(LENGTH lines count)
+    if(count GREATER 3)
+      list(SUBLIST lines 0 3 lines)
+    endif()
+    list(JOIN lines "; " lines)
+    set(reason "does not compile or link: ${lines}")
+  endif()
+  string(REPLACE ";" "," reason "${reason}")
+  set(${out}_REASON "${reason}" PARENT_SCOPE)
+endfunction()
+
+# Describes an imported target for the configuration summary: the library file it resolves to.
+function(_grpc_describe_target out target)
+  set(location "")
+  get_target_property(type ${target} TYPE)
+  if(NOT type STREQUAL "INTERFACE_LIBRARY")
+    get_target_property(location ${target} IMPORTED_LOCATION)
+    if(NOT location)
+      get_target_property(configs ${target} IMPORTED_CONFIGURATIONS)
+      foreach(cfg IN LISTS configs)
+        get_target_property(location ${target} IMPORTED_LOCATION_${cfg})
+        if(location)
+          break()
+        endif()
+      endforeach()
+    endif()
+  endif()
+  if(NOT location)
+    get_target_property(location ${target} INTERFACE_LINK_LIBRARIES)
+    list(JOIN location " " location)
+  endif()
+  if(NOT location)
+    set(location "${target}")
+  endif()
+  set(${out} "${location}" PARENT_SCOPE)
+endfunction()
+
+# grpc_find_library_target(<out> DEPENDENCY <name> HEADER <header> SYMBOL <symbol>
+#   [PACKAGE <pkg> [MODULE_MODE] CONFIG_TARGETS <t>...] [PKG_MODULE <module>] [NAMES <lib>...])
+# Provides dependency <name> as an imported target in <out> (empty when unavailable):
+#   0. the pinned release built from source, unless GRPC_DEPENDENCIES is SYSTEM or <name> is
+#      listed in GRPC_SYSTEM_DEPENDENCIES (cmake/GrpcBundledDeps.cmake);
 #   1. a CMake package (find_package; CONFIG mode unless MODULE_MODE), using the first of
 #      CONFIG_TARGETS it defines (vcpkg and upstream CMake packages);
 #   2. the pkg-config module PKG_MODULE;
 #   3. HEADER plus a library from NAMES, wrapped in an UNKNOWN IMPORTED target.
-# Sets <out> to the target name (empty when not found). CMAKE_PREFIX_PATH (GRPC_TLS_PREFIX,
-# ~/.local, ...) applies to every step.
+# Each candidate must pass grpc_check_library, otherwise the next one is tried. Also sets
+# <out>_SOURCE (where it came from, for the summary) and, when nothing fits, <out>_ERROR, which
+# says why each candidate was rejected and how to fix it. CMAKE_PREFIX_PATH (GRPC_TLS_PREFIX,
+# ~/.local, ...) applies to every system lookup.
 function(grpc_find_library_target out)
-  cmake_parse_arguments(arg "MODULE_MODE" "PACKAGE;PKG_MODULE;HEADER" "CONFIG_TARGETS;NAMES" ${ARGN})
+  cmake_parse_arguments(arg "MODULE_MODE" "DEPENDENCY;PACKAGE;PKG_MODULE;HEADER;SYMBOL"
+    "CONFIG_TARGETS;NAMES" ${ARGN})
   set(${out} "" PARENT_SCOPE)
+  set(${out}_SOURCE "" PARENT_SCOPE)
+  set(rejected)
+  string(MAKE_C_IDENTIFIER "${arg_DEPENDENCY}" dep_id)
+
+  grpc_dependency_is_bundled(bundled "${arg_DEPENDENCY}")
+  if(bundled)
+    grpc_bundled_dependency(target "${arg_DEPENDENCY}")
+    if(target)
+      grpc_check_library(usable ${target} "${arg_HEADER}" "${arg_SYMBOL}")
+      if(usable)
+        set(${out} ${target} PARENT_SCOPE)
+        set(${out}_SOURCE "bundled ${GRPC_BUNDLED_${dep_id}_VERSION}" PARENT_SCOPE)
+        return()
+      endif()
+      set(GRPC_BUNDLED_${dep_id}_ERROR "the bundled build ${usable_REASON}")
+    endif()
+    list(APPEND rejected "bundled ${arg_DEPENDENCY} ${GRPC_BUNDLED_${dep_id}_VERSION}: ${GRPC_BUNDLED_${dep_id}_ERROR}")
+    message(WARNING "ezGRPC-next: the bundled ${arg_DEPENDENCY} is unavailable, so the system one is used if present.\n${GRPC_BUNDLED_${dep_id}_ERROR}")
+  endif()
+
   if(arg_PACKAGE)
     if(arg_MODULE_MODE)
       find_package(${arg_PACKAGE} QUIET)
@@ -76,8 +194,15 @@ function(grpc_find_library_target out)
     endif()
     foreach(target IN LISTS arg_CONFIG_TARGETS)
       if(TARGET ${target})
-        set(${out} ${target} PARENT_SCOPE)
-        return()
+        grpc_check_library(usable ${target} "${arg_HEADER}" "${arg_SYMBOL}")
+        if(usable)
+          _grpc_describe_target(where ${target})
+          set(${out} ${target} PARENT_SCOPE)
+          set(${out}_SOURCE "system, CMake package ${arg_PACKAGE} (${where})" PARENT_SCOPE)
+          return()
+        endif()
+        list(APPEND rejected "CMake package ${arg_PACKAGE} (${target}) ${usable_REASON}")
+        break()
       endif()
     endforeach()
   endif()
@@ -85,8 +210,15 @@ function(grpc_find_library_target out)
     string(MAKE_C_IDENTIFIER "GRPC_PC_${arg_PKG_MODULE}" pc_prefix)
     grpc_pkg_check_modules(${pc_prefix} QUIET IMPORTED_TARGET ${arg_PKG_MODULE})
     if(${pc_prefix}_FOUND)
-      set(${out} PkgConfig::${pc_prefix} PARENT_SCOPE)
-      return()
+      set(target PkgConfig::${pc_prefix})
+      grpc_check_library(usable ${target} "${arg_HEADER}" "${arg_SYMBOL}")
+      if(usable)
+        _grpc_describe_target(where ${target})
+        set(${out} ${target} PARENT_SCOPE)
+        set(${out}_SOURCE "system, pkg-config ${arg_PKG_MODULE} ${${pc_prefix}_VERSION} (${where})" PARENT_SCOPE)
+        return()
+      endif()
+      list(APPEND rejected "pkg-config ${arg_PKG_MODULE} ${${pc_prefix}_VERSION} (prefix ${${pc_prefix}_PREFIX}) ${usable_REASON}")
     endif()
   endif()
   if(arg_HEADER AND arg_NAMES)
@@ -101,14 +233,39 @@ function(grpc_find_library_target out)
           IMPORTED_LOCATION "${GRPC_${id}_LIBRARY}"
           INTERFACE_INCLUDE_DIRECTORIES "${GRPC_${id}_INCLUDE_DIR}")
       endif()
-      set(${out} grpc_dep_${id} PARENT_SCOPE)
+      grpc_check_library(usable grpc_dep_${id} "${arg_HEADER}" "${arg_SYMBOL}")
+      if(usable)
+        set(${out} grpc_dep_${id} PARENT_SCOPE)
+        set(${out}_SOURCE "system (${GRPC_${id}_LIBRARY})" PARENT_SCOPE)
+        return()
+      endif()
+      list(APPEND rejected "${GRPC_${id}_LIBRARY} with ${GRPC_${id}_INCLUDE_DIR} ${usable_REASON}")
+    elseif(GRPC_${id}_LIBRARY)
+      list(APPEND rejected "${GRPC_${id}_LIBRARY} was found but no <${arg_HEADER}> to go with it; the development package is probably missing")
     endif()
   endif()
+
+  set(error "${arg_DEPENDENCY} is not available.")
+  if(rejected)
+    list(JOIN rejected "\n  - " rejected)
+    string(APPEND error "\nCandidates that were rejected:\n  - ${rejected}")
+  endif()
+  string(APPEND error "\nTo fix it, either:")
+  if(NOT bundled)
+    string(APPEND error "\n  * let CMake download and build it: -DGRPC_DEPENDENCIES=BUNDLED (and remove it from GRPC_SYSTEM_DEPENDENCIES)")
+  endif()
+  if(DEFINED GRPC_HINT_${dep_id})
+    string(APPEND error "\n  * install its development files: ${GRPC_HINT_${dep_id}}")
+  endif()
+  string(APPEND error "\n  * point CMAKE_PREFIX_PATH at an installation of it, built with -fPIC when it is static")
+  set(${out}_ERROR "${error}" PARENT_SCOPE)
 endfunction()
 
 # Optional library features: <feature> stays AUTO/ON/OFF; GRPC_<feature>_FOUND/_TARGET are set.
 macro(grpc_find_optional_library feature)
   set(GRPC_${feature}_TARGET "")
+  set(GRPC_${feature}_TARGET_SOURCE "")
+  set(GRPC_${feature}_TARGET_ERROR "")
   if(NOT GRPC_${feature} STREQUAL "OFF")
     grpc_find_library_target(GRPC_${feature}_TARGET ${ARGN})
   endif()
@@ -119,45 +276,76 @@ macro(grpc_find_optional_library feature)
   endif()
 endmacro()
 
+# Records "<name>: <source>" for the configuration summary.
+macro(grpc_report_dependency name source)
+  list(APPEND GRPC_DEPENDENCY_REPORT "${name}|${source}")
+endmacro()
+set(GRPC_DEPENDENCY_REPORT)
+
 # ---- required -------------------------------------------------------------------------------
 
-grpc_find_library_target(GRPC_NGHTTP2_TARGET
-  PKG_MODULE libnghttp2 HEADER nghttp2/nghttp2.h NAMES nghttp2)
+grpc_find_library_target(GRPC_NGHTTP2_TARGET DEPENDENCY nghttp2
+  HEADER nghttp2/nghttp2.h SYMBOL nghttp2_session_server_new
+  PKG_MODULE libnghttp2 NAMES nghttp2)
 if(NOT GRPC_NGHTTP2_TARGET)
-  message(FATAL_ERROR "libnghttp2 development headers and library are required")
+  message(FATAL_ERROR "${GRPC_NGHTTP2_TARGET_ERROR}")
 endif()
+grpc_report_dependency(nghttp2 "${GRPC_NGHTTP2_TARGET_SOURCE}")
 
-grpc_find_library_target(GRPC_LIBUV_TARGET
+grpc_find_library_target(GRPC_LIBUV_TARGET DEPENDENCY libuv
+  HEADER uv.h SYMBOL uv_loop_init
   PACKAGE libuv CONFIG_TARGETS libuv::uv_a libuv::uv uv_a uv
-  PKG_MODULE libuv HEADER uv.h NAMES uv libuv)
+  PKG_MODULE libuv NAMES uv libuv)
 if(NOT GRPC_LIBUV_TARGET)
-  message(FATAL_ERROR "libuv is required; install it through vcpkg or pkg-config")
+  message(FATAL_ERROR "${GRPC_LIBUV_TARGET_ERROR}")
 endif()
+grpc_report_dependency(libuv "${GRPC_LIBUV_TARGET_SOURCE}")
 
 # ---- optional codecs and serialization ----------------------------------------------------
 
-grpc_find_optional_library(ZLIB PACKAGE ZLIB MODULE_MODE CONFIG_TARGETS ZLIB::ZLIB PKG_MODULE zlib)
-grpc_feature_enabled(ZLIB "${GRPC_ZLIB_FOUND}" "zlib")
+grpc_find_optional_library(ZLIB DEPENDENCY zlib HEADER zlib.h SYMBOL deflateInit2_
+  PACKAGE ZLIB MODULE_MODE CONFIG_TARGETS ZLIB::ZLIB PKG_MODULE zlib)
+grpc_feature_enabled(ZLIB "${GRPC_ZLIB_FOUND}" "zlib" "${GRPC_ZLIB_TARGET_ERROR}")
 
-grpc_find_optional_library(ZSTD
+grpc_find_optional_library(ZSTD DEPENDENCY zstd HEADER zstd.h SYMBOL ZSTD_compress
   PACKAGE zstd CONFIG_TARGETS zstd::libzstd zstd::libzstd_shared zstd::libzstd_static
-  PKG_MODULE libzstd HEADER zstd.h NAMES zstd)
-grpc_feature_enabled(ZSTD "${GRPC_ZSTD_FOUND}" "Zstandard")
+  PKG_MODULE libzstd NAMES zstd)
+grpc_feature_enabled(ZSTD "${GRPC_ZSTD_FOUND}" "Zstandard" "${GRPC_ZSTD_TARGET_ERROR}")
 
-grpc_find_optional_library(SNAPPY
-  PACKAGE Snappy CONFIG_TARGETS Snappy::snappy PKG_MODULE snappy HEADER snappy-c.h NAMES snappy)
-grpc_feature_enabled(SNAPPY "${GRPC_SNAPPY_FOUND}" "Snappy")
+grpc_find_optional_library(SNAPPY DEPENDENCY snappy HEADER snappy-c.h SYMBOL snappy_compress
+  PACKAGE Snappy CONFIG_TARGETS Snappy::snappy PKG_MODULE snappy NAMES snappy)
+grpc_feature_enabled(SNAPPY "${GRPC_SNAPPY_FOUND}" "Snappy" "${GRPC_SNAPPY_TARGET_ERROR}")
 
-# protobuf-c also needs its code generator
-grpc_find_optional_library(PROTOBUF_C
-  PKG_MODULE libprotobuf-c HEADER protobuf-c/protobuf-c.h NAMES protobuf-c)
-if(GRPC_PROTOBUF_C_FOUND)
-  find_program(PROTOC_C_EXECUTABLE protoc-c)
-  if(NOT PROTOC_C_EXECUTABLE)
-    set(GRPC_PROTOBUF_C_FOUND FALSE)
+# The protobuf-c runtime enables the library's protobuf helpers. The protoc-c code generator is
+# needed only by the protobuf test and example, which are skipped without it.
+grpc_find_optional_library(PROTOBUF_C DEPENDENCY protobuf-c
+  HEADER protobuf-c/protobuf-c.h SYMBOL protobuf_c_message_pack
+  PKG_MODULE libprotobuf-c NAMES protobuf-c)
+grpc_feature_enabled(PROTOBUF_C "${GRPC_PROTOBUF_C_FOUND}" "protobuf-c"
+  "${GRPC_PROTOBUF_C_TARGET_ERROR}")
+if(GRPC_PROTOBUF_C_ENABLED)
+  find_program(PROTOC_C_EXECUTABLE NAMES protoc-c protoc-gen-c)
+endif()
+
+foreach(_feature IN ITEMS ZLIB ZSTD SNAPPY PROTOBUF_C)
+  string(TOLOWER "${_feature}" _name)
+  string(REPLACE "_" "-" _name "${_name}")
+  if(GRPC_${_feature}_ENABLED)
+    grpc_report_dependency(${_name} "${GRPC_${_feature}_TARGET_SOURCE}")
+  elseif(GRPC_${_feature} STREQUAL "OFF")
+    grpc_report_dependency(${_name} "disabled (GRPC_${_feature}=OFF)")
+  else()
+    grpc_report_dependency(${_name} "not found, feature disabled")
+    message(STATUS "ezGRPC-next: ${_name} support is disabled: ${GRPC_${_feature}_TARGET_ERROR}")
+  endif()
+endforeach()
+if(GRPC_PROTOBUF_C_ENABLED)
+  if(PROTOC_C_EXECUTABLE)
+    grpc_report_dependency(protoc-c "${PROTOC_C_EXECUTABLE}")
+  else()
+    grpc_report_dependency(protoc-c "not found; the protobuf test and example are skipped (${GRPC_HINT_protobuf_c})")
   endif()
 endif()
-grpc_feature_enabled(PROTOBUF_C "${GRPC_PROTOBUF_C_FOUND}" "protobuf-c and protoc-c")
 
 set(GRPC_FLATCC_FOUND FALSE)
 if(GRPC_FLATCC STREQUAL "ON" OR GRPC_FLATCC STREQUAL "AUTO")
@@ -207,6 +395,13 @@ if(NOT _tls_backend STREQUAL "none")
     set(GRPC_TLS_LIBRARIES "${RUSTLS_LIBRARY}" gcc_s util rt m dl)
   endif()
   set(GRPC_TLS_ENABLED TRUE)
+  if(_tls_backend MATCHES "^(openssl|libressl|boringssl|awslc)$")
+    grpc_report_dependency(tls "system ${_tls_backend} ${OPENSSL_VERSION} (${OPENSSL_SSL_LIBRARY})")
+  else()
+    grpc_report_dependency(tls "system ${_tls_backend}")
+  endif()
+else()
+  grpc_report_dependency(tls "disabled (GRPC_TLS_BACKEND=none)")
 endif()
 
 # HTTP/3: ngtcp2 (QUIC), nghttp3 (HTTP/3) and the ngtcp2 crypto helper matching the TLS backend.
@@ -292,6 +487,7 @@ grpc_feature_enabled(HTTP3 "${GRPC_HTTP3_FOUND}"
   "HTTP/3 (ngtcp2 >= 1.0, nghttp3 >= 1.0 and the ngtcp2 crypto helper for the TLS backend)")
 if(GRPC_HTTP3_ENABLED)
   set(GRPC_QUIC_CRYPTO "${_quic_crypto}")
+  grpc_report_dependency(ngtcp2/nghttp3 "system (ngtcp2_crypto_${_quic_crypto})")
 endif()
 
 set(GRPC_ALLOCATOR_LIBRARIES)

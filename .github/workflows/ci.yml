@@ -114,13 +114,21 @@ jobs:
       - name: Install Python dependencies
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install grpcio grpcio-tools protobuf
+          python3 -m pip install -r scripts/requirements-test.txt
+
+      - name: Cache bundled dependency downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ezgrpc-next
+          key: bundled-deps-${{ hashFiles('cmake/GrpcBundledDeps.cmake') }}
 
       - name: Build ezGRPC-next and examples
         run: |
-          # warnings are errors with the current compilers (22.04's older ones only report them)
+          # warnings are errors with the current compilers (22.04's older ones only report them).
+          # 24.04 builds the bundled (downloaded) dependencies, 22.04 the distribution packages.
           cmake -S . -B build \
             -DCMAKE_C_COMPILER=${{ matrix.compiler }} \
+            -DGRPC_DEPENDENCIES=${{ matrix.os == 'ubuntu-22.04' && 'SYSTEM' || 'BUNDLED' }} \
             -DGRPC_IPO=${{ matrix.ipo || 'OFF' }} \
             -DGRPC_ALLOCATOR=${{ matrix.allocator }} \
             -DGRPC_WERROR=${{ matrix.os == 'ubuntu-24.04' && matrix.allocator == 'default' && 'ON' || 'OFF' }}
@@ -177,6 +185,7 @@ jobs:
           # any undefined behaviour aborts the test that hit it
           cmake -S . -B build \
             -DCMAKE_C_COMPILER=${{ matrix.compiler }} \
+            -DGRPC_DEPENDENCIES=SYSTEM \
             -DGRPC_SANITIZE="address;undefined" \
             -DCMAKE_C_FLAGS="-fno-sanitize-recover=undefined" \
             -DGRPC_WERROR=ON
@@ -244,6 +253,7 @@ jobs:
       - name: Build and test
         run: |
           cmake -S . -B build \
+            -DGRPC_DEPENDENCIES=SYSTEM \
             -DGRPC_TLS_BACKEND=${{ matrix.tls }} \
             -DGRPC_TLS_PREFIX="$TLS_PREFIX_DIR"
           cmake --build build --parallel 2
@@ -307,6 +317,7 @@ jobs:
       - name: Build and test
         run: |
           cmake -S . -B build \
+            -DGRPC_DEPENDENCIES=SYSTEM \
             -DGRPC_TLS_BACKEND=${{ matrix.tls }} \
             -DGRPC_TLS_PREFIX="$TLS_PREFIX_DIR" \
             -DOPENSSL_ROOT_DIR="$TLS_PREFIX_DIR" \
@@ -379,6 +390,7 @@ jobs:
         run: |
           cmake -S . -B build \
             -DCMAKE_C_COMPILER=${{ matrix.compiler }} \
+            -DGRPC_DEPENDENCIES=SYSTEM \
             -DGRPC_ASAN=${{ matrix.asan == '1' && 'ON' || 'OFF' }} \
             -DGRPC_FLATCC=ON \
             -DGRPC_FLATCC_PREFIX="$FLATCC_PREFIX_DIR"
