@@ -28,7 +28,10 @@ jobs:
       - name: Install dependencies
         shell: pwsh
         run: |
-          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install libuv:x64-windows nghttp2:x64-windows openssl:x64-windows zlib:x64-windows zstd:x64-windows snappy:x64-windows
+          $pkgs = @('libuv', 'nghttp2', 'openssl', 'zlib', 'zstd', 'snappy')
+          # HTTP/3 with OpenSSL: vcpkg's OpenSSL is >= 3.5, and its ngtcp2 builds the ossl helper
+          if ('${{ matrix.tls }}' -eq 'openssl') { $pkgs += @('ngtcp2[openssl]', 'nghttp3') }
+          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install ($pkgs | ForEach-Object { "${_}:x64-windows" })
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip install grpcio
       - name: Configure
@@ -38,6 +41,7 @@ jobs:
             "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
             "-DGRPC_HOST_OPENSSL_EXECUTABLE=C:/Program Files/Git/usr/bin/openssl.exe" `
             -DGRPC_TLS_BACKEND=${{ matrix.tls }} `
+            -DGRPC_HTTP3=${{ matrix.tls == 'openssl' && 'ON' || 'OFF' }} `
             -DGRPC_IPO=${{ matrix.mode == 'ipo' && 'ON' || 'OFF' }} `
             -DGRPC_BUILD_SHARED=${{ matrix.mode == 'ipo' && 'OFF' || 'ON' }} `
             -DGRPC_BUILD_EXAMPLES=${{ matrix.mode == 'ipo' && 'OFF' || 'ON' }} `

@@ -51,6 +51,8 @@ ctest --test-dir build -C Release --output-on-failure
 
 Static library: `grpc.lib`. Shared library: `grpc.dll` + import library `grpc_dll.lib`.
 
+For HTTP/3, also install `"ngtcp2[openssl]:x64-windows" nghttp3:x64-windows` and configure with `-DGRPC_TLS_BACKEND=openssl -DGRPC_HTTP3=ON` (see [HTTP/3](http3.md#windows-msvc)).
+
 ### IPO / LTO
 
 ```bash

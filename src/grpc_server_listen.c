@@ -34,42 +34,45 @@ static void grpc_winsock_init(void) {
 }
 #endif
 
-uv_os_sock_t server_open_listener(grpc_server *server, int family, const char *addr, uint16_t port,
-                                  int backlog, uint16_t *bound_port, grpc_err *out_err) {
-  struct sockaddr_storage ss = {};
-  socklen_t sslen;
+/* Fills ss with family addr:port. Returns its length, or 0 when addr does not parse. */
+static socklen_t make_sockaddr(struct sockaddr_storage *ss, int family, const char *addr,
+                               uint16_t port) {
+  memset(ss, 0, sizeof(*ss));
   if (family == AF_INET) {
-    struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
+    struct sockaddr_in *sin = (struct sockaddr_in *)ss;
     sin->sin_family = AF_INET;
     sin->sin_port = htons(port);
-    if (inet_pton(AF_INET, addr, &sin->sin_addr) != 1) {
-      LOG_ERROR(server, "invalid IPv4 address '%s'\n", addr);
-      if (out_err != nullptr)
-        *out_err = GRPC_ERR_INVALID;
-      return GRPC_INVALID_SOCKET;
-    }
-    sslen = sizeof(*sin);
-  } else {
-    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
-    sin6->sin6_family = AF_INET6;
-    sin6->sin6_port = htons(port);
-    if (inet_pton(AF_INET6, addr, &sin6->sin6_addr) != 1) {
-      LOG_ERROR(server, "invalid IPv6 address '%s'\n", addr);
-      if (out_err != nullptr)
-        *out_err = GRPC_ERR_INVALID;
-      return GRPC_INVALID_SOCKET;
-    }
-    sslen = sizeof(*sin6);
+    return inet_pton(AF_INET, addr, &sin->sin_addr) == 1 ? (socklen_t)sizeof(*sin) : 0;
   }
+  struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ss;
+  sin6->sin6_family = AF_INET6;
+  sin6->sin6_port = htons(port);
+  return inet_pton(AF_INET6, addr, &sin6->sin6_addr) == 1 ? (socklen_t)sizeof(*sin6) : 0;
+}
 
+/* A new socket of `type` for family, not inherited by child processes. */
+static uv_os_sock_t open_socket(int family, int type) {
 #ifdef _WIN32
   static uv_once_t winsock_once = UV_ONCE_INIT;
   uv_once(&winsock_once, grpc_winsock_init);
-  uv_os_sock_t fd =
-      WSASocketW(family, SOCK_STREAM, 0, NULL, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
+  return WSASocketW(family, type, 0, NULL, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
 #else
-  uv_os_sock_t fd = socket(family, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  return socket(family, type | SOCK_CLOEXEC, 0);
 #endif
+}
+
+uv_os_sock_t server_open_listener(grpc_server *server, int family, const char *addr, uint16_t port,
+                                  int backlog, uint16_t *bound_port, grpc_err *out_err) {
+  struct sockaddr_storage ss;
+  socklen_t sslen = make_sockaddr(&ss, family, addr, port);
+  if (sslen == 0) {
+    LOG_ERROR(server, "invalid %s address '%s'\n", family == AF_INET ? "IPv4" : "IPv6", addr);
+    if (out_err != nullptr)
+      *out_err = GRPC_ERR_INVALID;
+    return GRPC_INVALID_SOCKET;
+  }
+
+  uv_os_sock_t fd = open_socket(family, SOCK_STREAM);
   if (fd == GRPC_INVALID_SOCKET) {
     LOG_ERROR(server, "socket: %s\n", grpc_socket_error());
     if (out_err != nullptr)
@@ -115,6 +118,21 @@ uv_os_sock_t server_open_listener(grpc_server *server, int family, const char *a
     }
   }
   return fd;
+}
+
+bool server_udp_port_free(int family, const char *addr, uint16_t port) {
+  struct sockaddr_storage ss;
+  socklen_t sslen = make_sockaddr(&ss, family, addr, port);
+  if (sslen == 0)
+    return false;
+  uv_os_sock_t fd = open_socket(family, SOCK_DGRAM);
+  if (fd == GRPC_INVALID_SOCKET)
+    return false;
+  if (family == AF_INET6)
+    (void)setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&(int){1}, sizeof(int));
+  bool ok = bind(fd, (struct sockaddr *)&ss, sslen) == 0;
+  grpc_socket_close(fd);
+  return ok;
 }
 
 bool server_start_listener(grpc_server *server, uv_tcp_t *listener, uv_os_sock_t *fd) {

@@ -26,6 +26,10 @@ void logger_server_remove(grpc_server *server);
 uv_os_sock_t server_open_listener(grpc_server *server, int family, const char *addr, uint16_t port,
                                   int backlog, uint16_t *bound_port, grpc_err *out_err);
 
+/* True when a UDP socket could bind addr:port right now (the socket is closed again). Used to
+ * pick, for port 0, a port number HTTP/3 can also take on UDP. */
+bool server_udp_port_free(int family, const char *addr, uint16_t port);
+
 /* Hands an open socket to an initialized uv_tcp_t and starts listening with
  * on_listener_connection(). On a successful uv_tcp_open() *fd is reset to GRPC_INVALID_SOCKET,
  * since the handle now owns (and closes) it. Returns false on failure. */

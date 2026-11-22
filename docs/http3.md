@@ -30,6 +30,18 @@ cmake --build build-h3 --parallel
 
 `just http3 <backend>` performs all of the above into `.tls/<backend>` and runs the tests.
 
+### Windows (MSVC)
+
+vcpkg's OpenSSL is 3.5 or newer and its ngtcp2 port builds the `ossl` crypto helper, so HTTP/3 needs only two more packages. Without pkg-config, CMake finds them through the CMake packages vcpkg installs:
+
+```powershell
+vcpkg install libuv:x64-windows nghttp2:x64-windows openssl:x64-windows "ngtcp2[openssl]:x64-windows" nghttp3:x64-windows
+cmake -S . -B build -A x64 -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake `
+  -DGRPC_TLS_BACKEND=openssl -DGRPC_HTTP3=ON
+```
+
+`http3_raw` (a raw ngtcp2 client) and `http3_eagain` (a Linux `sendmsg()` shim) are not built on Windows. The other HTTP/3 tests, including `http3_oom`, run there as in the CI.
+
 At run time, `grpc_http3_available()` reports whether HTTP/3 is built in, and `grpc_http3_versions()` returns the library versions, e.g. `"ngtcp2/1.26.0 nghttp3/1.19.0 crypto=ossl"`.
 
 ---
@@ -54,7 +66,7 @@ printf("HTTP/2 on tcp/%u, HTTP/3 on udp/%u\n", grpc_server_port(server),
 | `grpc_http3_config` field | Meaning |
 |:---|:---|
 | `enable` | Also accept gRPC over HTTP/3. Requires `config.tls` and an IP address (not a Unix socket only) |
-| `port` | UDP port; `0` uses the TCP port |
+| `port` | UDP port; `0` uses the TCP port. With `config.port = 0` as well, the server picks a port number free on both TCP and UDP. On Windows the UDP port that matches the TCP port the system chose may be reserved (`netsh int ipv4 show excludedportrange protocol=udp`). In that case the server retries on random ports. |
 | `max_idle_timeout_ms` | QUIC idle timeout; `0` uses `max_connection_idle_ms`, else 30 s |
 | `advertise_alt_svc` | Add `alt-svc: h3=":<port>"` to HTTP/2 responses |
 | `require_retry` | Validate client addresses with a QUIC Retry before allocating connection state (one extra round trip; mitigates address spoofing) |
@@ -135,5 +147,5 @@ cd build/http3/generated/http3-example
 - **Servers sharing a port** forward datagrams only within one process. Separate processes on one port (`SO_REUSEPORT` across processes) still lose a connection whose client moves to an address the kernel maps to another process.
 - **The client** does not migrate on its own, and frees a connection as soon as it closes it. Its loop runs only during calls, so there is no closing period on that side.
 - **GSO** is Linux-only. Other systems send packet by packet.
-- **Windows builds keep HTTP/3 off.** The CI does not install ngtcp2/nghttp3 there.
+- **Windows** supports HTTP/3 with the `openssl` backend from vcpkg (tested in CI). Other QUIC-capable backends are not packaged for MSVC there.
 - **Python `grpcio` has no HTTP/3.** HTTP/3 is tested with the library's own client (`src/tests/http3.c`). For interoperability checks, use .NET `Grpc.Net.Client` (which supports HTTP/3) or `curl --http3` with a gRPC-framed body.

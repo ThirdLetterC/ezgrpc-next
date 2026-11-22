@@ -3,13 +3,13 @@
  * with an error, the client keeps working, and no request state is kept for a stream nghttp3
  * never accepted (a failed nghttp3_conn_submit_request() used to park it until disconnect).
  * Run from the directory holding test_cert.pem / test_key.pem. */
-#include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+#include "internal/grpc_threads.h"
 #include "grpc.h"
 #include "internal_client.h"
 #include "test.h"

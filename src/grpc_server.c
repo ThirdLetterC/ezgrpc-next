@@ -265,28 +265,59 @@ GRPC_API grpc_server *grpc_server_new_ex(const grpc_config *config, grpc_err *ou
     if ((err = tls_enable(server, &tls_cfg)) != GRPC_OK)
       goto err;
   }
+  /* HTTP/3 needs TLS and an IP address. Checked before anything is bound, so an invalid config
+   * reports GRPC_ERR_INVALID everywhere (on Windows a Unix-style path would fail to bind first). */
+  if (config->http3.enable && grpc_http3_available() &&
+      (!server->is_tls || (server->ipv4_addr == nullptr && server->ipv6_addr == nullptr))) {
+    LOG_ERROR(server, "%s\n",
+              server->is_tls ? "http3 needs an IPv4 or IPv6 address (it cannot use a Unix socket)"
+                             : "http3 requires TLS (config.tls)");
+    err = GRPC_ERR_INVALID;
+    goto err;
+  }
 
-  /* With port 0 the IPv4 listener picks the port and IPv6 takes the same one, which may happen
-   * to be in use on IPv6: then both start over with a new port (a few times). */
+  /* With port 0 the first listener picks the port and the others take the same number: IPv6, and
+   * the HTTP/3 UDP sockets unless http3.port is set. That number may be taken there, or (on
+   * Windows) inside a block of ports reserved for that protocol only. Then everything starts over
+   * on a random port of the dynamic range: the system's next choice is often the neighbouring
+   * port, in the same reserved block. */
+  bool same_udp_port =
+      cfg->port == 0 && config->http3.enable && config->http3.port == 0 && grpc_http3_available();
   uint16_t bound_port = cfg->port;
   for (int attempt = 0;; attempt++) {
     bound_port = cfg->port;
-    if (server->ipv4_addr != nullptr &&
-        (server->ipv4_sockfd = server_open_listener(server, AF_INET, server->ipv4_addr, bound_port,
-                                                    cfg->backlog, &bound_port, &err)) ==
-            GRPC_INVALID_SOCKET)
-      goto err;
-    if (server->ipv6_addr == nullptr ||
-        (server->ipv6_sockfd = server_open_listener(server, AF_INET6, server->ipv6_addr, bound_port,
-                                                    cfg->backlog, &bound_port, &err)) !=
-            GRPC_INVALID_SOCKET)
+    if (cfg->port == 0 && attempt > 0) {
+      uint16_t r = 0;
+      (void)uv_random(nullptr, nullptr, &r, sizeof(r), 0, nullptr);
+      bound_port = (uint16_t)(49152u + r % 16384u);
+    }
+    bool ok = server->ipv4_addr == nullptr ||
+              (server->ipv4_sockfd =
+                   server_open_listener(server, AF_INET, server->ipv4_addr, bound_port,
+                                        cfg->backlog, &bound_port, &err)) != GRPC_INVALID_SOCKET;
+    ok = ok && (server->ipv6_addr == nullptr ||
+                (server->ipv6_sockfd =
+                     server_open_listener(server, AF_INET6, server->ipv6_addr, bound_port,
+                                          cfg->backlog, &bound_port, &err)) != GRPC_INVALID_SOCKET);
+    if (ok && same_udp_port &&
+        ((server->ipv4_addr != nullptr &&
+          !server_udp_port_free(AF_INET, server->ipv4_addr, bound_port)) ||
+         (server->ipv6_addr != nullptr &&
+          !server_udp_port_free(AF_INET6, server->ipv6_addr, bound_port)))) {
+      LOG_DEBUG(server, "udp port %u is not available for http3, picking another port\n",
+                bound_port);
+      ok = false;
+      err = GRPC_ERR_IO;
+    }
+    if (ok)
       break;
-    bool retry =
-        cfg->port == 0 && server->ipv4_addr != nullptr && err == GRPC_ERR_IO && attempt < 7;
-    if (!retry)
+    if (server->ipv4_sockfd != GRPC_INVALID_SOCKET)
+      grpc_socket_close(server->ipv4_sockfd);
+    if (server->ipv6_sockfd != GRPC_INVALID_SOCKET)
+      grpc_socket_close(server->ipv6_sockfd);
+    server->ipv4_sockfd = server->ipv6_sockfd = GRPC_INVALID_SOCKET;
+    if (cfg->port != 0 || err != GRPC_ERR_IO || attempt >= 15)
       goto err;
-    grpc_socket_close(server->ipv4_sockfd);
-    server->ipv4_sockfd = GRPC_INVALID_SOCKET;
   }
   cfg->port = bound_port;
 
