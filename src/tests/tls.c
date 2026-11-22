@@ -12,7 +12,7 @@
 #endif
 #include "internal/grpc_threads.h"
 #include "grpc.h"
-#include "unity.h"
+#include "test.h"
 #if defined(GRPC_TLS_OPENSSL) || defined(GRPC_TLS_LIBRESSL) || defined(GRPC_TLS_BORINGSSL) || \
     defined(GRPC_TLS_AWSLC)
 #define TLS_OPENSSL_FAMILY 1

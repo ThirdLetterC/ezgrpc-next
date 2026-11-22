@@ -7,7 +7,7 @@
 #endif
 #include "internal/grpc_threads.h"
 #include "grpc.h"
-#include "unity.h"
+#include "test.h"
 
 /* What the server handlers record. They run on the server threads, so counters are atomics and
  * the strings are guarded by `lock`; the test thread asserts on them after each RPC. */

@@ -14,7 +14,7 @@
 #include "internal/grpc_threads.h"
 #include "grpc.h"
 #include "grpc_list.h"
-#include "unity.h"
+#include "test.h"
 
 /* Deterministic countdown allocator for OOM fault-injection testing. It is installed once in
  * main(), before any server thread exists, and stays installed: grpc_set_allocator() is not
@@ -139,7 +139,7 @@ static void oom_report(const char *loop, int points) {
   } while (0)
 #define ASSERT_OK_OR_NOMEM(rc) ASSERT_ERR_ONE_OF2(rc, GRPC_OK, GRPC_ERR_NOMEM)
 
-/* Server threads must never run Unity assertions (they longjmp on the test thread's stack).
+/* Server threads must never run test assertions (a failure there aborts the process, see test.h).
  * Handlers record the first failed expectation here and the test thread checks it. */
 static atomic_int g_srv_bad_line = 0;
 #define SRV_EXPECT(cond)                                                       \

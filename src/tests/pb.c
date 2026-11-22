@@ -8,7 +8,7 @@
 #endif
 #include "grpc.h"
 #include "test_msg.pb-c.h"
-#include "unity.h"
+#include "test.h"
 
 /* A forwarding allocator: every call goes to the allocator that was installed before it (so
  * blocks are always freed by the family that allocated them), except that allocations fail on a

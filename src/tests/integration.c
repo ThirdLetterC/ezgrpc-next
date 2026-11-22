@@ -13,7 +13,7 @@
 #include <uv.h>
 #include "internal/grpc_threads.h"
 #include "grpc.h"
-#include "unity.h"
+#include "test.h"
 
 /* ---- Synchronisation helpers ------------------------------------------------------------------ */
 
@@ -61,7 +61,7 @@ static const char *md_find(const grpc_metadata *md, size_t n, const char *key) {
   return nullptr;
 }
 
-/* Checks made on the server thread. Unity assertions longjmp, so they must never run there: a
+/* Checks made on the server thread. Test assertions abort the process there (see test.h): a
  * failing check records its source line, and the test thread asserts it with
  * ASSERT_HANDLER_CHECKS(). */
 static atomic_int g_handler_fail_line;

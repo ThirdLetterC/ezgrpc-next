@@ -16,7 +16,7 @@
 #endif
 #include "internal/grpc_threads.h"
 #include "grpc.h"
-#include "unity.h"
+#include "test.h"
 
 /* A started server on its own thread, the clients of the running test and what the handlers
  * record. Static, not on a test's stack: tearDown() stops, joins and frees whatever a failed

@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "grpc.h"
-#include "unity.h"
+#include "test.h"
 
 /* the public headers must not leak macros into the application */
 #if defined(malloc) || defined(free) || defined(calloc) || defined(realloc) || defined(strdup)
@@ -298,7 +298,7 @@ void test_strings(void) {
   TEST_ASSERT_EQUAL_STRING("helper test 1\n", close_bracket + 2);
 
   /* ezdump writes to stdout: point stdout at a temporary file while it runs (no assertion in
-   * between, since Unity prints to stdout too) */
+   * between, since the test harness prints to stdout too) */
   char dumped[512];
   TEST_ASSERT_TRUE(capture_stdout_dump(sample, sizeof(sample), dumped, sizeof(dumped)));
   TEST_ASSERT_EQUAL_STRING(

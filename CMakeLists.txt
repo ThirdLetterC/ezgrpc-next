@@ -321,15 +321,15 @@ if(GRPC_BUILD_TESTS)
   enable_testing()
   # grpc_add_unit_test(<name> <source> [LIBRARY grpc_static|grpc_shared] [SOURCES ...]
   #                    [INCLUDES ...] [DEFINITIONS ...] [WORKING_DIRECTORY dir] [DEPENDS target...])
-  # Builds test_<name> from <source> and Unity and registers it as test <name>.
+  # Builds test_<name> from <source> (with the src/tests/test.h harness) and registers it as test <name>.
   function(grpc_add_unit_test name source)
     cmake_parse_arguments(arg "" "LIBRARY;WORKING_DIRECTORY" "SOURCES;INCLUDES;DEFINITIONS;DEPENDS"
                           ${ARGN})
     if(NOT arg_LIBRARY)
       set(arg_LIBRARY grpc_static)
     endif()
-    add_executable(test_${name} "${source}" src/tests/unity/unity.c ${arg_SOURCES})
-    target_include_directories(test_${name} PRIVATE src/tests/unity include/internal ${arg_INCLUDES})
+    add_executable(test_${name} "${source}" ${arg_SOURCES})
+    target_include_directories(test_${name} PRIVATE src/tests include/internal ${arg_INCLUDES})
     target_link_libraries(test_${name} PRIVATE ${arg_LIBRARY})
     if(arg_DEFINITIONS)
       target_compile_definitions(test_${name} PRIVATE ${arg_DEFINITIONS})
@@ -555,7 +555,6 @@ if(GRPC_BUILD_DEVELOPER_TARGETS)
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/examples/*.c")
-  list(FILTER GRPC_FORMAT_FILES EXCLUDE REGEX "/src/tests/unity/")
   list(FILTER GRPC_FORMAT_FILES EXCLUDE REGEX "_(reader|builder|verifier)\\.h$")
   find_program(CLANG_FORMAT_EXECUTABLE clang-format)
   if(CLANG_FORMAT_EXECUTABLE)

@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "grpc.h"
-#include "unity.h"
+#include "test.h"
 
 /* interceptors run on real calls; the Python integration test of
  * examples/python_client_c_server exercises on_call, rejection and on_done */

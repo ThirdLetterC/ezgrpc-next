@@ -11,6 +11,3 @@ CEDoromal <https://github.com/cedoromal>
 
 # ezGRPC-next
 Yehor Smoliakov
-
-# Third-party code bundled in this repository keeps its own copyright, for example the Unity test
-# framework in src/tests/unity/ (Mike Karlesky, Mark VanderVoord and Greg Williams).

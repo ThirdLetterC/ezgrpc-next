@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "grpc.h"
-#include "unity.h"
+#include "test.h"
 
 void setUp(void) {}
 void tearDown(void) {}
