@@ -98,7 +98,8 @@ class Collector:
                     ready.put(True)
             ready.put(False)
 
-        threading.Thread(target=read, daemon=True).start()
+        self._reader = threading.Thread(target=read, daemon=True)
+        self._reader.start()
         if not ready.get(timeout=60):
             raise RuntimeError("collector did not start:\n" + "".join(self.log))
         return self
@@ -107,6 +108,8 @@ class Collector:
         if self.proc is not None:
             self.proc.send_signal(signal.SIGTERM)
             self.proc.wait(timeout=60)
+            self._reader.join(timeout=10)
+            self.proc.stderr.close()
             self.proc = None
 
 

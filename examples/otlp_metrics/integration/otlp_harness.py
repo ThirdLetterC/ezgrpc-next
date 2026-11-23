@@ -26,11 +26,13 @@ class Server:
         self.port = None
         self.stderr_lines = []
         self._channel = None
+        self._stderr_thread = None
 
     def start(self):
         cmd = [self.binary, "--host", "127.0.0.1", "--port", "0", "--admin", *self.args]
         self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env)
-        threading.Thread(target=self._drain_stderr, daemon=True).start()
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, args=(self.proc,), daemon=True)
+        self._stderr_thread.start()
         # a thread reads the first line, so the wait below is bounded on every platform
         first_line = queue.Queue()
         threading.Thread(target=lambda: first_line.put(self.proc.stdout.readline()), daemon=True).start()
@@ -42,12 +44,13 @@ class Server:
         text = line.decode().strip()
         if not text.startswith("READY port="):
             code = self.proc.wait(timeout=10)
+            self._reap()
             raise RuntimeError(f"server exited ({code}) before READY: {text!r}\n{self.stderr()}")
         self.port = int(text.split("=", 1)[1])
         return self
 
-    def _drain_stderr(self):
-        for raw in self.proc.stderr:
+    def _drain_stderr(self, proc):
+        for raw in proc.stderr:
             self.stderr_lines.append(raw.decode(errors="replace"))
 
     def stderr(self):
@@ -102,7 +105,7 @@ class Server:
         except subprocess.TimeoutExpired:
             self.kill()
             raise
-        self.proc = None
+        self._reap()
         if expect_code is not None and code != expect_code:
             raise RuntimeError(f"server exited with {code}:\n{self.stderr()}")
         return code
@@ -111,7 +114,16 @@ class Server:
         if self.proc is not None:
             self.proc.kill()
             self.proc.wait()
-            self.proc = None
+            self._reap()
+
+    def _reap(self):
+        # the process has exited: the stderr reader reaches EOF, then both pipes are closed
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=10)
+            self._stderr_thread = None
+        self.proc.stdout.close()
+        self.proc.stderr.close()
+        self.proc = None
 
     def __enter__(self):
         return self.start()

@@ -391,9 +391,8 @@ Windows builds were not run in this work; the table states what the code is writ
 - **WAL**: no compaction, retention or replay into another system; segments rotate only between
   write groups; a failed directory sync on rotation is not reported; one writer thread (a single
   disk stream) for all loops.
-- **Collector test not run here**: running a downloaded Collector binary was not permitted in the
-  environment this was developed in. The test and configuration are ready
-  (`integration/fetch-otelcol.sh`, `OTLP_OTELCOL_EXECUTABLE`).
+- **Collector coverage**: the Collector test ran (and passed, 10 consecutive repetitions) with
+  `otelcol` 0.165.0 on Linux amd64 only; CI does not download a Collector, so there it is skipped.
 - **Windows** was not built or tested in this work (see the table above). jemalloc builds were
   not benchmarked (not installed on the benchmark machine).
 - **protobuf-c**: proto3 `optional` relies on the shim until protobuf-c reports the feature

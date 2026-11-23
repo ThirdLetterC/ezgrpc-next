@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Downloads the OpenTelemetry Collector core distribution ("otelcol") for the collector
-# integration test, verifies it against the checksum file published with the release, and
+# integration test, verifies it against the SHA-256 published next to the archive, and
 # installs the binary into <dir>:
 #
 #   examples/otlp_metrics/integration/fetch-otelcol.sh .tls/otelcol
@@ -25,14 +25,17 @@ esac
 
 base=https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v$version
 archive=otelcol_${version}_${os}_${arch}.tar.gz
-checksums=opentelemetry-collector-releases_otelcol_checksums.txt
 
 mkdir -p "$dir"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 curl -fsSL -o "$work/$archive" "$base/$archive"
-curl -fsSL -o "$work/$checksums" "$base/$checksums"
+expected=$(curl -fsSL "$base/$archive.sha256" | tr -d '[:space:]')
 if command -v sha256sum > /dev/null; then sha=(sha256sum); else sha=(shasum -a 256); fi
-(cd "$work" && grep " $archive\$" "$checksums" | "${sha[@]}" -c -)
+actual=$("${sha[@]}" "$work/$archive" | cut -d' ' -f1)
+if [[ ! $expected =~ ^[0-9a-f]{64}$ || $actual != "$expected" ]]; then
+  echo "checksum mismatch for $archive: expected '$expected', got '$actual'" >&2
+  exit 1
+fi
 tar -xzf "$work/$archive" -C "$dir" otelcol
 echo "installed $("$dir/otelcol" --version) into $dir"
