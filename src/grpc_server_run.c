@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <inttypes.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -110,6 +111,51 @@ GRPC_API void grpc_server_stop(grpc_server *server) {
   atomic_store(&server->stop, true);
   /* async-signal-safe */
   uv_async_send(&server->async);
+}
+
+GRPC_API bool grpc_server_stop_requested(const grpc_server *server) {
+  return server != nullptr && atomic_load(&server->stop);
+}
+
+/* The signals grpc_server_stop_on_signals() watches. libuv reports Ctrl+C (and Ctrl+Break) on a
+ * Windows console as SIGINT; SIGTERM is never raised there, but watching it is harmless. */
+static const int stop_signal_numbers[2] = {SIGINT, SIGTERM};
+
+/* libuv signal callback, on the loop thread. Stops watching both signals, which gives them their
+ * default action back, so a second Ctrl+C ends a shutdown that hangs; then stops the server. */
+static void on_stop_signal(uv_signal_t *handle, int signum) {
+  grpc_server *server = handle->data;
+  for (size_t i = 0; i < 2; i++)
+    uv_signal_stop(&server->stop_signals[i]);
+  LOG_INFO(server, "received %s, stopping (repeat it to exit at once)\n",
+             signum == SIGINT ? "SIGINT" : "SIGTERM");
+  grpc_server_stop(server);
+}
+
+/* Watches SIGINT and SIGTERM on the server's loop. The handles are initialized once, unreferenced
+ * so that they do not keep the loop alive, and closed by grpc_server_free(). */
+GRPC_API grpc_err grpc_server_stop_on_signals(grpc_server *server) {
+  if (server == nullptr)
+    return GRPC_ERR_INVALID;
+  if (!server->stop_signals_active) {
+    for (size_t i = 0; i < 2; i++) {
+      /* uv_signal_init() cannot fail once the loop is initialized */
+      uv_signal_init(&server->loop, &server->stop_signals[i]);
+      server->stop_signals[i].data = server;
+      uv_unref((uv_handle_t *)&server->stop_signals[i]);
+    }
+    server->stop_signals_active = true;
+  }
+  for (size_t i = 0; i < 2; i++) {
+    int rc = uv_signal_start(&server->stop_signals[i], on_stop_signal, stop_signal_numbers[i]);
+    if (rc != 0) {
+      LOG_ERROR(server, "cannot watch signal %d: %s\n", stop_signal_numbers[i], uv_strerror(rc));
+      for (size_t j = 0; j < i; j++)
+        uv_signal_stop(&server->stop_signals[j]);
+      return GRPC_ERR_IO;
+    }
+  }
+  return GRPC_OK;
 }
 
 /* Counts the streams of sessions that are open and not closing. */

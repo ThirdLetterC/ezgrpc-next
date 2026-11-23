@@ -476,6 +476,8 @@ struct grpc_server {
   uv_timer_t flush_retry_timer;
   /* Wakes the loop for grpc_server_post() and grpc_server_stop(). */
   uv_async_t async;
+  /* SIGINT and SIGTERM watchers of grpc_server_stop_on_signals(). */
+  uv_signal_t stop_signals[2];
 
   bool loop_initialized : 1;
   bool ipv4_listener_active : 1;
@@ -490,6 +492,8 @@ struct grpc_server {
   /* expire_deadlines() is walking the sessions: grpc_server_flush() must not close one now */
   bool in_deadline_scan : 1;
   bool async_active : 1;
+  /* stop_signals are initialized (closed by grpc_server_free()) */
+  bool stop_signals_active : 1;
   bool is_tls : 1;
 
   atomic_bool stop;
@@ -610,7 +614,7 @@ void reflection_free(grpc_server *server);
  * GRPC_ERR_UNSUPPORTED without TLS. */
 grpc_err tls_enable(grpc_server *server, const grpc_tls_config *cfg);
 /* Free the active and retired TLS contexts. */
-void tls_free(grpc_server *server);
+void tls_server_free(grpc_server *server);
 
 /* grpc_message.c: a message with a compressed flag */
 /* Allocate a message with `len` payload bytes and the given compressed-flag byte, copying `data`

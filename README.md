@@ -47,6 +47,7 @@ int main(void) {
   (void)grpc_health_enable(server);
   (void)grpc_reflection_enable(server);
   (void)grpc_server_handle(server, "/helloworld.Greeter/SayHello", say_hello, nullptr);
+  (void)grpc_server_stop_on_signals(server); /* Ctrl+C stops grpc_server_run() */
   (void)grpc_server_run(server);
   (void)grpc_server_drain(server, 5000);
   grpc_server_free(server);

@@ -206,9 +206,12 @@ static void resume_stream(grpc_call *call, void *userdata) {
 
 ### Graceful Shutdown
 
-Call `grpc_server_stop(server)` from a signal handler or another thread to exit `grpc_server_run()`, then drain active calls before freeing:
+Call `grpc_server_stop(server)` from a signal handler or another thread to exit `grpc_server_run()`, then drain active calls before freeing.
+`grpc_server_stop_on_signals(server)` does it for you on Ctrl+C (SIGINT) or SIGTERM; it is
+handled once, so a second Ctrl+C ends the process if the drain hangs:
 
 ```c
+(void)grpc_server_stop_on_signals(server); /* Ctrl+C / SIGTERM stops grpc_server_run() */
 (void)grpc_server_run(server);
 /* Stop accepting new connections, send HTTP/2 GOAWAY, wait up to 5s for active calls */
 grpc_err drain_err = grpc_server_drain(server, 5000);
@@ -218,3 +221,14 @@ grpc_server_free(server);
 Calls on event routes (`grpc_server_register_path()`) need the application to answer them: when
 they produce events during a drain, `grpc_server_drain()` returns `GRPC_ERR_STATE` with the events
 available from `grpc_server_events()`. Handle them, then call `grpc_server_drain()` again.
+
+A `grpc_server_poll()` loop ends the same way with `grpc_server_stop_requested()`:
+
+```c
+(void)grpc_server_stop_on_signals(server);
+while (!grpc_server_stop_requested(server)) {
+  if (grpc_server_poll(server, 500) < 0)
+    break;
+  /* handle grpc_server_events() */
+}
+```

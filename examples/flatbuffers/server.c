@@ -16,10 +16,6 @@ enum { MAX_REPLIES = 100 };
 static grpc_server *g_server;
 static int g_quiet = 0;
 
-static void sig_handler([[maybe_unused]] int sig) {
-  grpc_server_stop(g_server);
-}
-
 /* builds every response. grpc_call_send_fb() resets it after each one */
 static flatcc_builder_t g_builder;
 
@@ -106,8 +102,7 @@ int main(int argc, char *argv[]) {
 #ifdef SIGPIPE
   signal(SIGPIPE, SIG_IGN);
 #endif
-  signal(SIGINT, sig_handler);
-  signal(SIGTERM, sig_handler);
+  grpc_server_stop_on_signals(g_server);
 
   grpc_server_run(g_server);
 

@@ -158,6 +158,55 @@ void test_post_and_stop_from_another_thread(void) {
   TEST_ASSERT_EQUAL_INT(100, counter);
 }
 
+#ifndef _WIN32
+#include <signal.h>
+
+/* The disposition of signum, without changing it. */
+static void (*signal_disposition(int signum))(int) {
+  struct sigaction current;
+  sigaction(signum, nullptr, &current);
+  return current.sa_handler;
+}
+
+void test_stop_on_signals(void) {
+  TEST_ASSERT_EQUAL_INT(GRPC_ERR_INVALID, grpc_server_stop_on_signals(nullptr));
+  TEST_ASSERT_FALSE(grpc_server_stop_requested(nullptr));
+
+  grpc_server *server = grpc_server_new(
+      &(grpc_config){.port = 0, .ipv4_addr = "127.0.0.1", .log_level = GRPC_LOG_OFF});
+  TEST_ASSERT_NOT_NULL(server);
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_stop_on_signals(server));
+  /* calling it again is harmless */
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_stop_on_signals(server));
+  TEST_ASSERT_FALSE(grpc_server_stop_requested(server));
+  TEST_ASSERT_TRUE(signal_disposition(SIGINT) != SIG_DFL);
+
+  for (int round = 0; round < 2; round++) {
+    int signum = round == 0 ? SIGINT : SIGTERM;
+    /* handled on the loop: grpc_server_run() returns */
+    TEST_ASSERT_EQUAL_INT(0, raise(signum));
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_run(server));
+    /* run cleared the stop flag; both signals have their default action again */
+    TEST_ASSERT_FALSE(grpc_server_stop_requested(server));
+    TEST_ASSERT_TRUE(signal_disposition(SIGINT) == SIG_DFL);
+    TEST_ASSERT_TRUE(signal_disposition(SIGTERM) == SIG_DFL);
+    /* watched once more for the next round */
+    TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_stop_on_signals(server));
+  }
+
+  /* a poll loop sees the stop */
+  TEST_ASSERT_EQUAL_INT(0, raise(SIGINT));
+  for (int i = 0; i < 100 && !grpc_server_stop_requested(server); i++)
+    TEST_ASSERT_TRUE(grpc_server_poll(server, 100) >= 0);
+  TEST_ASSERT_TRUE(grpc_server_stop_requested(server));
+
+  /* free closes the watchers while they are active */
+  TEST_ASSERT_EQUAL_INT(GRPC_OK, grpc_server_stop_on_signals(server));
+  grpc_server_free(server);
+  TEST_ASSERT_TRUE(signal_disposition(SIGINT) == SIG_DFL);
+}
+#endif
+
 static size_t read_log(FILE *file, char *buffer, size_t size) {
   fflush(file);
   rewind(file);
@@ -420,6 +469,9 @@ int main(void) {
   RUN_TEST(test_routes);
   RUN_TEST(test_poll_idle);
   RUN_TEST(test_post_and_stop_from_another_thread);
+#ifndef _WIN32
+  RUN_TEST(test_stop_on_signals);
+#endif
   RUN_TEST(test_log_level_control);
   RUN_TEST(test_strings);
   RUN_TEST(test_messages);

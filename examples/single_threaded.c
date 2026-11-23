@@ -16,12 +16,6 @@
 
 #include "grpc.h"
 
-static volatile sig_atomic_t running = 1;
-
-static void on_signal([[maybe_unused]] int sig) {
-  running = 0;
-}
-
 enum method { ECHO, COLLECT };
 
 static void handle_event(const grpc_event *event) {
@@ -63,9 +57,6 @@ int main(int argc, char **argv) {
 #ifdef SIGPIPE
   signal(SIGPIPE, SIG_IGN);
 #endif
-  signal(SIGINT, on_signal);
-  signal(SIGTERM, on_signal);
-
   grpc_server *server = grpc_server_new(&(grpc_config){
       .port = (uint16_t)(argc > 1 ? atoi(argv[1]) : 19009),
   });
@@ -76,7 +67,9 @@ int main(int argc, char **argv) {
   grpc_server_register_path(server, "/example.Echo/Echo", &echo);
   grpc_server_register_path(server, "/example.Echo/Collect", &collect);
 
-  while (running) {
+  /* Ctrl+C or SIGTERM ends the loop below */
+  grpc_server_stop_on_signals(server);
+  while (!grpc_server_stop_requested(server)) {
     int nb_events = grpc_server_poll(server, 500);
     if (nb_events < 0)
       break;

@@ -1,7 +1,7 @@
 /* grpc_tls.c - TLS backend independent layer: public TLS API and per-session plumbing.
  *
  * This file implements the public TLS functions (grpc_tls_backend(), grpc_server_reload_tls(),
- * grpc_server_tls_native()), the server context lifetime (tls_enable(), tls_free()) and the
+ * grpc_server_tls_native()), the server context lifetime (tls_enable(), tls_server_free()) and the
  * grpc_tls_* per-session wrappers used by the session code. The wrappers validate the session
  * and forward to the tls_backend_* contract from internal_tls.h, which exactly one
  * src/grpc_tls_<backend>.c implements.
@@ -111,7 +111,7 @@ GRPC_API grpc_err grpc_server_reload_tls(grpc_server *server, const grpc_tls_con
 
 /* Frees the active server context and every retired one. Called when the server is destroyed,
  * after its connections. */
-void tls_free(grpc_server *server) {
+void tls_server_free(grpc_server *server) {
   tls_ctx_pool_free(&server->tls_pool);
 }
 
@@ -251,7 +251,7 @@ GRPC_API grpc_err grpc_server_reload_tls(grpc_server *server, const grpc_tls_con
 }
 
 /* Without TLS: there is nothing to free. */
-void tls_free([[maybe_unused]] grpc_server *server) {}
+void tls_server_free([[maybe_unused]] grpc_server *server) {}
 
 /* Without TLS: succeeds without doing anything, as for a plaintext server. */
 int grpc_tls_session_init([[maybe_unused]] grpc_session *session) {
