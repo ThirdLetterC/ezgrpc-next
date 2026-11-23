@@ -146,6 +146,17 @@ if(GRPC_BUILD_TESTS)
   endfunction()
   otlp_add_test(unit tests/unit_tests.c SOURCES tests/otlp_fixtures.c)
   otlp_add_test(server tests/server_tests.c SOURCES tests/otlp_fixtures.c)
+  if(OTLP_METRICS_WAL)
+    otlp_add_test(wal tests/wal_tests.c)
+  endif()
+endif()
+
+if(OTLP_METRICS_WAL)
+  # verifies a log and exports its batches as one ExportMetricsServiceRequest
+  add_executable(otlp_wal_dump tools/otlp_wal_dump.c)
+  target_link_libraries(otlp_wal_dump PRIVATE otlp_metrics_core)
+  set_target_properties(otlp_wal_dump PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+  list(APPEND otlp_example_targets otlp_wal_dump)
 endif()
 
 # ---- integration tests (official OpenTelemetry SDK exporters) --------------------------------
@@ -226,6 +237,13 @@ if(GRPC_BUILD_INTEGRATION_TESTS OR GRPC_BUILD_TESTS)
       COMMAND "${otlp_python}" "${CMAKE_CURRENT_SOURCE_DIR}/integration/python_sdk_test.py")
     set_tests_properties(otlp_integration_python PROPERTIES LABELS "integration;otlp" TIMEOUT 300
       ENVIRONMENT "OTLP_SERVER=$<TARGET_FILE:otlp_metrics_server>")
+    if(OTLP_METRICS_WAL)
+      add_test(NAME otlp_integration_wal
+        COMMAND "${otlp_python}" "${CMAKE_CURRENT_SOURCE_DIR}/integration/wal_test.py")
+      set_tests_properties(otlp_integration_wal PROPERTIES LABELS "integration;otlp" TIMEOUT 300
+        ENVIRONMENT
+          "OTLP_SERVER=$<TARGET_FILE:otlp_metrics_server>;OTLP_WAL_DUMP=$<TARGET_FILE:otlp_wal_dump>")
+    endif()
   else()
     message(STATUS "otlp_metrics: no Python with the OpenTelemetry SDK; the Python integration "
       "test is skipped (pip install -r ${CMAKE_CURRENT_SOURCE_DIR}/integration/requirements.txt "

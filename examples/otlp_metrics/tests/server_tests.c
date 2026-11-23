@@ -737,6 +737,77 @@ static void test_concurrent_accounting_loops_and_workers(void) {
 #endif
 }
 
+#ifdef OTLP_METRICS_WAL
+#include "otlp_wal_format.h"
+
+/* Concurrent clients, several loops and workers, the WAL sink: after a graceful stop the log holds
+ * exactly the acknowledged points, in valid records. */
+static void test_concurrent_accounting_wal(void) {
+  uv_loop_t loop;
+  uv_loop_init(&loop);
+  uv_fs_t req;
+  TEST_ASSERT_EQUAL_INT(0, uv_fs_mkdtemp(&loop, &req, "otlp-wal-server-XXXXXX", nullptr));
+  char dir[256];
+  snprintf(dir, sizeof(dir), "%s", req.path);
+  uv_fs_req_cleanup(&req);
+
+  otlp_config c = test_config();
+#ifndef _WIN32
+  c.loops = 2;
+#endif
+  c.service.workers = 2;
+  c.sink = OTLP_SINK_KIND_WAL;
+  c.wal_dir = dir;
+  c.wal_sync = 0; /* page cache: the test checks accounting, not power-loss durability */
+  c.wal_segment_bytes = 256 * 1024;
+  start(&c);
+  size_t len;
+  uint8_t *data = fx_pack(&F, &fx_all_kinds(&F, 2)->base, &len); /* 10 points */
+  static load_thread threads[NB_THREADS];
+  static const uint8_t bad[] = {0x0a, 0x03, 0x12, 0x09};
+  for (unsigned i = 0; i < NB_THREADS; i++) {
+    threads[i] = (load_thread){.port = otlp_app_port(g_app),
+                               .index = i,
+                               .payloads = {data, data, bad},
+                               .lens = {len, len, sizeof(bad)}};
+    TEST_ASSERT_EQUAL_INT(0, pthread_create(&threads[i].thread, nullptr, load_main, &threads[i]));
+  }
+  uint64_t ok_n = 0;
+  for (unsigned i = 0; i < NB_THREADS; i++) {
+    TEST_ASSERT_EQUAL_INT(0, pthread_join(threads[i].thread, nullptr));
+    TEST_ASSERT_EQUAL_UINT64(0, threads[i].other);
+    ok_n += threads[i].ok;
+  }
+  otlp_stats_snapshot s = stats();
+  TEST_ASSERT_EQUAL_UINT64(ok_n * 10, s.points_accepted);
+  otlp_app_stop(g_app);
+  TEST_ASSERT_EQUAL_INT(0, otlp_app_wait(g_app));
+  g_app = nullptr;
+
+  char **names;
+  long n = otlp_wal_list_segments(dir, &names);
+  TEST_ASSERT_TRUE(n >= 1);
+  uint64_t records = 0, points = 0;
+  for (long i = 0; i < n; i++) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", dir, names[i]);
+    otlp_wal_scan scan;
+    otlp_wal_scan_segment(path, nullptr, nullptr, &scan);
+    TEST_ASSERT_EQUAL_INT(OTLP_WAL_SCAN_CLEAN, scan.end);
+    records += scan.records;
+    points += scan.points;
+    uv_fs_unlink(&loop, &req, path, nullptr);
+    uv_fs_req_cleanup(&req);
+  }
+  otlp_wal_list_free(names, n);
+  uv_fs_rmdir(&loop, &req, dir, nullptr);
+  uv_fs_req_cleanup(&req);
+  uv_loop_close(&loop);
+  TEST_ASSERT_EQUAL_UINT64(ok_n, records);
+  TEST_ASSERT_EQUAL_UINT64(ok_n * 10, points);
+}
+#endif
+
 /* ---- shutdown ---------------------------------------------------------------------------------- */
 
 typedef struct stopper {
@@ -821,6 +892,9 @@ int main(void) {
   RUN_TEST(test_concurrent_accounting_workers);
   RUN_TEST(test_concurrent_accounting_loops);
   RUN_TEST(test_concurrent_accounting_loops_and_workers);
+#ifdef OTLP_METRICS_WAL
+  RUN_TEST(test_concurrent_accounting_wal);
+#endif
   RUN_TEST(test_shutdown_fails_held_requests_as_retryable);
   RUN_TEST(test_shutdown_drains_requests_in_flight);
   return UNITY_END();

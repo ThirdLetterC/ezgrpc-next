@@ -342,19 +342,31 @@ static void process(otlp_service *svc, otlp_arena *arena, otlp_job *job,
   otlp_sink_completion done = {
       .fn = on_sink_done, .ctx = job, .cancelled = job != nullptr ? &job->cancelled : nullptr};
   const char *detail = nullptr;
-  otlp_sink_result result = otlp_sink_submit(svc->sink, &batch, &done, &detail);
-  switch (result) {
-  case OTLP_SINK_ACCEPTED:
-    OTLP_STAT_ADD(st, payload_bytes_stored, batch.payload_len);
-    return;
-  case OTLP_SINK_PENDING:
-    /* only sinks with OTLP_SINK_MAY_DEFER defer, and their requests always have a job */
+  if (job != nullptr) {
+    /* A deferring sink may complete the batch on its own thread before submit() even returns,
+     * so the job must hold everything its completion needs before the sink sees it (the sink's
+     * queue lock publishes these writes to that thread). */
     job->response = out->response;
     job->points = out->points;
     job->accepted = out->accepted;
     job->rejected = out->rejected;
     out->response = nullptr;
+  }
+  otlp_sink_result result = otlp_sink_submit(svc->sink, &batch, &done, &detail);
+  if (result == OTLP_SINK_PENDING) {
+    /* only sinks with OTLP_SINK_MAY_DEFER defer, and their requests always have a job; the job
+     * now belongs to the completion */
     out->pending = true;
+    OTLP_STAT_ADD(st, payload_bytes_stored, batch.payload_len);
+    return;
+  }
+  if (job != nullptr) {
+    /* not deferred: no completion will run, the response is ours again */
+    out->response = job->response;
+    job->response = nullptr;
+  }
+  switch (result) {
+  case OTLP_SINK_ACCEPTED:
     OTLP_STAT_ADD(st, payload_bytes_stored, batch.payload_len);
     return;
   case OTLP_SINK_RETRYABLE:
