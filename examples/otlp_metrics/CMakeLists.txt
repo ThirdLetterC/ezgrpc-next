@@ -251,6 +251,49 @@ if(GRPC_BUILD_INTEGRATION_TESTS OR GRPC_BUILD_TESTS)
   endif()
 endif()
 
+# Go: the official OpenTelemetry Go SDK exporter tests, and the grpc-go comparison server used by
+# the benchmarks (bench/). Modules are pinned by go.mod/go.sum and downloaded by the Go toolchain.
+find_program(OTLP_GO_EXECUTABLE go DOC "Go toolchain for the OTLP Go tests and comparison server")
+set(otlp_go_dir "${CMAKE_CURRENT_SOURCE_DIR}/go")
+if(OTLP_GO_EXECUTABLE)
+  set(otlp_grpcgo_server "${CMAKE_BINARY_DIR}/grpcgo-server${CMAKE_EXECUTABLE_SUFFIX}")
+  add_custom_target(otlp_grpcgo_server
+    COMMAND "${OTLP_GO_EXECUTABLE}" build -trimpath -o "${otlp_grpcgo_server}" ./cmd/grpcgo-server
+    WORKING_DIRECTORY "${otlp_go_dir}"
+    BYPRODUCTS "${otlp_grpcgo_server}"
+    COMMENT "Building the grpc-go comparison server"
+    VERBATIM)
+  if(GRPC_BUILD_INTEGRATION_TESTS OR GRPC_BUILD_TESTS)
+    add_test(NAME otlp_integration_go
+      COMMAND "${OTLP_GO_EXECUTABLE}" test -count=1 -v ./sdktest
+      WORKING_DIRECTORY "${otlp_go_dir}")
+    set_tests_properties(otlp_integration_go PROPERTIES LABELS "integration;otlp" TIMEOUT 600
+      ENVIRONMENT
+        "OTLP_SERVER=$<TARGET_FILE:otlp_metrics_server>;GRPCGO_SERVER=${otlp_grpcgo_server}")
+    # the comparison server is built by `cmake --build <dir> --target otlp_grpcgo_server`, or by
+    # this fixture before the Go tests
+    add_test(NAME otlp_build_grpcgo_server
+      COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}" --target otlp_grpcgo_server)
+    set_tests_properties(otlp_build_grpcgo_server PROPERTIES LABELS "integration;otlp"
+      FIXTURES_SETUP otlp_grpcgo TIMEOUT 600)
+    set_tests_properties(otlp_integration_go PROPERTIES FIXTURES_REQUIRED otlp_grpcgo)
+  endif()
+else()
+  message(STATUS "otlp_metrics: Go not found; the Go SDK tests and the grpc-go comparison server are skipped")
+endif()
+
+# The OpenTelemetry Collector test needs a collector binary (core distribution "otelcol"); see
+# integration/fetch-otelcol.sh. Without one it reports itself skipped.
+set(OTLP_OTELCOL_EXECUTABLE "" CACHE FILEPATH "otelcol binary for the collector integration test")
+if(otlp_python)
+  add_test(NAME otlp_integration_collector
+    COMMAND "${otlp_python}" "${CMAKE_CURRENT_SOURCE_DIR}/integration/collector_test.py")
+  set_tests_properties(otlp_integration_collector PROPERTIES LABELS "integration;otlp"
+    TIMEOUT 300 SKIP_RETURN_CODE 77
+    ENVIRONMENT
+      "OTLP_SERVER=$<TARGET_FILE:otlp_metrics_server>;OTLP_OTELCOL=${OTLP_OTELCOL_EXECUTABLE}")
+endif()
+
 if("thread" IN_LIST _grpc_sanitizers)
   # see the top-level CMakeLists.txt: ThreadSanitizer does not intercept io_uring
   get_property(otlp_tests DIRECTORY PROPERTY TESTS)
