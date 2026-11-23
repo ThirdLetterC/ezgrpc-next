@@ -302,7 +302,7 @@ server's counters, CPU time and peak RSS from `/proc`. Medians, with min-max.
 ### Recorded results
 
 [`bench/results/20261123-011435/`](bench/results/20261123-011435/): `summary.md`, 129 raw runs
-(`runs/*.json`, with ghz's full report and server counters), `environment.json`, `run.log`. The
+(`runs/*.json`, with ghz's full report and server counters) and `environment.json`. The
 payload files (`workloads/*.bin`) are not committed; `workloads/workloads.json` holds the
 `otlp_gen` arguments that recreate them byte for byte.
 
