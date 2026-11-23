@@ -32,6 +32,7 @@ typedef struct fault_sink {
   uint64_t submits;
   size_t blocked; /* threads waiting in a blocking gate */
   bool gate_closed;
+  bool quiesced; /* refuse batches that would be held */
   bool closed;
   held *head, *tail;
   size_t held_count;
@@ -109,6 +110,14 @@ static otlp_sink_result fault_submit(otlp_sink *sink, const otlp_batch *batch,
     return otlp_sink_submit(s->inner, batch, done, detail);
   }
 
+  pthread_mutex_lock(&s->lock);
+  bool quiesced = s->quiesced;
+  pthread_mutex_unlock(&s->lock);
+  if (quiesced) {
+    *detail = "shutting down";
+    return OTLP_SINK_RETRYABLE;
+  }
+
   /* hold a copy until the gate opens */
   size_t len = batch->payload != nullptr ? batch->payload_len : 0;
   size_t reserved = len;
@@ -128,9 +137,9 @@ static otlp_sink_result fault_submit(otlp_sink *sink, const otlp_batch *batch,
     memcpy(h->data, batch->payload, len);
 
   pthread_mutex_lock(&s->lock);
-  if (!s->gate_closed || s->closed || s->held_count >= s->config.gate_capacity) {
-    /* the gate opened (or the sink closed, or filled up) meanwhile */
-    bool now_closed = s->closed;
+  if (!s->gate_closed || s->closed || s->quiesced || s->held_count >= s->config.gate_capacity) {
+    /* the gate opened (or the sink quiesced, or filled up) meanwhile */
+    bool now_closed = s->closed || s->quiesced;
     bool full = s->gate_closed && !now_closed;
     pthread_mutex_unlock(&s->lock);
     if (reserved != 0 && s->budget != nullptr)
@@ -215,16 +224,18 @@ static void fault_stats(otlp_sink *sink, otlp_strbuf *out) {
   }
 }
 
-static void fault_shutdown(otlp_sink *sink) {
+/* Fails the held batches (never stored) and refuses new ones that a closed gate would hold, so
+ * their calls get answered while the server still drains. Threads blocked in a blocking gate
+ * model a slow sink that is still working: they keep waiting for the gate (or shutdown()). */
+static void fault_quiesce(otlp_sink *sink) {
   fault_sink *s = (fault_sink *)sink;
   pthread_mutex_lock(&s->lock);
-  s->closed = true;
-  pthread_cond_broadcast(&s->changed);
+  s->quiesced = true;
   held *list = s->head;
   s->head = s->tail = nullptr;
   s->held_count = 0;
+  pthread_cond_broadcast(&s->changed);
   pthread_mutex_unlock(&s->lock);
-  /* held batches were never stored: fail them so their requests finish */
   while (list != nullptr) {
     held *next = list->next;
     if (list->reserved != 0 && s->budget != nullptr)
@@ -234,6 +245,16 @@ static void fault_shutdown(otlp_sink *sink) {
     done.fn(done.ctx, OTLP_SINK_RETRYABLE, "shutting down");
     list = next;
   }
+  otlp_sink_quiesce(s->inner);
+}
+
+static void fault_shutdown(otlp_sink *sink) {
+  fault_sink *s = (fault_sink *)sink;
+  fault_quiesce(sink);
+  pthread_mutex_lock(&s->lock);
+  s->closed = true; /* wakes blocked submitters, which refuse their batches */
+  pthread_cond_broadcast(&s->changed);
+  pthread_mutex_unlock(&s->lock);
   otlp_sink_shutdown(s->inner);
 }
 
@@ -249,6 +270,7 @@ static const otlp_sink_ops fault_ops = {
     .name = "fault",
     .submit = fault_submit,
     .stats_json = fault_stats,
+    .quiesce = fault_quiesce,
     .shutdown = fault_shutdown,
     .destroy = fault_destroy,
 };

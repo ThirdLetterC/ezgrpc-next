@@ -36,6 +36,7 @@
   X(sink_failed)          /* INTERNAL: the sink failed permanently */                          \
   X(deadline_exceeded)    /* DEADLINE_EXCEEDED: --request-timeout-ms passed before the sink */ \
   X(cancelled)            /* the client cancelled (or its deadline passed) before the sink */  \
+  X(cancellations)        /* calls in flight the client cancelled (any stage) */               \
   X(shutting_down)        /* UNAVAILABLE: received while shutting down */                      \
   X(encoding_identity)    /* requests without grpc-encoding (or identity) */                   \
   X(encoding_gzip)        /* requests with grpc-encoding: gzip */                              \

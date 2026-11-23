@@ -61,7 +61,10 @@ otlp_service *otlp_service_new(const otlp_service_config *config, otlp_sink *sin
 /** Registers the service's methods and interceptors on `server` (before it serves). */
 grpc_err otlp_service_attach(otlp_service *service, grpc_server *server);
 
-/** New Export calls are refused with UNAVAILABLE from now on. Any thread; idempotent. */
+/**
+ * New Export calls are refused with UNAVAILABLE from now on, and the sink quiesces (fails what it
+ * holds but cannot finish by itself). Any thread except a signal handler; idempotent.
+ */
 void otlp_service_begin_shutdown(otlp_service *service);
 
 /**

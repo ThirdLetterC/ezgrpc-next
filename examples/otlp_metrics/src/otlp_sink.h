@@ -22,8 +22,11 @@
  *    `done` is called only for OTLP_SINK_PENDING.
  *  - `detail` (in the completion) is a short reason for the client, valid during the call.
  *
- * shutdown() stops accepting (later submits return RETRYABLE), finishes or fails every pending
- * batch (calling their `done`) and joins the sink's threads. destroy() frees a shut-down sink.
+ * quiesce() starts a shutdown while the event loops still drain: later submits return RETRYABLE,
+ * and pending batches that cannot complete by themselves (held by a closed gate) are failed now,
+ * so their calls are answered before the connections close. Batches that are making progress (a
+ * WAL write) keep going. shutdown() then finishes or fails every pending batch (calling their
+ * `done`) and joins the sink's threads. destroy() frees a shut-down sink.
  */
 
 #include <stdatomic.h>
@@ -78,6 +81,8 @@ typedef struct otlp_sink_ops {
                              const otlp_sink_completion *done, const char **detail);
   /** Appends sink-specific JSON object members (without braces). Optional. */
   void (*stats_json)(otlp_sink *sink, otlp_strbuf *out);
+  /** Optional; see above. Any thread, called once before shutdown(). */
+  void (*quiesce)(otlp_sink *sink);
   void (*shutdown)(otlp_sink *sink);
   void (*destroy)(otlp_sink *sink);
 } otlp_sink_ops;
@@ -96,6 +101,11 @@ static inline otlp_sink_result otlp_sink_submit(otlp_sink *sink, const otlp_batc
                                                 const char **detail) {
   const char *ignored = nullptr;
   return sink->ops->submit(sink, batch, done, detail != nullptr ? detail : &ignored);
+}
+
+static inline void otlp_sink_quiesce(otlp_sink *sink) {
+  if (sink != nullptr && sink->ops->quiesce != nullptr)
+    sink->ops->quiesce(sink);
 }
 
 static inline void otlp_sink_shutdown(otlp_sink *sink) {

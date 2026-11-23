@@ -448,6 +448,8 @@ static void on_job_cancel(grpc_call *call, void *userdata) {
   (void)call;
   otlp_job *job = userdata;
   atomic_store(&job->cancelled, true);
+  OTLP_STAT_ADD(&job->svc->stats, cancellations, 1);
+  notify_waiters(job->svc);
 }
 
 static void count_encoding(otlp_service *svc, grpc_call *call) {
@@ -755,7 +757,8 @@ grpc_err otlp_service_attach(otlp_service *svc, grpc_server *server) {
 }
 
 void otlp_service_begin_shutdown(otlp_service *svc) {
-  atomic_store(&svc->shutting_down, true);
+  if (!atomic_exchange(&svc->shutting_down, true))
+    otlp_sink_quiesce(svc->sink);
 }
 
 void otlp_service_stop(otlp_service *svc) {
