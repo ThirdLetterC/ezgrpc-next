@@ -27,7 +27,7 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-Only a C compiler, CMake and OpenSSL headers need to be installed. nghttp2, libuv, zlib, zstd, Snappy and protobuf-c are downloaded as pinned, checksummed releases and built on the first configure. Pass `-DGRPC_DEPENDENCIES=SYSTEM` to use installed packages instead (see [Getting Started](docs/getting-started.md#third-party-libraries-bundled-by-default)).
+Only a C compiler, CMake and Perl (which OpenSSL's build uses) need to be installed. OpenSSL, nghttp2, libuv, zlib, zstd, Snappy and protobuf-c are downloaded as pinned, checksummed releases and built on the first configure. Pass `-DGRPC_DEPENDENCIES=SYSTEM` to use installed packages instead (see [Getting Started](docs/getting-started.md#third-party-libraries-bundled-by-default)).
 
 ```c
 #include <string.h>
@@ -47,6 +47,7 @@ int main(void) {
   (void)grpc_health_enable(server);
   (void)grpc_reflection_enable(server);
   (void)grpc_server_handle(server, "/helloworld.Greeter/SayHello", say_hello, nullptr);
+  (void)grpc_server_stop_on_signals(server); /* Ctrl+C stops grpc_server_run() */
   (void)grpc_server_run(server);
   (void)grpc_server_drain(server, 5000);
   grpc_server_free(server);

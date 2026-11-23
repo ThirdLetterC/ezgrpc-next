@@ -262,6 +262,27 @@ GRPC_API grpc_err grpc_server_run(grpc_server *server);
 GRPC_API void grpc_server_stop(grpc_server *server);
 
 /**
+ * Stops the server on Ctrl+C (SIGINT) or SIGTERM: the first of them calls
+ * grpc_server_stop(), so grpc_server_run() returns and the application can
+ * drain and free the server. That signal also gives both signals their default
+ * action back, so a second Ctrl+C ends the process if the shutdown hangs.
+ * Call it again after a stop to watch the signals once more. On Windows, libuv
+ * reports Ctrl+C and Ctrl+Break on the console as SIGINT. Signals are watched
+ * on the server's loop, so they are noticed while it is polled; replaces any
+ * handler the application installed for them. Returns GRPC_ERR_IO if a
+ * signal cannot be watched.
+ */
+GRPC_API grpc_err grpc_server_stop_on_signals(grpc_server *server);
+
+/**
+ * Whether grpc_server_stop() was called (by any thread, or by the signal
+ * watch of grpc_server_stop_on_signals()) since the server was created or
+ * since grpc_server_run() last returned, which clears it. Lets a
+ * grpc_server_poll() loop end like grpc_server_run(). Safe from any thread.
+ */
+GRPC_API bool grpc_server_stop_requested(const grpc_server *server);
+
+/**
  * Gracefully drains the server: stops accepting new connections, shuts every
  * connection down in gRPC's two steps (a GOAWAY notice plus a PING, then,
  * once the client acknowledged it or after at most 1 s, the final GOAWAY; so

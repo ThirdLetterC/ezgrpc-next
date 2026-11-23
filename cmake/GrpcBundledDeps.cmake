@@ -105,6 +105,51 @@ grpc_bundled_declare(protobuf-c
   HEADER protobuf-c/protobuf-c.h LIBRARY_NAMES protobuf-c
   OVERLAY "${CMAKE_CURRENT_LIST_DIR}/bundled/protobuf-c")
 
+# OpenSSL's directory (OPENSSLDIR) holds the default certificate store that clients verify servers
+# against when no CA is configured. The bundled build uses the system's, as the host openssl
+# command reports it, or the usual location. SSL_CERT_FILE / SSL_CERT_DIR still override it.
+set(GRPC_OPENSSL_DIR "" CACHE STRING
+  "OPENSSLDIR of the bundled OpenSSL (certificate store, openssl.cnf); empty: the system's")
+set(_grpc_openssldir "${GRPC_OPENSSL_DIR}")
+if(NOT _grpc_openssldir AND NOT WIN32 AND NOT CMAKE_CROSSCOMPILING)
+  find_program(GRPC_HOST_OPENSSL_EXECUTABLE NAMES openssl NO_CMAKE_PATH)
+  if(GRPC_HOST_OPENSSL_EXECUTABLE)
+    execute_process(COMMAND "${GRPC_HOST_OPENSSL_EXECUTABLE}" version -d
+      OUTPUT_VARIABLE _grpc_openssldir_out ERROR_QUIET RESULT_VARIABLE _grpc_openssldir_rc)
+    if(_grpc_openssldir_rc EQUAL 0 AND _grpc_openssldir_out MATCHES "OPENSSLDIR: \"([^\"]+)\"")
+      set(_grpc_openssldir "${CMAKE_MATCH_1}")
+    endif()
+  endif()
+  if(NOT _grpc_openssldir)
+    foreach(_grpc_dir IN ITEMS /etc/pki/tls /etc/ssl /usr/local/etc/ssl)
+      if(NOT _grpc_openssldir AND (EXISTS "${_grpc_dir}/cert.pem" OR EXISTS "${_grpc_dir}/certs"))
+        set(_grpc_openssldir "${_grpc_dir}")
+      endif()
+    endforeach()
+  endif()
+endif()
+set(_grpc_openssl_args)
+if(_grpc_openssldir)
+  set(_grpc_openssl_args "-DOPENSSL_OPENSSLDIR=${_grpc_openssldir}")
+endif()
+if(WIN32)
+  set(_grpc_openssl_link ws2_32 crypt32 user32 advapi32)
+elseif(APPLE)
+  set(_grpc_openssl_link Threads::Threads)
+else()
+  set(_grpc_openssl_link Threads::Threads ${CMAKE_DL_LIBS})
+endif()
+# libcrypto; GrpcDependencies.cmake adds libssl, installed next to it (grpc_bundled_openssl)
+grpc_bundled_declare(openssl
+  VERSION 3.5.9 FILE openssl-3.5.9.tar.gz
+  URLS
+    "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
+    "https://www.openssl.org/source/openssl-3.5.9.tar.gz=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a"
+  HEADER openssl/crypto.h LIBRARY_NAMES crypto libcrypto
+  LINK ${_grpc_openssl_link}
+  CMAKE_ARGS ${_grpc_openssl_args}
+  OVERLAY "${CMAKE_CURRENT_LIST_DIR}/bundled/openssl")
+
 # ---- machinery ------------------------------------------------------------------------------
 
 # The configurations to build. GCC/Clang code links into any configuration, so one Release build

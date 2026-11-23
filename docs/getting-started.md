@@ -8,31 +8,34 @@
 - **Logger dependency**: CMake fetches the pinned [ulog](https://github.com/ThirdLetterC/ulog) source at configure time. For offline builds, set `-DFETCHCONTENT_SOURCE_DIR_ULOG=/path/to/ulog`.
 - **Required libraries**: `libuv`, `libnghttp2`, and `pthread` on Unix. They are downloaded and built by default (see below).
 - **Optional libraries**:
-  - TLS: OpenSSL (default), LibreSSL, BoringSSL, AWS-LC, wolfSSL, GnuTLS, or rustls. Always taken from the system or `GRPC_TLS_PREFIX`.
+  - TLS: OpenSSL (default; downloaded by default), LibreSSL, BoringSSL, AWS-LC, wolfSSL, GnuTLS, or rustls. The others are taken from the system or `GRPC_TLS_PREFIX`.
   - Compression: `zlib` (gzip/deflate), `libzstd`, `libsnappy`. Downloaded by default.
   - Serialization: `protobuf-c` (runtime downloaded by default; the `protoc-c` generator, needed only by its test and example, comes from the system) and `flatcc` (build it with `scripts/build-flatcc.sh`).
   - Allocators: `mimalloc`, `jemalloc`.
 
-A fresh Linux machine needs only a compiler, CMake, and OpenSSL headers. A C++ compiler is also needed for Snappy, which is skipped without one:
+A fresh Linux machine needs only a compiler, CMake, and Perl, which OpenSSL's build scripts are written in. A C++ compiler is also needed for Snappy, which is skipped without one. The TLS tests and examples create their certificates with the `openssl` command:
 
 ```bash
-sudo apt-get install -y build-essential cmake libssl-dev
+sudo apt-get install -y build-essential cmake perl openssl
 ```
 
 ### Third-party libraries: bundled by default
 
-With `GRPC_DEPENDENCIES=BUNDLED` (the default), configure downloads pinned releases of nghttp2, libuv, zlib, zstd, Snappy and the protobuf-c runtime. Each archive comes from its GitHub release (or a listed mirror) and is checked against a SHA-256. Each library is built once, as a static position-independent library, into `build/_deps/bundled`. Nothing installed on the system can shadow these builds. They are linked into `libgrpc` and are not re-exported from `libgrpc.so`. `cmake --install` puts them in `<libdir>/ezgrpc-next/`, so the installed CMake package and `pkg-config --static` keep working.
+With `GRPC_DEPENDENCIES=BUNDLED` (the default), configure downloads pinned releases of OpenSSL, nghttp2, libuv, zlib, zstd, Snappy and the protobuf-c runtime. Each archive comes from its GitHub release (or a listed mirror) and is checked against a SHA-256. Each library is built once, as a static position-independent library, into `build/_deps/bundled`. Nothing installed on the system can shadow these builds. They are linked into `libgrpc` and are not re-exported from `libgrpc.so`. `cmake --install` puts them in `<libdir>/ezgrpc-next/`, so the installed CMake package and `pkg-config --static` keep working.
 
-The first configure takes about half a minute; later ones reuse the build. Archives are cached in `~/.cache/ezgrpc-next` (`%LOCALAPPDATA%\ezgrpc-next\cache` on Windows), which every build directory shares. Deleting `build/` therefore does not download them again.
+The first configure takes one to two minutes, most of it OpenSSL; later ones reuse the build. Archives are cached in `~/.cache/ezgrpc-next` (`%LOCALAPPDATA%\ezgrpc-next\cache` on Windows), which every build directory shares. Deleting `build/` therefore does not download them again.
 
 | Option | Description |
 |:---|:---|
 | `-DGRPC_DEPENDENCIES=SYSTEM` | Use installed packages (CMake packages, then pkg-config, then a header/library search). The default under a vcpkg toolchain |
-| `-DGRPC_SYSTEM_DEPENDENCIES="libuv;zlib"` | In bundled mode, take only these from the system: any of `nghttp2;libuv;zlib;zstd;snappy;protobuf-c;python` |
+| `-DGRPC_SYSTEM_DEPENDENCIES="libuv;zlib"` | In bundled mode, take only these from the system: any of `nghttp2;libuv;zlib;zstd;snappy;protobuf-c;openssl;python` |
+| `-DGRPC_OPENSSL_DIR=path` | `OPENSSLDIR` of the bundled OpenSSL: its default certificate store (`cert.pem`, `certs/`) and `openssl.cnf`. Empty (the default) uses the system's, as `openssl version -d` reports it |
 | `-DGRPC_DEPS_MIRRORS="https://mirror.example/ezgrpc"` | Base URLs tried before upstream. Each one serves the archive file names listed in `cmake/GrpcBundledDeps.cmake`. Also read from the `GRPC_DEPS_MIRRORS` environment variable |
 | `-DGRPC_DEPS_CACHE_DIR=path` | Download cache (env `GRPC_DEPS_CACHE_DIR`). For an offline machine, copy the archives here |
 
-If a download fails, configure warns and falls back to the system copy of that library. The pins (version, URLs, SHA-256) are in `cmake/GrpcBundledDeps.cmake`.
+If a download fails, configure warns and falls back to the system copy of that library.
+
+OpenSSL is bundled only when it is the TLS backend (`GRPC_TLS_BACKEND` `AUTO` or `openssl`) and no particular OpenSSL was named with `GRPC_TLS_PREFIX` or `OPENSSL_ROOT_DIR`. Its build runs OpenSSL's Perl `Configure` and then `make` (`nmake` with MSVC, which needs Strawberry Perl, run from a Developer Prompt; NASM is used when found). Clients verify servers against the system's certificate store unless a CA is configured, and `SSL_CERT_FILE` / `SSL_CERT_DIR` still override it at run time. The system ngtcp2 crypto helper is linked against the system OpenSSL, so HTTP/3 needs OpenSSL, ngtcp2 and nghttp3 from one prefix (`GRPC_TLS_PREFIX`, see [HTTP/3](http3.md)) or `-DGRPC_SYSTEM_DEPENDENCIES=openssl`. The pins (version, URLs, SHA-256) are in `cmake/GrpcBundledDeps.cmake`.
 
 ### Library checks and the configuration summary
 
@@ -45,7 +48,7 @@ The configuration summary ends with where each dependency came from:
        nghttp2        bundled 1.71.0
        libuv          bundled 1.53.0
        ...
-       tls            system openssl 3.0.13 (/usr/lib/x86_64-linux-gnu/libssl.so)
+       tls            openssl, bundled 3.5.9 (OPENSSLDIR /usr/lib/ssl)
        python         system (/usr/bin/python3)
 ```
 
@@ -228,6 +231,7 @@ int main(void) {
   (void)grpc_reflection_enable(server);
   (void)grpc_server_handle(server, "/helloworld.Greeter/SayHello", say_hello, nullptr);
 
+  (void)grpc_server_stop_on_signals(server); /* Ctrl+C stops grpc_server_run() */
   (void)grpc_server_run(server);
   (void)grpc_server_drain(server, 5000);
   grpc_server_free(server);

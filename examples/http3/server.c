@@ -19,7 +19,6 @@
  * Ctrl-C drains: no new calls are accepted, running calls get up to 5 seconds to finish.
  */
 #include <ctype.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,10 +26,6 @@
 #include "grpc.h"
 
 static grpc_server *server;
-
-static void on_signal([[maybe_unused]] int sig) {
-  grpc_server_stop(server); /* async-signal-safe */
-}
 
 static void say_hello(grpc_call *call, const grpc_message *req, [[maybe_unused]] void *userdata) {
   char reply[300];
@@ -109,8 +104,7 @@ int main(int argc, char **argv) {
          grpc_server_http3_port(server));
   fflush(stdout);
 
-  signal(SIGINT, on_signal);
-  signal(SIGTERM, on_signal);
+  (void)grpc_server_stop_on_signals(server);
   (void)grpc_server_run(server);
 
   printf("draining...\n");

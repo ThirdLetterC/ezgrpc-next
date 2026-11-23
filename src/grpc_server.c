@@ -473,6 +473,10 @@ GRPC_API void grpc_server_free(grpc_server *server) {
     uv_close((uv_handle_t *)&server->flush_retry_timer, nullptr);
   if (server->async_active)
     uv_close((uv_handle_t *)&server->async, nullptr);
+  if (server->stop_signals_active) {
+    for (size_t i = 0; i < 2; i++)
+      uv_close((uv_handle_t *)&server->stop_signals[i], nullptr);
+  }
   if (server->ipv4_sockfd != GRPC_INVALID_SOCKET)
     grpc_socket_close(server->ipv4_sockfd);
   if (server->ipv6_sockfd != GRPC_INVALID_SOCKET)
@@ -497,7 +501,7 @@ GRPC_API void grpc_server_free(grpc_server *server) {
   interceptors_free(server);
   health_free(server);
   reflection_free(server);
-  tls_free(server);
+  tls_server_free(server);
   if (server->h3 != nullptr)
     http3_thread_cleanup();
   http3_server_free(server);

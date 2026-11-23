@@ -77,7 +77,7 @@ if(NOT GRPC_DEPENDENCIES MATCHES "^(BUNDLED|SYSTEM)$")
   message(FATAL_ERROR "GRPC_DEPENDENCIES must be BUNDLED or SYSTEM")
 endif()
 set(GRPC_SYSTEM_DEPENDENCIES "" CACHE STRING
-  "With GRPC_DEPENDENCIES=BUNDLED, dependencies to take from the system anyway: any of nghttp2;libuv;zlib;zstd;snappy;protobuf-c;python")
+  "With GRPC_DEPENDENCIES=BUNDLED, dependencies to take from the system anyway: any of nghttp2;libuv;zlib;zstd;snappy;protobuf-c;openssl;python")
 set(GRPC_DEPS_MIRRORS "$ENV{GRPC_DEPS_MIRRORS}" CACHE STRING
   "Base URLs tried before upstream when downloading bundled dependencies (each serves the archive file names)")
 if(DEFINED ENV{GRPC_DEPS_CACHE_DIR})

@@ -20,11 +20,6 @@
 
 static grpc_server *g_server;
 
-static void on_signal([[maybe_unused]] int sig) {
-  /* safe in a signal handler */
-  grpc_server_stop(g_server);
-}
-
 /* a minimal work queue of calls */
 typedef struct job job;
 struct job {
@@ -113,8 +108,8 @@ int main(int argc, char **argv) {
     return 1;
   grpc_server_handle(g_server, "/example.Work/Reverse", reverse, nullptr);
 
-  signal(SIGINT, on_signal);
-  signal(SIGTERM, on_signal);
+  /* Ctrl+C or SIGTERM makes grpc_server_run() return */
+  grpc_server_stop_on_signals(g_server);
 
   pthread_t workers[64];
   for (int i = 0; i < nb_workers; i++)
