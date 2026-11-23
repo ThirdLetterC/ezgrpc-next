@@ -283,9 +283,12 @@ macro(grpc_find_optional_library feature)
   endif()
 endmacro()
 
-# Records "<name>: <source>" for the configuration summary.
+# Records "<name>: <source>" for the configuration summary. A source may itself be a list (e.g.
+# OpenSSL's "optimized;<lib>;debug;<lib>" with multi-config generators); its separators are
+# replaced so that the entry stays one element of the report list.
 macro(grpc_report_dependency name source)
-  list(APPEND GRPC_DEPENDENCY_REPORT "${name}|${source}")
+  string(REPLACE ";" " " _grpc_report_source "${source}")
+  list(APPEND GRPC_DEPENDENCY_REPORT "${name}|${_grpc_report_source}")
 endmacro()
 set(GRPC_DEPENDENCY_REPORT)
 
