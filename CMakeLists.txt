@@ -658,6 +658,15 @@ if(GRPC_BUILD_EXAMPLES)
     endif()
   endif()
 
+  # The OTLP metrics receiver (examples/otlp_metrics): protobuf-c bindings of the upstream
+  # OpenTelemetry protos, generated with protoc-c.
+  option(GRPC_EXAMPLE_OTLP_METRICS "Build the OTLP metrics receiver example" ON)
+  if(GRPC_EXAMPLE_OTLP_METRICS AND GRPC_PROTOBUF_C_ENABLED AND PROTOC_C_EXECUTABLE)
+    add_subdirectory(examples/otlp_metrics)
+  elseif(GRPC_EXAMPLE_OTLP_METRICS)
+    message(STATUS "ezGRPC-next: the OTLP metrics example needs protobuf-c and protoc-c; skipped")
+  endif()
+
   if(GRPC_BUILD_INTEGRATION_TESTS)
     set(examples_client "${CMAKE_CURRENT_SOURCE_DIR}/examples/test_examples.py")
     grpc_add_integration_test(single_threaded SERVER example_single_threaded

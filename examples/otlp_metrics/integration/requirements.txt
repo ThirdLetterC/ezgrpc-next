@@ -1,0 +1,12 @@
+# Python packages for the OTLP metrics integration tests (official OpenTelemetry SDK and exporter).
+#   python3 -m venv .venv && .venv/bin/pip install -r examples/otlp_metrics/integration/requirements.txt
+opentelemetry-api==1.45.2
+opentelemetry-sdk==1.45.2
+opentelemetry-proto==1.45.2
+opentelemetry-exporter-otlp-proto-common==1.45.2
+opentelemetry-exporter-otlp-proto-grpc==1.45.2
+opentelemetry-semantic-conventions==0.66b2
+googleapis-common-protos==1.76.0
+grpcio==1.80.1
+protobuf==7.36.2
+typing_extensions==4.16.0
