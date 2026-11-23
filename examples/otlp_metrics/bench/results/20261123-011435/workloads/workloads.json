@@ -1,0 +1,70 @@
+{
+  "small": {
+    "file": "examples/otlp_metrics/bench/results/20261123-011435/workloads/small.bin",
+    "bytes": 2061,
+    "resources": 1,
+    "scopes": 1,
+    "metrics": 10,
+    "points": 10,
+    "rejected": 0,
+    "expected_rejected": 0,
+    "generator_args": [
+      "--resources",
+      "1",
+      "--scopes",
+      "1",
+      "--metrics",
+      "10",
+      "--points",
+      "1",
+      "--attrs",
+      "3"
+    ]
+  },
+  "large": {
+    "file": "examples/otlp_metrics/bench/results/20261123-011435/workloads/large.bin",
+    "bytes": 175368,
+    "resources": 4,
+    "scopes": 2,
+    "metrics": 200,
+    "points": 1000,
+    "rejected": 0,
+    "expected_rejected": 0,
+    "generator_args": [
+      "--resources",
+      "4",
+      "--scopes",
+      "2",
+      "--metrics",
+      "25",
+      "--points",
+      "5",
+      "--attrs",
+      "4"
+    ]
+  },
+  "partial": {
+    "file": "examples/otlp_metrics/bench/results/20261123-011435/workloads/partial.bin",
+    "bytes": 3458,
+    "resources": 1,
+    "scopes": 1,
+    "metrics": 10,
+    "points": 20,
+    "rejected": 5,
+    "expected_rejected": 5,
+    "generator_args": [
+      "--resources",
+      "1",
+      "--scopes",
+      "1",
+      "--metrics",
+      "10",
+      "--points",
+      "2",
+      "--attrs",
+      "3",
+      "--invalid-every",
+      "4"
+    ]
+  }
+}

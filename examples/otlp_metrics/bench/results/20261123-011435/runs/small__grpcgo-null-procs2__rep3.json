@@ -1,0 +1,160 @@
+{
+  "config": "grpcgo-null-procs2",
+  "server": "grpc-go",
+  "allocator": "go",
+  "workload": "small",
+  "workload_meta": {
+    "file": "examples/otlp_metrics/bench/results/20261123-011435/workloads/small.bin",
+    "bytes": 2061,
+    "resources": 1,
+    "scopes": 1,
+    "metrics": 10,
+    "points": 10,
+    "rejected": 0,
+    "expected_rejected": 0,
+    "generator_args": [
+      "--resources",
+      "1",
+      "--scopes",
+      "1",
+      "--metrics",
+      "10",
+      "--points",
+      "1",
+      "--attrs",
+      "3"
+    ]
+  },
+  "rep": 3,
+  "command": [
+    "build-bench-default/grpcgo-server",
+    "-addr",
+    "127.0.0.1:0",
+    "-sink",
+    "null",
+    "-max-message-bytes",
+    "16777216",
+    "-max-streams",
+    "256"
+  ],
+  "env": {
+    "GOMAXPROCS": "2"
+  },
+  "ghz": {
+    "count": 285937,
+    "total": 9999398880,
+    "average": 1665263,
+    "fastest": 146600,
+    "slowest": 10616887,
+    "rps": 28595.41892782259,
+    "statusCodeDistribution": {
+      "OK": 285917,
+      "Unavailable": 20
+    },
+    "errorDistribution": {
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:56692->127.0.0.1:46353: use of closed network connection": 1,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:56704->127.0.0.1:46353: use of closed network connection": 4,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:56706->127.0.0.1:46353: use of closed network connection": 4,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:56730->127.0.0.1:46353: use of closed network connection": 4,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:56736->127.0.0.1:46353: use of closed network connection": 3,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:56762->127.0.0.1:46353: use of closed network connection": 3,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:56800->127.0.0.1:46353: use of closed network connection": 1
+    },
+    "latencyDistribution": [
+      {
+        "percentage": 10,
+        "latency": 629214
+      },
+      {
+        "percentage": 25,
+        "latency": 1052811
+      },
+      {
+        "percentage": 50,
+        "latency": 1624397
+      },
+      {
+        "percentage": 75,
+        "latency": 2164082
+      },
+      {
+        "percentage": 90,
+        "latency": 2648155
+      },
+      {
+        "percentage": 95,
+        "latency": 3025474
+      },
+      {
+        "percentage": 99,
+        "latency": 4141378
+      }
+    ]
+  },
+  "measured_s": 9.99939888,
+  "wall_s": 10.506291331956163,
+  "requests_ok": 285917,
+  "rps": 28595.41892782259,
+  "ok_rps": 28593.418807591363,
+  "latency_ms": {
+    "average": 1.665263,
+    "p10": 0.629214,
+    "p25": 1.052811,
+    "p50": 1.624397,
+    "p75": 2.164082,
+    "p90": 2.648155,
+    "p95": 3.025474,
+    "p99": 4.141378
+  },
+  "server_counters_delta": {
+    "bytes_received": 589309974,
+    "malformed": 3,
+    "points_accepted": 2859340,
+    "points_received": 2859340,
+    "points_rejected": 0,
+    "requests": 285937,
+    "requests_failed": 3,
+    "requests_ok": 285934,
+    "requests_partial": 0
+  },
+  "points_accepted_per_s": 285951.18909787905,
+  "server_cpu_s": 18.82,
+  "server_cpu_cores": 1.8821131375849267,
+  "server_cpu_us_per_request": 65.8186943277715,
+  "client_cpu_s": 58.32999999999811,
+  "server_memory_kb": {
+    "VmHWM": 19820,
+    "VmRSS": 19140
+  },
+  "server_threads": 8,
+  "server_exit_code": 0,
+  "server_sink": {
+    "name": "null"
+  },
+  "server_memory_budget": null,
+  "server_stats_before": {
+    "bytes_received": 180873360,
+    "malformed": 21,
+    "points_accepted": 877600,
+    "points_received": 877600,
+    "points_rejected": 0,
+    "requests": 87781,
+    "requests_failed": 21,
+    "requests_ok": 87760,
+    "requests_partial": 0
+  },
+  "server_stats_after": {
+    "bytes_received": 770183334,
+    "malformed": 24,
+    "points_accepted": 3736940,
+    "points_received": 3736940,
+    "points_rejected": 0,
+    "requests": 373718,
+    "requests_failed": 24,
+    "requests_ok": 373694,
+    "requests_partial": 0
+  },
+  "server_status_delta": {},
+  "server_cpus": "0-3,8-11",
+  "client_cpus": "4-7,12-15"
+}

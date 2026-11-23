@@ -1,0 +1,237 @@
+{
+  "config": "ezgrpc-mimalloc-null-loops4",
+  "server": "ezgrpc",
+  "allocator": "mimalloc",
+  "workload": "partial",
+  "workload_meta": {
+    "file": "examples/otlp_metrics/bench/results/20261123-011435/workloads/partial.bin",
+    "bytes": 3458,
+    "resources": 1,
+    "scopes": 1,
+    "metrics": 10,
+    "points": 20,
+    "rejected": 5,
+    "expected_rejected": 5,
+    "generator_args": [
+      "--resources",
+      "1",
+      "--scopes",
+      "1",
+      "--metrics",
+      "10",
+      "--points",
+      "2",
+      "--attrs",
+      "3",
+      "--invalid-every",
+      "4"
+    ]
+  },
+  "rep": 1,
+  "command": [
+    "build-bench-mimalloc/otlp_metrics_server",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "0",
+    "--admin",
+    "--loops",
+    "4",
+    "--sink",
+    "null",
+    "--log-level",
+    "error",
+    "--max-message-bytes",
+    "16M",
+    "--max-decoded-bytes",
+    "128M",
+    "--memory-limit",
+    "1G",
+    "--max-streams",
+    "256"
+  ],
+  "env": {},
+  "ghz": {
+    "count": 308889,
+    "total": 9998539047,
+    "average": 745353,
+    "fastest": 125701,
+    "slowest": 11203201,
+    "rps": 30893.413382496143,
+    "statusCodeDistribution": {
+      "OK": 308875,
+      "Unavailable": 14
+    },
+    "errorDistribution": {
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:56448->127.0.0.1:42519: use of closed network connection": 2,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:56450->127.0.0.1:42519: use of closed network connection": 1,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:56466->127.0.0.1:42519: use of closed network connection": 1,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:56468->127.0.0.1:42519: use of closed network connection": 1,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:56488->127.0.0.1:42519: use of closed network connection": 2,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:56512->127.0.0.1:42519: use of closed network connection": 2,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:56528->127.0.0.1:42519: use of closed network connection": 2,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:56544->127.0.0.1:42519: use of closed network connection": 1,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:56560->127.0.0.1:42519: use of closed network connection": 1,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:56592->127.0.0.1:42519: use of closed network connection": 1
+    },
+    "latencyDistribution": [
+      {
+        "percentage": 10,
+        "latency": 223869
+      },
+      {
+        "percentage": 25,
+        "latency": 281290
+      },
+      {
+        "percentage": 50,
+        "latency": 456814
+      },
+      {
+        "percentage": 75,
+        "latency": 933723
+      },
+      {
+        "percentage": 90,
+        "latency": 1606682
+      },
+      {
+        "percentage": 95,
+        "latency": 2139184
+      },
+      {
+        "percentage": 99,
+        "latency": 3800672
+      }
+    ]
+  },
+  "measured_s": 9.998539047,
+  "wall_s": 10.556265652994625,
+  "requests_ok": 308875,
+  "rps": 30893.413382496143,
+  "ok_rps": 30892.013177932837,
+  "latency_ms": {
+    "average": 0.745353,
+    "p10": 0.223869,
+    "p25": 0.28129,
+    "p50": 0.456814,
+    "p75": 0.933723,
+    "p90": 1.606682,
+    "p95": 2.139184,
+    "p99": 3.800672
+  },
+  "server_counters_delta": {
+    "requests": 308887,
+    "requests_ok": 0,
+    "requests_partial": 308887,
+    "requests_failed": 0,
+    "bytes_received": 1068131246,
+    "points_received": 6177740,
+    "points_accepted": 4633305,
+    "points_rejected": 1544435,
+    "points_failed": 0,
+    "payload_bytes_stored": 0,
+    "malformed": 0,
+    "too_deep": 0,
+    "too_large": 0,
+    "throttled_memory": 0,
+    "throttled_queue": 0,
+    "sink_retryable": 0,
+    "sink_failed": 0,
+    "deadline_exceeded": 0,
+    "cancelled": 0,
+    "cancellations": 0,
+    "shutting_down": 0,
+    "encoding_identity": 308887,
+    "encoding_gzip": 0,
+    "encoding_other": 0,
+    "admin_waits": 0
+  },
+  "points_accepted_per_s": 463398.20029909216,
+  "server_cpu_s": 12.040000000000001,
+  "server_cpu_cores": 1.2041759244429344,
+  "server_cpu_us_per_request": 38.97865562487252,
+  "client_cpu_s": 79.82999999999993,
+  "server_memory_kb": {
+    "VmHWM": 9996,
+    "VmRSS": 9996
+  },
+  "server_threads": 5,
+  "server_exit_code": 0,
+  "server_sink": {
+    "name": "null",
+    "batches": 402442,
+    "points": 6036630
+  },
+  "server_memory_budget": {
+    "limit": 1073741824,
+    "used": 65536,
+    "peak": 65536,
+    "denied": 0
+  },
+  "server_stats_before": {
+    "requests": 93555,
+    "requests_ok": 0,
+    "requests_partial": 93555,
+    "requests_failed": 0,
+    "bytes_received": 323513190,
+    "points_received": 1871100,
+    "points_accepted": 1403325,
+    "points_rejected": 467775,
+    "points_failed": 0,
+    "payload_bytes_stored": 0,
+    "malformed": 0,
+    "too_deep": 0,
+    "too_large": 0,
+    "throttled_memory": 0,
+    "throttled_queue": 0,
+    "sink_retryable": 0,
+    "sink_failed": 0,
+    "deadline_exceeded": 0,
+    "cancelled": 0,
+    "cancellations": 0,
+    "shutting_down": 0,
+    "encoding_identity": 93555,
+    "encoding_gzip": 0,
+    "encoding_other": 0,
+    "admin_waits": 0,
+    "status": {
+      "0": 93555
+    }
+  },
+  "server_stats_after": {
+    "requests": 402442,
+    "requests_ok": 0,
+    "requests_partial": 402442,
+    "requests_failed": 0,
+    "bytes_received": 1391644436,
+    "points_received": 8048840,
+    "points_accepted": 6036630,
+    "points_rejected": 2012210,
+    "points_failed": 0,
+    "payload_bytes_stored": 0,
+    "malformed": 0,
+    "too_deep": 0,
+    "too_large": 0,
+    "throttled_memory": 0,
+    "throttled_queue": 0,
+    "sink_retryable": 0,
+    "sink_failed": 0,
+    "deadline_exceeded": 0,
+    "cancelled": 0,
+    "cancellations": 0,
+    "shutting_down": 0,
+    "encoding_identity": 402442,
+    "encoding_gzip": 0,
+    "encoding_other": 0,
+    "admin_waits": 0,
+    "status": {
+      "0": 402442
+    }
+  },
+  "server_status_delta": {
+    "0": 308887
+  },
+  "server_cpus": "0-3,8-11",
+  "client_cpus": "4-7,12-15"
+}

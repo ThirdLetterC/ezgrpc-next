@@ -1,0 +1,169 @@
+{
+  "config": "grpcgo-null-procs2",
+  "server": "grpc-go",
+  "allocator": "go",
+  "workload": "small",
+  "workload_meta": {
+    "file": "examples/otlp_metrics/bench/results/20261123-011435/workloads/small.bin",
+    "bytes": 2061,
+    "resources": 1,
+    "scopes": 1,
+    "metrics": 10,
+    "points": 10,
+    "rejected": 0,
+    "expected_rejected": 0,
+    "generator_args": [
+      "--resources",
+      "1",
+      "--scopes",
+      "1",
+      "--metrics",
+      "10",
+      "--points",
+      "1",
+      "--attrs",
+      "3"
+    ]
+  },
+  "rep": 1,
+  "command": [
+    "build-bench-default/grpcgo-server",
+    "-addr",
+    "127.0.0.1:0",
+    "-sink",
+    "null",
+    "-max-message-bytes",
+    "16777216",
+    "-max-streams",
+    "256"
+  ],
+  "env": {
+    "GOMAXPROCS": "2"
+  },
+  "ghz": {
+    "count": 277063,
+    "total": 9998842905,
+    "average": 1743708,
+    "fastest": 150676,
+    "slowest": 12237954,
+    "rps": 27709.506253113796,
+    "statusCodeDistribution": {
+      "OK": 277000,
+      "Unavailable": 63
+    },
+    "errorDistribution": {
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:37390->127.0.0.1:42187: use of closed network connection": 4,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:37404->127.0.0.1:42187: use of closed network connection": 4,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:37414->127.0.0.1:42187: use of closed network connection": 4,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:37422->127.0.0.1:42187: use of closed network connection": 4,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:37428->127.0.0.1:42187: use of closed network connection": 4,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:37430->127.0.0.1:42187: use of closed network connection": 4,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:37450->127.0.0.1:42187: use of closed network connection": 4,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:37466->127.0.0.1:42187: use of closed network connection": 4,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:37468->127.0.0.1:42187: use of closed network connection": 4,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:37482->127.0.0.1:42187: use of closed network connection": 4,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:37494->127.0.0.1:42187: use of closed network connection": 4,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:37506->127.0.0.1:42187: use of closed network connection": 4,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:37510->127.0.0.1:42187: use of closed network connection": 4,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:37524->127.0.0.1:42187: use of closed network connection": 4,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:37532->127.0.0.1:42187: use of closed network connection": 4,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:37538->127.0.0.1:42187: use of closed network connection": 3
+    },
+    "latencyDistribution": [
+      {
+        "percentage": 10,
+        "latency": 651988
+      },
+      {
+        "percentage": 25,
+        "latency": 1085158
+      },
+      {
+        "percentage": 50,
+        "latency": 1690027
+      },
+      {
+        "percentage": 75,
+        "latency": 2256178
+      },
+      {
+        "percentage": 90,
+        "latency": 2802794
+      },
+      {
+        "percentage": 95,
+        "latency": 3288041
+      },
+      {
+        "percentage": 99,
+        "latency": 4433377
+      }
+    ]
+  },
+  "measured_s": 9.998842905,
+  "wall_s": 10.53438639396336,
+  "requests_ok": 277000,
+  "rps": 27709.506253113796,
+  "ok_rps": 27703.205524059587,
+  "latency_ms": {
+    "average": 1.743708,
+    "p10": 0.651988,
+    "p25": 1.085158,
+    "p50": 1.690027,
+    "p75": 2.256178,
+    "p90": 2.802794,
+    "p95": 3.288041,
+    "p99": 4.433377
+  },
+  "server_counters_delta": {
+    "bytes_received": 570981501,
+    "malformed": 22,
+    "points_accepted": 2770410,
+    "points_received": 2770410,
+    "points_rejected": 0,
+    "requests": 277063,
+    "requests_failed": 22,
+    "requests_ok": 277041,
+    "requests_partial": 0
+  },
+  "points_accepted_per_s": 277073.05998523434,
+  "server_cpu_s": 18.9,
+  "server_cpu_cores": 1.8902187162625492,
+  "server_cpu_us_per_request": 68.21553220747627,
+  "client_cpu_s": 56.81000000000006,
+  "server_memory_kb": {
+    "VmHWM": 19424,
+    "VmRSS": 18964
+  },
+  "server_threads": 8,
+  "server_exit_code": 0,
+  "server_sink": {
+    "name": "null"
+  },
+  "server_memory_budget": null,
+  "server_stats_before": {
+    "bytes_received": 178047729,
+    "malformed": 25,
+    "points_accepted": 863890,
+    "points_received": 863890,
+    "points_rejected": 0,
+    "requests": 86414,
+    "requests_failed": 25,
+    "requests_ok": 86389,
+    "requests_partial": 0
+  },
+  "server_stats_after": {
+    "bytes_received": 749029230,
+    "malformed": 47,
+    "points_accepted": 3634300,
+    "points_received": 3634300,
+    "points_rejected": 0,
+    "requests": 363477,
+    "requests_failed": 47,
+    "requests_ok": 363430,
+    "requests_partial": 0
+  },
+  "server_status_delta": {},
+  "server_cpus": "0-3,8-11",
+  "client_cpus": "4-7,12-15"
+}

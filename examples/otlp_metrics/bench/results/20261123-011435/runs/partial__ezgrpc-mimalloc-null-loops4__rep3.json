@@ -1,0 +1,233 @@
+{
+  "config": "ezgrpc-mimalloc-null-loops4",
+  "server": "ezgrpc",
+  "allocator": "mimalloc",
+  "workload": "partial",
+  "workload_meta": {
+    "file": "examples/otlp_metrics/bench/results/20261123-011435/workloads/partial.bin",
+    "bytes": 3458,
+    "resources": 1,
+    "scopes": 1,
+    "metrics": 10,
+    "points": 20,
+    "rejected": 5,
+    "expected_rejected": 5,
+    "generator_args": [
+      "--resources",
+      "1",
+      "--scopes",
+      "1",
+      "--metrics",
+      "10",
+      "--points",
+      "2",
+      "--attrs",
+      "3",
+      "--invalid-every",
+      "4"
+    ]
+  },
+  "rep": 3,
+  "command": [
+    "build-bench-mimalloc/otlp_metrics_server",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "0",
+    "--admin",
+    "--loops",
+    "4",
+    "--sink",
+    "null",
+    "--log-level",
+    "error",
+    "--max-message-bytes",
+    "16M",
+    "--max-decoded-bytes",
+    "128M",
+    "--memory-limit",
+    "1G",
+    "--max-streams",
+    "256"
+  ],
+  "env": {},
+  "ghz": {
+    "count": 309977,
+    "total": 9999079803,
+    "average": 746048,
+    "fastest": 138177,
+    "slowest": 10727204,
+    "rps": 31000.552661555746,
+    "statusCodeDistribution": {
+      "Canceled": 1,
+      "OK": 309972,
+      "Unavailable": 4
+    },
+    "errorDistribution": {
+      "rpc error: code = Canceled desc = grpc: the client connection is closing": 1,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:54152->127.0.0.1:44179: use of closed network connection": 1,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:54216->127.0.0.1:44179: use of closed network connection": 1,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:54218->127.0.0.1:44179: use of closed network connection": 1,
+      "rpc error: code = Unavailable desc = error reading from server: read tcp 127.0.0.1:54238->127.0.0.1:44179: use of closed network connection": 1
+    },
+    "latencyDistribution": [
+      {
+        "percentage": 10,
+        "latency": 222901
+      },
+      {
+        "percentage": 25,
+        "latency": 280942
+      },
+      {
+        "percentage": 50,
+        "latency": 458778
+      },
+      {
+        "percentage": 75,
+        "latency": 935501
+      },
+      {
+        "percentage": 90,
+        "latency": 1606984
+      },
+      {
+        "percentage": 95,
+        "latency": 2126107
+      },
+      {
+        "percentage": 99,
+        "latency": 3817487
+      }
+    ]
+  },
+  "measured_s": 9.999079803,
+  "wall_s": 10.540112212998793,
+  "requests_ok": 309972,
+  "rps": 31000.552661555746,
+  "ok_rps": 31000.052615541663,
+  "latency_ms": {
+    "average": 0.746048,
+    "p10": 0.222901,
+    "p25": 0.280942,
+    "p50": 0.458778,
+    "p75": 0.935501,
+    "p90": 1.606984,
+    "p95": 2.126107,
+    "p99": 3.817487
+  },
+  "server_counters_delta": {
+    "requests": 309976,
+    "requests_ok": 0,
+    "requests_partial": 309976,
+    "requests_failed": 0,
+    "bytes_received": 1071897008,
+    "points_received": 6199520,
+    "points_accepted": 4649640,
+    "points_rejected": 1549880,
+    "points_failed": 0,
+    "payload_bytes_stored": 0,
+    "malformed": 0,
+    "too_deep": 0,
+    "too_large": 0,
+    "throttled_memory": 0,
+    "throttled_queue": 0,
+    "sink_retryable": 0,
+    "sink_failed": 0,
+    "deadline_exceeded": 0,
+    "cancelled": 0,
+    "cancellations": 0,
+    "shutting_down": 0,
+    "encoding_identity": 309976,
+    "encoding_gzip": 0,
+    "encoding_other": 0,
+    "admin_waits": 0
+  },
+  "points_accepted_per_s": 465006.789785294,
+  "server_cpu_s": 11.120000000000001,
+  "server_cpu_cores": 1.1121023353232657,
+  "server_cpu_us_per_request": 35.873745064134006,
+  "client_cpu_s": 79.8700000000008,
+  "server_memory_kb": {
+    "VmHWM": 9940,
+    "VmRSS": 9940
+  },
+  "server_threads": 5,
+  "server_exit_code": 0,
+  "server_sink": {
+    "name": "null",
+    "batches": 403464,
+    "points": 6051960
+  },
+  "server_memory_budget": {
+    "limit": 1073741824,
+    "used": 65536,
+    "peak": 65536,
+    "denied": 0
+  },
+  "server_stats_before": {
+    "requests": 93488,
+    "requests_ok": 0,
+    "requests_partial": 93488,
+    "requests_failed": 0,
+    "bytes_received": 323281504,
+    "points_received": 1869760,
+    "points_accepted": 1402320,
+    "points_rejected": 467440,
+    "points_failed": 0,
+    "payload_bytes_stored": 0,
+    "malformed": 0,
+    "too_deep": 0,
+    "too_large": 0,
+    "throttled_memory": 0,
+    "throttled_queue": 0,
+    "sink_retryable": 0,
+    "sink_failed": 0,
+    "deadline_exceeded": 0,
+    "cancelled": 0,
+    "cancellations": 0,
+    "shutting_down": 0,
+    "encoding_identity": 93488,
+    "encoding_gzip": 0,
+    "encoding_other": 0,
+    "admin_waits": 0,
+    "status": {
+      "0": 93488
+    }
+  },
+  "server_stats_after": {
+    "requests": 403464,
+    "requests_ok": 0,
+    "requests_partial": 403464,
+    "requests_failed": 0,
+    "bytes_received": 1395178512,
+    "points_received": 8069280,
+    "points_accepted": 6051960,
+    "points_rejected": 2017320,
+    "points_failed": 0,
+    "payload_bytes_stored": 0,
+    "malformed": 0,
+    "too_deep": 0,
+    "too_large": 0,
+    "throttled_memory": 0,
+    "throttled_queue": 0,
+    "sink_retryable": 0,
+    "sink_failed": 0,
+    "deadline_exceeded": 0,
+    "cancelled": 0,
+    "cancellations": 0,
+    "shutting_down": 0,
+    "encoding_identity": 403464,
+    "encoding_gzip": 0,
+    "encoding_other": 0,
+    "admin_waits": 0,
+    "status": {
+      "0": 403464
+    }
+  },
+  "server_status_delta": {
+    "0": 309976
+  },
+  "server_cpus": "0-3,8-11",
+  "client_cpus": "4-7,12-15"
+}

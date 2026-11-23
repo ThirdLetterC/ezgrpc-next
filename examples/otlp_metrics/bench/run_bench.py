@@ -352,7 +352,9 @@ def summarize(out_dir):
 
     lines = ["# OTLP Export benchmark summary", "",
              "Medians over the repetitions (min-max in brackets). Generated from runs/*.json by "
-             "run_bench.py; see environment.json for the machine, builds and settings.", ""]
+             "run_bench.py; see environment.json for the machine, builds and settings. "
+             "\"client non-OK\" are calls in flight when ghz's duration ended (cancelled or cut off by "
+             "ghz); \"server errors\" are error statuses the receiver returned (CANCELLED excluded).", ""]
     for workload in WORKLOADS:
         rows = [(cfg, rs) for (w, cfg), rs in groups.items() if w == workload]
         if not rows:
@@ -373,7 +375,10 @@ def summarize(out_dir):
             us = med(rs, lambda r: r["server_cpu_us_per_request"])[0]
             rss = med(rs, lambda r: r["server_memory_kb"].get("VmHWM", 0) / 1024)[0]
             errs = sum(r["ghz"]["count"] - r["requests_ok"] for r in rs)
-            server_errs = sum(v for r in rs for k, v in r.get("server_status_delta", {}).items() if k != "0")
+            # statuses the server itself returned other than OK; CANCELLED (1) is excluded: those are
+            # calls ghz cancelled when its duration ended (they match the `cancellations` counter)
+            server_errs = sum(v for r in rs for k, v in r.get("server_status_delta", {}).items()
+                              if k not in ("0", "1"))
             lines.append(f"| {cfg} | {rps[0]:,.0f} [{rps[1]:,.0f}-{rps[2]:,.0f}] | {pts[0]:,.0f} | "
                          f"{p50:.2f} | {p90:.2f} | {p99:.2f} | {cores:.2f} | {us:.1f} | {rss:.0f} | {errs} | "
                          f"{server_errs if rs[0]['server'] == 'ezgrpc' else 'n/a'} |")
