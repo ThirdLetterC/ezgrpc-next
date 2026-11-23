@@ -40,7 +40,8 @@
   X(shutting_down)        /* UNAVAILABLE: received while shutting down */                      \
   X(encoding_identity)    /* requests without grpc-encoding (or identity) */                   \
   X(encoding_gzip)        /* requests with grpc-encoding: gzip */                              \
-  X(encoding_other)       /* requests with another grpc-encoding */
+  X(encoding_other)       /* requests with another grpc-encoding */                            \
+  X(admin_waits)          /* Admin/Wait calls parked (monotonic) */
 
 typedef struct otlp_stats {
 #define OTLP_STATS_FIELD(name) atomic_uint_least64_t name;

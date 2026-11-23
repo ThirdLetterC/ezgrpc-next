@@ -849,6 +849,49 @@ static void test_shutdown_fails_held_requests_as_retryable(void) {
   }
 }
 
+typedef struct parked_wait {
+  uint16_t port;
+  pthread_t thread;
+  grpc_status status;
+} parked_wait;
+
+static void *parked_wait_main(void *arg) {
+  parked_wait *p = arg;
+  grpc_err err;
+  grpc_client *client = grpc_client_new(
+      &(grpc_client_config){.host = "127.0.0.1", .port = p->port, .timeout_ms = 60000}, &err);
+  if (client == nullptr)
+    return nullptr;
+  grpc_client_response resp = {0};
+  static const char body[] = "points_accepted 1000000000";
+  if (grpc_client_unary(client, "/otlp_metrics.Admin/Wait", body, sizeof(body) - 1, nullptr, 0,
+                        60000, &resp) == GRPC_OK)
+    p->status = resp.status;
+  grpc_client_response_free(&resp);
+  grpc_client_free(client);
+  return nullptr;
+}
+
+/* A parked Admin/Wait call is an in-flight call: shutdown must answer it, not wait out the drain. */
+static void test_shutdown_answers_parked_wait(void) {
+  otlp_config c = test_config();
+  c.drain_ms = 30000;
+  start(&c);
+  parked_wait p = {.port = otlp_app_port(g_app), .status = GRPC_STATUS_UNKNOWN};
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&p.thread, nullptr, parked_wait_main, &p));
+  /* this Wait call is parked too, and counts: 2 means both are parked, in either order */
+  wait_counter("admin_waits", 2);
+  stopper st = {.app = g_app};
+  g_app = nullptr;
+  uint64_t t0 = uv_hrtime();
+  TEST_ASSERT_EQUAL_INT(0, pthread_create(&st.thread, nullptr, stop_main, &st));
+  TEST_ASSERT_EQUAL_INT(0, pthread_join(st.thread, nullptr));
+  TEST_ASSERT_EQUAL_INT(0, st.status); /* drained, not timed out */
+  TEST_ASSERT_TRUE((uv_hrtime() - t0) / 1000000u < 20000);
+  TEST_ASSERT_EQUAL_INT(0, pthread_join(p.thread, nullptr));
+  TEST_ASSERT_EQUAL_INT(GRPC_STATUS_UNAVAILABLE, p.status);
+}
+
 static void test_shutdown_drains_requests_in_flight(void) {
   otlp_config c = test_config();
   c.drain_ms = 30000; /* the drain must outlast the request, which the test releases */
@@ -897,5 +940,6 @@ int main(void) {
 #endif
   RUN_TEST(test_shutdown_fails_held_requests_as_retryable);
   RUN_TEST(test_shutdown_drains_requests_in_flight);
+  RUN_TEST(test_shutdown_answers_parked_wait);
   return UNITY_END();
 }

@@ -608,6 +608,8 @@ static void on_admin_wait(grpc_call *call, const grpc_message *request, void *us
     (void)grpc_call_finish(call, GRPC_STATUS_RESOURCE_EXHAUSTED, "out of memory");
     return;
   }
+  /* registered under the lock, so release_waiters() either sees it or ran before (then the
+   * shutting_down check below refuses it) */
   w->svc = svc;
   w->threshold = threshold;
   memcpy(w->counter, counter, sizeof(w->counter));
@@ -615,6 +617,12 @@ static void on_admin_wait(grpc_call *call, const grpc_message *request, void *us
   grpc_call_set_userdata(call, w, grpc_free);
   grpc_call_on_cancel(call, on_waiter_cancel, w);
   pthread_mutex_lock(&svc->waiters_lock);
+  if (atomic_load(&svc->shutting_down)) {
+    pthread_mutex_unlock(&svc->waiters_lock);
+    (void)grpc_call_finish(call, GRPC_STATUS_UNAVAILABLE, "shutting down");
+    grpc_call_unref(call); /* w is freed with the call */
+    return;
+  }
   w->listed = true;
   w->next = svc->waiters;
   if (svc->waiters != nullptr)
@@ -622,6 +630,7 @@ static void on_admin_wait(grpc_call *call, const grpc_message *request, void *us
   svc->waiters = w;
   atomic_fetch_add(&svc->nb_waiters, 1);
   pthread_mutex_unlock(&svc->waiters_lock);
+  OTLP_STAT_ADD(&svc->stats, admin_waits, 1);
   /* the counter may have moved between the check and the registration */
   notify_waiters(svc);
 }
@@ -768,9 +777,24 @@ grpc_err otlp_service_attach(otlp_service *svc, grpc_server *server) {
   return err;
 }
 
+/* Answers every parked Wait call (they would otherwise hold up the drain). Any thread. */
+static void release_waiters(otlp_service *svc) {
+  pthread_mutex_lock(&svc->waiters_lock);
+  while (svc->waiters != nullptr) {
+    waiter *w = svc->waiters;
+    grpc_call *call = w->call;
+    unlink_waiter(svc, w);
+    (void)grpc_call_finish_async(call, GRPC_STATUS_UNAVAILABLE, "shutting down");
+    grpc_call_unref(call);
+  }
+  pthread_mutex_unlock(&svc->waiters_lock);
+}
+
 void otlp_service_begin_shutdown(otlp_service *svc) {
-  if (!atomic_exchange(&svc->shutting_down, true))
+  if (!atomic_exchange(&svc->shutting_down, true)) {
     otlp_sink_quiesce(svc->sink);
+    release_waiters(svc);
+  }
 }
 
 void otlp_service_stop(otlp_service *svc) {
@@ -784,16 +808,7 @@ void otlp_service_stop(otlp_service *svc) {
       pthread_join(svc->workers[i].thread, nullptr);
   }
   otlp_sink_shutdown(svc->sink); /* completes the batches it still holds */
-
-  pthread_mutex_lock(&svc->waiters_lock);
-  while (svc->waiters != nullptr) {
-    waiter *w = svc->waiters;
-    grpc_call *call = w->call;
-    unlink_waiter(svc, w);
-    (void)grpc_call_finish_async(call, GRPC_STATUS_UNAVAILABLE, "shutting down");
-    grpc_call_unref(call);
-  }
-  pthread_mutex_unlock(&svc->waiters_lock);
+  release_waiters(svc);          /* none left unless one registered during the drain */
 }
 
 void otlp_service_free(otlp_service *svc) {
