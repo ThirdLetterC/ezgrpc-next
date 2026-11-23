@@ -76,6 +76,7 @@ Full guides and code examples live in [`docs/`](docs/README.md):
 - [`examples/python_client_c_server/`](examples/python_client_c_server/) — Full Protobuf-C server + Python `grpcio` integration tests
 - [`examples/flatbuffers/`](examples/flatbuffers/) — Zero-copy FlatBuffers (`flatcc`) server + Python client
 - [`examples/http3/`](examples/http3/) — HTTP/3 (QUIC) server and client in C
+- [`examples/otlp_metrics/`](examples/otlp_metrics/) — OpenTelemetry OTLP/gRPC metrics receiver: official protos via protobuf-c, partial success and RetryInfo, bounded memory, multi-loop and worker concurrency, null/memory/write-ahead-log sinks; tested with the official Python and Go SDK exporters, fuzzed, and benchmarked against grpc-go
 - CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) tests Ubuntu 22.04/24.04 (GCC/Clang), Windows MSVC, `mimalloc`/`jemalloc`, AddressSanitizer, FlatBuffers, and all 7 TLS backends.
 
 ---
