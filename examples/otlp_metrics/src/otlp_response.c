@@ -15,12 +15,13 @@ grpc_message *otlp_response_new(uint64_t rejected, const char *error_message) {
     memcpy(text, error_message, len);
     text[len] = '\0';
   }
-  otlp_pb_partial_success partial =
-      OPENTELEMETRY__PROTO__COLLECTOR__METRICS__V1__EXPORT_METRICS_PARTIAL_SUCCESS__INIT;
+  /* the generated init functions, not the __INIT macros: those cast away const in this file */
+  otlp_pb_partial_success partial;
+  opentelemetry__proto__collector__metrics__v1__export_metrics_partial_success__init(&partial);
   partial.rejected_data_points = rejected > INT64_MAX ? INT64_MAX : (int64_t)rejected;
   partial.error_message = text;
-  otlp_pb_response response =
-      OPENTELEMETRY__PROTO__COLLECTOR__METRICS__V1__EXPORT_METRICS_SERVICE_RESPONSE__INIT;
+  otlp_pb_response response;
+  opentelemetry__proto__collector__metrics__v1__export_metrics_service_response__init(&response);
   response.partial_success = &partial;
 
   size_t len = protobuf_c_message_get_packed_size(&response.base);

@@ -151,6 +151,78 @@ if(GRPC_BUILD_TESTS)
   endif()
 endif()
 
+# deterministic request generator: benchmark workloads and fuzz seeds
+add_executable(otlp_gen tools/otlp_gen.c)
+target_link_libraries(otlp_gen PRIVATE otlp_metrics_core)
+set_target_properties(otlp_gen PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+list(APPEND otlp_example_targets otlp_gen)
+
+# ---- fuzzing ----------------------------------------------------------------------------------
+# tests/fuzz_export.c: replayed over a generated seed corpus and tests/fuzz-regressions in every
+# build; with -DOTLP_METRICS_FUZZ=ON and Clang also built as a libFuzzer target (otlp_fuzz_export).
+option(OTLP_METRICS_FUZZ "Build the libFuzzer target of the OTLP metrics example (Clang)" OFF)
+set(otlp_corpus_dir "${CMAKE_CURRENT_BINARY_DIR}/fuzz-corpus")
+# "<name>|<otlp_gen arguments separated by |>"
+set(otlp_seed_args
+  "seed-default"
+  "seed-invalid|--invalid-every|3"
+  "seed-summary|--kinds|summary|--points|3"
+  "seed-wide|--resources|2|--scopes|2|--metrics|3|--points|2"
+  "seed-hist|--kinds|histogram,exp|--buckets|3|--points|2|--invalid-every|2")
+set(otlp_seeds)
+foreach(entry IN LISTS otlp_seed_args)
+  string(REPLACE "|" ";" entry "${entry}")
+  list(POP_FRONT entry name)
+  list(APPEND otlp_seeds "${otlp_corpus_dir}/${name}.bin")
+  add_custom_command(OUTPUT "${otlp_corpus_dir}/${name}.bin"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${otlp_corpus_dir}"
+    COMMAND otlp_gen --out "${otlp_corpus_dir}/${name}.bin" ${entry}
+    DEPENDS otlp_gen VERBATIM)
+endforeach()
+add_custom_target(otlp_fuzz_corpus DEPENDS ${otlp_seeds})
+
+if(GRPC_BUILD_TESTS)
+  add_executable(otlp_fuzz_replay tests/fuzz_export.c)
+  target_link_libraries(otlp_fuzz_replay PRIVATE otlp_metrics_core)
+  add_dependencies(otlp_fuzz_replay otlp_fuzz_corpus)
+  add_test(NAME otlp_fuzz_replay COMMAND otlp_fuzz_replay "${otlp_corpus_dir}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/fuzz-regressions")
+  set_tests_properties(otlp_fuzz_replay PROPERTIES LABELS "unit;otlp" TIMEOUT 120)
+  list(APPEND otlp_test_targets otlp_fuzz_replay)
+endif()
+
+if(OTLP_METRICS_FUZZ)
+  if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "OTLP_METRICS_FUZZ needs Clang (libFuzzer)")
+  endif()
+  # protobuf-c's decoder is compiled into the target when its sources are at hand (bundled), so
+  # coverage feedback reaches it; otherwise the installed runtime is used uninstrumented
+  # coverage feedback from the receiver's code and the generated descriptors too (configure with
+  # GRPC_SANITIZE=address;undefined so every target links the sanitizer runtimes)
+  target_compile_options(otlp_metrics_core PRIVATE -fsanitize=fuzzer-no-link)
+  target_compile_options(otlp_metrics_proto PRIVATE -fsanitize=fuzzer-no-link)
+  file(GLOB otlp_pbc_source "${FETCHCONTENT_BASE_DIR}/bundled/src/protobuf_c-*/protobuf-c/protobuf-c.c")
+  add_executable(otlp_fuzz_export tests/fuzz_export.c ${otlp_pbc_source})
+  target_compile_definitions(otlp_fuzz_export PRIVATE OTLP_LIBFUZZER)
+  target_compile_options(otlp_fuzz_export PRIVATE -fsanitize=fuzzer,address,undefined
+    -fno-sanitize-recover=undefined)
+  if(otlp_pbc_source)
+    # Two UBSan checks are off for protobuf-c's own source (both are protobuf-c 1.5.2 patterns,
+    # outside this example; every check stays fatal for the receiver's code):
+    #  - function: the runtime calls each generated <message>__init(T *) through a generic
+    #    void (*)(ProtobufCMessage *) pointer (its descriptor design);
+    #  - nonnull-attribute: parse_packed_repeated_member() calls memcpy(NULL, p, 0) for an empty
+    #    packed repeated field (found by this fuzzer; see tests/fuzz-regressions/README.txt).
+    # Source options come after the library's interface -fsanitize=undefined, so these stick.
+    set_source_files_properties(${otlp_pbc_source} PROPERTIES
+      COMPILE_OPTIONS "-fno-sanitize=function;-fno-sanitize=nonnull-attribute")
+  endif()
+  target_link_options(otlp_fuzz_export PRIVATE -fsanitize=fuzzer,address,undefined)
+  target_link_libraries(otlp_fuzz_export PRIVATE otlp_metrics_core)
+  add_dependencies(otlp_fuzz_export otlp_fuzz_corpus)
+  list(APPEND otlp_test_targets otlp_fuzz_export)
+endif()
+
 if(OTLP_METRICS_WAL)
   # verifies a log and exports its batches as one ExportMetricsServiceRequest
   add_executable(otlp_wal_dump tools/otlp_wal_dump.c)
