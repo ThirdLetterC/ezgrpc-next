@@ -61,9 +61,9 @@ int main(void) {
 #else
   char path[] = "/tmp/protoc-gen-c-shim-XXXXXX";
   int fd = mkstemp(path);
-  FILE *request = fd >= 0 ? fdopen(fd, "w+b") : nullptr;
+  FILE *request = fd >= 0 ? fdopen(fd, "w+b") : NULL;
 #endif
-  if (request == nullptr) {
+  if (request == NULL) {
     fputs("protoc_gen_c_shim: cannot create a temporary file\n", stderr);
     return 1;
   }
@@ -85,7 +85,7 @@ int main(void) {
     goto out;
   }
   FILE *plugin = popen(command, POPEN_READ);
-  if (plugin == nullptr) {
+  if (plugin == NULL) {
     fprintf(stderr, "protoc_gen_c_shim: cannot run %s\n", OTLP_REAL_PLUGIN);
     goto out;
   }

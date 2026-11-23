@@ -61,6 +61,20 @@ find_program(OTLP_PROTOC NAMES protoc DOC "protoc, driving the protoc-c plugin")
 if(NOT OTLP_PROTOC)
   set(OTLP_PROTOC "${PROTOC_C_EXECUTABLE}")
 endif()
+# proto3 `optional` needs libprotoc 3.12 or newer, and until 3.15 an explicit opt-in flag
+# (Ubuntu 22.04 ships 3.12.4). protoc-c's own front end reports the libprotoc it embeds.
+execute_process(COMMAND "${OTLP_PROTOC}" --version OUTPUT_VARIABLE otlp_protoc_version
+  ERROR_VARIABLE otlp_protoc_version RESULT_VARIABLE otlp_protoc_result)
+string(REGEX MATCH "libprotoc ([0-9]+\\.[0-9]+(\\.[0-9]+)?)" _ "${otlp_protoc_version}")
+set(otlp_protoc_version "${CMAKE_MATCH_1}")
+set(otlp_protoc_flags)
+if(otlp_protoc_version AND otlp_protoc_version VERSION_LESS 3.12)
+  message(WARNING "otlp_metrics: ${OTLP_PROTOC} is libprotoc ${otlp_protoc_version}; proto3 "
+    "optional fields need 3.12 or newer. The OTLP metrics example is skipped.")
+  return()
+elseif(otlp_protoc_version AND otlp_protoc_version VERSION_LESS 3.15)
+  list(APPEND otlp_protoc_flags --experimental_allow_proto3_optional)
+endif()
 
 add_executable(otlp_protoc_gen_c_shim cmake/protoc_gen_c_shim.c)
 target_compile_definitions(otlp_protoc_gen_c_shim PRIVATE
@@ -79,7 +93,7 @@ foreach(proto IN LISTS OTLP_PROTO_FILES)
 endforeach()
 add_custom_command(OUTPUT ${otlp_gen_sources} ${otlp_gen_headers}
   COMMAND "${CMAKE_COMMAND}" -E make_directory "${otlp_gen_dir}"
-  COMMAND "${OTLP_PROTOC}" -I "${otlp_proto_root}"
+  COMMAND "${OTLP_PROTOC}" ${otlp_protoc_flags} -I "${otlp_proto_root}"
     "--plugin=protoc-gen-otlpc=$<TARGET_FILE:otlp_protoc_gen_c_shim>"
     "--otlpc_out=${otlp_gen_dir}" ${OTLP_PROTO_FILES}
   DEPENDS ${otlp_proto_paths} otlp_protoc_gen_c_shim

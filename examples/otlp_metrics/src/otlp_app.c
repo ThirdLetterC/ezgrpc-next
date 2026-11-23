@@ -178,7 +178,7 @@ int otlp_config_parse(otlp_config *c, int argc, char **argv) {
   if (strcmp(name, opt) == 0) {        \
     if (!parse_size(value, (max), &n)) \
       goto bad;                        \
-    field = (typeof(field))n;          \
+    field = (__typeof__(field))n;      \
     continue;                          \
   }
     SIZE_OPT("--port", c->port, UINT16_MAX)
