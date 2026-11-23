@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20...3.31)
-project(ezGRPC-next VERSION 1.0.0 LANGUAGES C)
+project(ezGRPC-next VERSION 1.1.0 LANGUAGES C)
 
 if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
   set(GRPC_IS_TOP_LEVEL ON)
