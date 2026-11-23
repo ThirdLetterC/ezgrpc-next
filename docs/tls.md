@@ -6,7 +6,7 @@ Select one TLS library at configure time with `-DGRPC_TLS_BACKEND=<backend>`:
 
 | `GRPC_TLS_BACKEND` | Library | How to Obtain | Notes |
 |:---|:---|:---|:---|
-| `openssl` | OpenSSL 3.0 | `libssl-dev` | Default when installed |
+| `openssl` | OpenSSL 3.0+ | Built by default (3.5); `libssl-dev` with `-DGRPC_SYSTEM_DEPENDENCIES=openssl` | Default |
 | `libressl` | LibreSSL 4.3 | `scripts/build-tls-backend.sh libressl <dir>` | Use with `-DGRPC_TLS_PREFIX` |
 | `boringssl` | BoringSSL | `scripts/build-tls-backend.sh boringssl <dir>` | Use with `-DGRPC_TLS_PREFIX` |
 | `awslc` | AWS-LC 5.10 | `scripts/build-tls-backend.sh awslc <dir>` | Use with `-DGRPC_TLS_PREFIX` |
@@ -101,7 +101,7 @@ If loading fails, the previous TLS configuration remains active and `grpc_server
 ## Native Backend Escape Hatch
 
 For backend-specific tuning not exposed in `grpc_tls_config`, `grpc_server_tls_native(server)` returns:
-- OpenSSL / LibreSSL / BoringSSL / AWS-LC: `SSL_CTX *`
+- OpenSSL / LibreSSL / BoringSSL / AWS-LC: `SSL_CTX *`. The bundled OpenSSL is linked into `libgrpc.so` without exporting its symbols, so an application using this context through the shared library must link the same OpenSSL: the installed static `libssl.a`/`libcrypto.a` (`<libdir>/ezgrpc-next/`, which `grpc::static` brings), or build with `-DGRPC_SYSTEM_DEPENDENCIES=openssl`
 - wolfSSL: `WOLFSSL_CTX *`
 - GnuTLS: `gnutls_certificate_credentials_t`
 - rustls: `const struct rustls_server_config *`

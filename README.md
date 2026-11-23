@@ -27,7 +27,7 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-Only a C compiler, CMake and OpenSSL headers need to be installed. nghttp2, libuv, zlib, zstd, Snappy and protobuf-c are downloaded as pinned, checksummed releases and built on the first configure. Pass `-DGRPC_DEPENDENCIES=SYSTEM` to use installed packages instead (see [Getting Started](docs/getting-started.md#third-party-libraries-bundled-by-default)).
+Only a C compiler, CMake and Perl (which OpenSSL's build uses) need to be installed. OpenSSL, nghttp2, libuv, zlib, zstd, Snappy and protobuf-c are downloaded as pinned, checksummed releases and built on the first configure. Pass `-DGRPC_DEPENDENCIES=SYSTEM` to use installed packages instead (see [Getting Started](docs/getting-started.md#third-party-libraries-bundled-by-default)).
 
 ```c
 #include <string.h>
